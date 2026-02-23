@@ -182,6 +182,182 @@ int uvc_rgbx_to_yuyv(uvc_frame_t *in, uvc_frame_t *out) {
     return  ret;
 }
 
+/** @brief Convert a frame from NV12 to RGBX8888
+ * @ingroup frame
+ * @param in NV12 frame
+ * @param out RGBX8888 frame
+ */
+// int uvc_nv12_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
+//     if (in->frame_format != UVC_FRAME_FORMAT_NV12)
+//         return UVC_ERROR_INVALID_PARAM;
+
+//     if (uvc_ensure_frame_size(out, in->width * in->height * PIXEL_RGBX) < 0)
+//         return UVC_ERROR_NO_MEM;
+
+//     out->width = in->width;
+//     out->height = in->height;
+//     out->frame_format = UVC_FRAME_FORMAT_RGBX;
+//     if (out->library_owns_data)
+//         out->step = in->width * PIXEL_RGBX;
+//     out->sequence = in->sequence;
+//     out->capture_time = in->capture_time;
+//     out->source = in->source;
+
+//     uint8_t *src_y = (uint8_t *) in->data;
+//     uint8_t *src_uv = (uint8_t *) in->data + in->width * in->height;
+//     uint8_t *dst = (uint8_t *) out->data;
+
+//     int ret = libyuv::NV12ToARGB(src_y, in->step ? in->step : in->width,
+//                                  src_uv, in->step ? in->step : in->width,
+//                                  dst, out->step,
+//                                  out->width, out->height);
+//     if (ret != 0)
+//         return ret;
+
+//     // libyuv wrote ARGB (A,R,G,B) per pixel. Convert to RGBX (R,G,B,A)
+//     const int px = out->width * out->height;
+//     for (int i = 0; i < px; ++i) {
+//         uint8_t a = dst[i * 4 + 0];
+//         uint8_t r = dst[i * 4 + 1];
+//         uint8_t g = dst[i * 4 + 2];
+//         uint8_t b = dst[i * 4 + 3];
+//         dst[i * 4 + 0] = r;
+//         dst[i * 4 + 1] = g;
+//         dst[i * 4 + 2] = b;
+//         dst[i * 4 + 3] = a;
+//     }
+
+//     return UVC_SUCCESS;
+// }
+
+int uvc_nv12_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
+    if (in->frame_format != UVC_FRAME_FORMAT_NV12)
+        return UVC_ERROR_INVALID_PARAM;
+
+    if (uvc_ensure_frame_size(out, in->width * in->height * PIXEL_RGBX) < 0)
+        return UVC_ERROR_NO_MEM;
+
+    out->width = in->width;
+    out->height = in->height;
+    out->frame_format = UVC_FRAME_FORMAT_RGBX;
+    if (out->library_owns_data)
+        out->step = in->width * PIXEL_RGBX;
+    out->sequence = in->sequence;
+    out->capture_time = in->capture_time;
+    out->source = in->source;
+
+    uint8_t *src_y = (uint8_t *) in->data;
+    uint8_t *src_uv = (uint8_t *) in->data + in->width * in->height;
+    uint8_t *dst = (uint8_t *) out->data;
+
+    int ret = libyuv::NV12ToABGR(src_y, in->width,
+                             src_uv, in->width,
+                             dst, out->step,
+                             out->width, out->height);
+    if (ret != 0)
+        return ret;
+
+    return UVC_SUCCESS;
+}
+
+/** @brief Convert a frame from NV21 to RGBX8888
+ * @ingroup frame
+ * @param in NV21 frame
+ * @param out RGBX8888 frame
+ */
+int uvc_nv21_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
+    if (in->frame_format != UVC_FRAME_FORMAT_NV21)
+        return UVC_ERROR_INVALID_PARAM;
+
+    if (uvc_ensure_frame_size(out, in->width * in->height * PIXEL_RGBX) < 0)
+        return UVC_ERROR_NO_MEM;
+
+    out->width = in->width;
+    out->height = in->height;
+    out->frame_format = UVC_FRAME_FORMAT_RGBX;
+    if (out->library_owns_data)
+        out->step = in->width * PIXEL_RGBX;
+    out->sequence = in->sequence;
+    out->capture_time = in->capture_time;
+    out->source = in->source;
+
+    uint8_t *src_y = (uint8_t *) in->data;
+    uint8_t *src_vu = (uint8_t *) in->data + in->width * in->height;
+    uint8_t *dst = (uint8_t *) out->data;
+
+    int ret = libyuv::NV21ToARGB(src_y, in->step ? in->step : in->width,
+                                 src_vu, in->step ? in->step : in->width,
+                                 dst, out->step,
+                                 out->width, out->height);
+    if (ret != 0)
+        return ret;
+
+    // ARGB -> RGBX
+    const int px = out->width * out->height;
+    for (int i = 0; i < px; ++i) {
+        uint8_t a = dst[i * 4 + 0];
+        uint8_t r = dst[i * 4 + 1];
+        uint8_t g = dst[i * 4 + 2];
+        uint8_t b = dst[i * 4 + 3];
+        dst[i * 4 + 0] = r;
+        dst[i * 4 + 1] = g;
+        dst[i * 4 + 2] = b;
+        dst[i * 4 + 3] = a;
+    }
+
+    return UVC_SUCCESS;
+}
+
+/** @brief Convert a frame from I420 to RGBX8888
+ * @ingroup frame
+ * @param in I420 frame
+ * @param out RGBX8888 frame
+ */
+int uvc_i420_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
+    if (in->frame_format != UVC_FRAME_FORMAT_I420)
+        return UVC_ERROR_INVALID_PARAM;
+
+    if (uvc_ensure_frame_size(out, in->width * in->height * PIXEL_RGBX) < 0)
+        return UVC_ERROR_NO_MEM;
+
+    out->width = in->width;
+    out->height = in->height;
+    out->frame_format = UVC_FRAME_FORMAT_RGBX;
+    if (out->library_owns_data)
+        out->step = in->width * PIXEL_RGBX;
+    out->sequence = in->sequence;
+    out->capture_time = in->capture_time;
+    out->source = in->source;
+
+    uint8_t *src_y = (uint8_t *) in->data;
+    uint8_t *src_u = (uint8_t *) in->data + in->width * in->height;
+    uint8_t *src_v = (uint8_t *) in->data + in->width * in->height + (in->width * in->height) / 4;
+    uint8_t *dst = (uint8_t *) out->data;
+
+    int ret = libyuv::I420ToARGB(src_y, in->width,
+                                 src_u, in->width / 2,
+                                 src_v, in->width / 2,
+                                 dst, out->step,
+                                 out->width, out->height);
+    if (ret != 0)
+        return ret;
+
+    // ARGB -> RGBX
+    const int px = out->width * out->height;
+    for (int i = 0; i < px; ++i) {
+        uint8_t a = dst[i * 4 + 0];
+        uint8_t r = dst[i * 4 + 1];
+        uint8_t g = dst[i * 4 + 2];
+        uint8_t b = dst[i * 4 + 3];
+        dst[i * 4 + 0] = r;
+        dst[i * 4 + 1] = g;
+        dst[i * 4 + 2] = b;
+        dst[i * 4 + 3] = a;
+    }
+
+    return UVC_SUCCESS;
+}
+
 /** @brief Convert a frame from RGBX8888 to NV12
 * @ingroup frame
 * @param ini RGBX8888 frame
@@ -340,6 +516,41 @@ int uvc_rgbx_to_yuyv(uvc_frame_t *in, uvc_frame_t *out) {
 
     ret = libyuv::ABGRToRGB24(in_data, in->step, out_data, out->step,
                               out->width, out->height);
+
+    return  ret;
+}
+
+/** @brief Convert a frame from RGBX8888 to I420
+* @ingroup frame
+* @param ini RGBX8888 frame
+* @param out I420 frame
+*/
+ int uvc_rgbx_to_i420(uvc_frame_t *in, uvc_frame_t *out) {
+    uint8_t *in_data = (uint8_t *) in->data;
+    uint8_t *out_data = (uint8_t *) out->data;
+
+    if (in->frame_format != UVC_FRAME_FORMAT_RGBX)
+        return UVC_ERROR_INVALID_PARAM;
+
+    if (uvc_ensure_frame_size(out, (in->width * in->height * 3) / 2) < 0)
+        return UVC_ERROR_NO_MEM;
+
+    out->width = in->width;
+    out->height = in->height;
+    out->frame_format = UVC_FRAME_FORMAT_I420;
+    if (out->library_owns_data)
+        out->step = in->width;
+    out->sequence = in->sequence;
+    out->capture_time = in->capture_time;
+    out->source = in->source;
+
+    int ret = UVC_SUCCESS;
+
+    ret = libyuv::ABGRToI420(in_data, in->step,
+                             out_data, out->width,
+                             out_data + out->width * out->height, out->width / 2,
+                             out_data + out->width * out->height * 5 / 4, out->width / 2,
+                             out->width, out->height);
 
     return  ret;
 }
