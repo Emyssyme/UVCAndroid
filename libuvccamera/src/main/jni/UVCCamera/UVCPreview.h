@@ -49,6 +49,7 @@ typedef int (*convFunc_t)(uvc_frame_t *in, uvc_frame_t *out);
 #define PIXEL_FORMAT_RGB565 5
 #define PIXEL_FORMAT_RGBX 6
 #define PIXEL_FORMAT_BGR 7
+#define PIXEL_FORMAT_I420 8
 
 
 // for callback to Java object
