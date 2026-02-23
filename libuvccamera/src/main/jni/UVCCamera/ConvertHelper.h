@@ -30,4 +30,11 @@ int uvc_rgbx_to_rgb565(uvc_frame_t *in, uvc_frame_t *out);
 
 int uvc_rgbx_to_bgr(uvc_frame_t *in, uvc_frame_t *out);
 
+int uvc_rgbx_to_i420(uvc_frame_t *in, uvc_frame_t *out);
+
+// Convert camera formats to RGBX for preview display
+int uvc_nv12_to_rgbx(uvc_frame_t *in, uvc_frame_t *out);
+int uvc_nv21_to_rgbx(uvc_frame_t *in, uvc_frame_t *out);
+int uvc_i420_to_rgbx(uvc_frame_t *in, uvc_frame_t *out);
+
 #endif //UVC_CAMERA_CONVERTHELPER_H
