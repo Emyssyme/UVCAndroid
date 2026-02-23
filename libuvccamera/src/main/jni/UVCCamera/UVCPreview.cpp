@@ -33,6 +33,7 @@
 #include "utilbase.h"
 #include "UVCPreview.h"
 #include "libuvc_internal.h"
+#include "ConvertHelper.h"
 
 #define MAX_FRAME 4
 // RGBA_8888/RGBX_8888:4
@@ -199,10 +200,55 @@ int UVCPreview::setPreviewSize(int width, int height, int frameType, int fps) {
     requestFormatType = frameType;
 
     uvc_stream_ctrl_t ctrl;
+
+    // If requested format is uncompressed, prefer NV12/I420 when the
+    // device advertises corresponding GUIDs (helps Elgato CamLink 4K).
+    if (frame_format == UVC_FRAME_FORMAT_UNCOMPRESSED && mDeviceHandle && mDeviceHandle->info) {
+        uvc_streaming_interface_t *stream_if;
+        bool found = false;
+        DL_FOREACH(mDeviceHandle->info->stream_ifs, stream_if) {
+            uvc_format_desc_t *fmt_desc;
+            DL_FOREACH(stream_if->format_descs, fmt_desc) {
+                if (fmt_desc->bDescriptorSubtype == UVC_VS_FORMAT_UNCOMPRESSED) {
+                    // check first 4 bytes of GUID for ASCII fourcc like 'NV12' or 'I420'
+                    uint8_t *g = fmt_desc->guidFormat;
+                    if (g[0] == 'N' && g[1] == 'V' && g[2] == '1' && g[3] == '2') {
+                        frame_format = UVC_FRAME_FORMAT_NV12;
+                        found = true;
+                        break;
+                    }
+                    if (g[0] == 'I' && g[1] == '4' && g[2] == '2' && g[3] == '0') {
+                        // libuvc doesn't define a distinct I420 frame enum here,
+                        // treat I420 as NV12 for negotiation and convert if needed.
+                        frame_format = UVC_FRAME_FORMAT_NV12;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (found) break;
+        }
+    }
     result = uvc_get_stream_ctrl_format_size(
             mDeviceHandle, &ctrl,
             frame_format,
             width, height, fps);
+
+    // If the initial request failed for uncompressed format, try common
+    // YUV420 fallbacks (NV12, NV21) so devices like Elgato CamLink 4K
+    // which advertise NV12/I420 are handled.
+    if (result != UVC_SUCCESS && frame_format == UVC_FRAME_FORMAT_UNCOMPRESSED) {
+        enum uvc_frame_format fallback_formats[] = {UVC_FRAME_FORMAT_NV12, UVC_FRAME_FORMAT_NV21, UVC_FRAME_FORMAT_YUYV};
+        const int num_fallbacks = sizeof(fallback_formats) / sizeof(fallback_formats[0]);
+        for (int i = 0; i < num_fallbacks; ++i) {
+            enum uvc_frame_format ff = fallback_formats[i];
+            result = uvc_get_stream_ctrl_format_size(mDeviceHandle, &ctrl, ff, width, height, fps);
+            if (result == UVC_SUCCESS) {
+                frame_format = ff; // use the successful frame format
+                break;
+            }
+        }
+    }
 
 #if LOCAL_DEBUG
     uvc_print_stream_ctrl(&ctrl, stderr);
@@ -316,6 +362,11 @@ void UVCPreview::callbackPixelFormatChanged() {
             LOGI("PIXEL_FORMAT_BGR:");
             mFrameCallbackFunc = uvc_rgbx_to_bgr;
             callbackPixelBytes = sz * 3;
+            break;
+        case PIXEL_FORMAT_I420:
+            LOGI("PIXEL_FORMAT_I420:");
+            mFrameCallbackFunc = uvc_rgbx_to_i420;
+            callbackPixelBytes = (sz * 3) / 2;
             break;
     }
 }
@@ -599,10 +650,21 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
                 frame_yuv = waitPreviewFrame();
                 if (LIKELY(frame_yuv)) {
                     frame = get_frame(frame_yuv->width * frame_yuv->height * PREVIEW_PIXEL_BYTES);
-//                    c_start = clock();
-                    result = uvc_yuyv2rgbx(frame_yuv, frame);   // YUYV => RGBX
-//                    c_end = clock();
-//                    LOGI("uvc_yuyv2rgbx time: %f", (double) (c_end - c_start) / CLOCKS_PER_SEC);
+                    // choose conversion based on incoming frame format
+                    if (frame_yuv->frame_format == UVC_FRAME_FORMAT_MJPEG) {
+                        result = uvc_mjpeg2rgbx_tj(frame_yuv, frame);
+                    } else if (frame_yuv->frame_format == UVC_FRAME_FORMAT_YUYV) {
+                        result = uvc_yuyv2rgbx(frame_yuv, frame);
+                    } else if (frame_yuv->frame_format == UVC_FRAME_FORMAT_NV12) {
+                        result = uvc_nv12_to_rgbx(frame_yuv, frame);
+                    } else if (frame_yuv->frame_format == UVC_FRAME_FORMAT_NV21) {
+                        result = uvc_nv21_to_rgbx(frame_yuv, frame);
+                    } else if (frame_yuv->frame_format == UVC_FRAME_FORMAT_I420) {
+                        result = uvc_i420_to_rgbx(frame_yuv, frame);
+                    } else {
+                        // fallback: try YUYV conversion if nothing else matches
+                        result = uvc_yuyv2rgbx(frame_yuv, frame);
+                    }
 
                     if (LIKELY(!result)) {
                         draw_preview_one(frame, &mPreviewWindow);
