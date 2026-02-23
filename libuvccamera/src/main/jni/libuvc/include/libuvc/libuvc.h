@@ -92,6 +92,7 @@ enum uvc_frame_format {
     UVC_FRAME_FORMAT_NV12,
     /** YUV420SP: NV21 */
     UVC_FRAME_FORMAT_NV21,
+    UVC_FRAME_FORMAT_I420,
     /** Number of formats understood */
     UVC_FRAME_FORMAT_COUNT,
 };
