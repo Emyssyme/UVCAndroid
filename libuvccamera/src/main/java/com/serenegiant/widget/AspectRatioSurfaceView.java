@@ -4,6 +4,9 @@ import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.AttributeSet;
+import android.view.GestureDetector;
+import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
 import android.view.SurfaceView;
 
 import com.serenegiant.uvccamera.BuildConfig;
@@ -21,8 +24,15 @@ public class AspectRatioSurfaceView extends SurfaceView    // API >= 14
 
     private static final boolean DEBUG = BuildConfig.DEBUG;    // TODO set false on release
     private static final String TAG = AspectRatioSurfaceView.class.getSimpleName();
+    private static final float MIN_SCALE = 1.0f;
+    private static final float MAX_SCALE = 5.0f;
 
     private double mRequestedAspect = -1.0;
+    private float mCurrentScale = MIN_SCALE;
+    private float mTranslationX = 0f;
+    private float mTranslationY = 0f;
+    private final ScaleGestureDetector mScaleGestureDetector;
+    private final GestureDetector mGestureDetector;
 
     public AspectRatioSurfaceView(final Context context) {
         this(context, null, 0);
@@ -34,6 +44,108 @@ public class AspectRatioSurfaceView extends SurfaceView    // API >= 14
 
     public AspectRatioSurfaceView(final Context context, final AttributeSet attrs, final int defStyle) {
         super(context, attrs, defStyle);
+        setClickable(true);
+        setLongClickable(true);
+        mScaleGestureDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override
+            public boolean onScale(ScaleGestureDetector detector) {
+                final float targetScale = clamp(mCurrentScale * detector.getScaleFactor(), MIN_SCALE, MAX_SCALE);
+                if (Math.abs(targetScale - mCurrentScale) < 1e-4f) {
+                    return false;
+                }
+                setPivotX(detector.getFocusX());
+                setPivotY(detector.getFocusY());
+                mCurrentScale = targetScale;
+                applyTouchTransform();
+                return true;
+            }
+        });
+        mGestureDetector = new GestureDetector(context, new GestureDetector.SimpleOnGestureListener() {
+            @Override
+            public boolean onDown(MotionEvent e) {
+                return true;
+            }
+
+            @Override
+            public boolean onScroll(MotionEvent e1, MotionEvent e2, float distanceX, float distanceY) {
+                if (mCurrentScale <= MIN_SCALE) {
+                    return false;
+                }
+                mTranslationX -= distanceX;
+                mTranslationY -= distanceY;
+                applyTouchTransform();
+                return true;
+            }
+        });
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        if (getParent() != null) {
+            getParent().requestDisallowInterceptTouchEvent(true);
+        }
+        final boolean scaleHandled = mScaleGestureDetector.onTouchEvent(event);
+        final boolean gestureHandled = mGestureDetector.onTouchEvent(event);
+        if (event.getActionMasked() == MotionEvent.ACTION_UP || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+            if (getParent() != null) {
+                getParent().requestDisallowInterceptTouchEvent(false);
+            }
+            if (mCurrentScale <= MIN_SCALE + 1e-4f) {
+                resetTouchTransform();
+            }
+        }
+        if (event.getPointerCount() > 1) {
+            return true;
+        }
+        return scaleHandled || gestureHandled || super.onTouchEvent(event);
+    }
+
+    @Override
+    protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+        super.onSizeChanged(w, h, oldw, oldh);
+        resetTouchTransform();
+    }
+
+    private void applyTouchTransform() {
+        constrainTranslation();
+        setScaleX(mCurrentScale);
+        setScaleY(mCurrentScale);
+        setTranslationX(mTranslationX);
+        setTranslationY(mTranslationY);
+        invalidate();
+    }
+
+    private void resetTouchTransform() {
+        mCurrentScale = MIN_SCALE;
+        mTranslationX = 0f;
+        mTranslationY = 0f;
+        setPivotX(getWidth() * 0.5f);
+        setPivotY(getHeight() * 0.5f);
+        applyTouchTransform();
+    }
+
+    private void constrainTranslation() {
+        final float width = getWidth();
+        final float height = getHeight();
+        if (width <= 0f || height <= 0f) {
+            return;
+        }
+        final float maxX = ((mCurrentScale - 1.0f) * width) * 0.5f;
+        final float maxY = ((mCurrentScale - 1.0f) * height) * 0.5f;
+        if (maxX <= 0f) {
+            mTranslationX = 0f;
+        } else {
+            mTranslationX = clamp(mTranslationX, -maxX, maxX);
+        }
+        if (maxY <= 0f) {
+            mTranslationY = 0f;
+        } else {
+            mTranslationY = clamp(mTranslationY, -maxY, maxY);
+        }
+    }
+
+    private static float clamp(float value, float min, float max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     @Override

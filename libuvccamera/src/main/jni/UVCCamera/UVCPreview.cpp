@@ -285,6 +285,7 @@ int UVCPreview::setPreviewSize(int width, int height, int frameType, int fps) {
             result = uvc_get_stream_ctrl_format_size(mDeviceHandle, &ctrl, ff, width, height, fps);
             if (result == UVC_SUCCESS) {
                 frame_format = ff; // use the successful frame format
+                LOGI("Requested uncompressed format not supported, falling back to %d", frame_format);
                 break;
             }
         }

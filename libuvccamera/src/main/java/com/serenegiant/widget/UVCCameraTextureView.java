@@ -25,6 +25,8 @@ package com.serenegiant.widget;
 
 import android.content.Context;
 import android.graphics.Bitmap;
+import android.graphics.Matrix;
+import android.graphics.RectF;
 import android.graphics.SurfaceTexture;
 import android.os.Handler;
 import android.os.HandlerThread;
@@ -33,6 +35,9 @@ import android.os.Message;
 import android.os.Process;
 import android.util.AttributeSet;
 import android.util.Log;
+import android.view.GestureDetector;
+import android.view.MotionEvent;
+import android.view.ScaleGestureDetector;
 import android.view.Surface;
 import android.view.TextureView;
 
@@ -63,6 +68,12 @@ public class UVCCameraTextureView extends AspectRatioTextureView    // API >= 14
     private Bitmap mTempBitmap;
     private boolean mRequestCaptureStillImage;
     private Callback mCallback;
+    private static final float MIN_SCALE = 1.0f;
+    private static final float MAX_SCALE = 5.0f;
+    private float mCurrentScale = MIN_SCALE;
+    private final Matrix mTouchTransform = new Matrix();
+    private final ScaleGestureDetector mScaleGestureDetector;
+    private final GestureDetector mGestureDetector;
     /**
      * for calculation of frame rate
      */
@@ -79,6 +90,111 @@ public class UVCCameraTextureView extends AspectRatioTextureView    // API >= 14
     public UVCCameraTextureView(final Context context, final AttributeSet attrs, final int defStyle) {
         super(context, attrs, defStyle);
         setSurfaceTextureListener(this);
+        setClickable(true);
+        setLongClickable(true);
+        mScaleGestureDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            @Override
+            public boolean onScale(ScaleGestureDetector detector) {
+                final float targetScale = clamp(mCurrentScale * detector.getScaleFactor(), MIN_SCALE, MAX_SCALE);
+                final float appliedScale = targetScale / mCurrentScale;
+                if (Math.abs(appliedScale - 1.0f) < 1e-4f) {
+                    return false;
+                }
+                mTouchTransform.postScale(appliedScale, appliedScale, detector.getFocusX(), detector.getFocusY());
+                mCurrentScale = targetScale;
+                constrainTranslation();
+                applyTouchTransform();
+                return true;
+            }
+        });
+        mGestureDetector = new GestureDetector(context, new GestureDetector.SimpleOnGestureListener() {
+            @Override
+            public boolean onDown(MotionEvent e) {
+                return true;
+            }
+
+            @Override
+            public boolean onScroll(MotionEvent e1, MotionEvent e2, float distanceX, float distanceY) {
+                if (mCurrentScale <= MIN_SCALE) {
+                    return false;
+                }
+                mTouchTransform.postTranslate(-distanceX, -distanceY);
+                constrainTranslation();
+                applyTouchTransform();
+                return true;
+            }
+        });
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        final boolean scaleHandled = mScaleGestureDetector.onTouchEvent(event);
+        final boolean gestureHandled = mGestureDetector.onTouchEvent(event);
+        if (event.getActionMasked() == MotionEvent.ACTION_UP || event.getActionMasked() == MotionEvent.ACTION_CANCEL) {
+            if (mCurrentScale <= MIN_SCALE + 1e-4f) {
+                resetTouchTransform();
+            }
+        }
+        if (event.getPointerCount() > 1) {
+            return true;
+        }
+        return scaleHandled || gestureHandled || super.onTouchEvent(event);
+    }
+
+    @Override
+    protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+        super.onSizeChanged(w, h, oldw, oldh);
+        resetTouchTransform();
+    }
+
+    private void applyTouchTransform() {
+        setTransform(mTouchTransform);
+        invalidate();
+    }
+
+    private void resetTouchTransform() {
+        mCurrentScale = MIN_SCALE;
+        mTouchTransform.reset();
+        applyTouchTransform();
+    }
+
+    private void constrainTranslation() {
+        if (getWidth() <= 0 || getHeight() <= 0) {
+            return;
+        }
+        final RectF transformedRect = new RectF(0f, 0f, getWidth(), getHeight());
+        mTouchTransform.mapRect(transformedRect);
+
+        float dx = 0f;
+        float dy = 0f;
+
+        if (transformedRect.width() <= getWidth()) {
+            dx = getWidth() * 0.5f - transformedRect.centerX();
+        } else {
+            if (transformedRect.left > 0f) {
+                dx = -transformedRect.left;
+            } else if (transformedRect.right < getWidth()) {
+                dx = getWidth() - transformedRect.right;
+            }
+        }
+
+        if (transformedRect.height() <= getHeight()) {
+            dy = getHeight() * 0.5f - transformedRect.centerY();
+        } else {
+            if (transformedRect.top > 0f) {
+                dy = -transformedRect.top;
+            } else if (transformedRect.bottom < getHeight()) {
+                dy = getHeight() - transformedRect.bottom;
+            }
+        }
+
+        if (dx != 0f || dy != 0f) {
+            mTouchTransform.postTranslate(dx, dy);
+        }
+    }
+
+    private static float clamp(float value, float min, float max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     @Override
