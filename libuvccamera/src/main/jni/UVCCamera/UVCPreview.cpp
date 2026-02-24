@@ -41,6 +41,46 @@
 #define PREVIEW_PIXEL_BYTES 4
 #define FRAME_POOL_SZ MAX_FRAME + 2
 
+static inline bool can_passthrough_callback_frame(const int pixel_format, const uvc_frame_t *frame) {
+    if (!frame) return false;
+    switch (pixel_format) {
+        case PIXEL_FORMAT_RAW:
+        case PIXEL_FORMAT_YUV:
+            return frame->frame_format == UVC_FRAME_FORMAT_YUYV;
+        case PIXEL_FORMAT_NV12:
+            return frame->frame_format == UVC_FRAME_FORMAT_NV12;
+        case PIXEL_FORMAT_NV21:
+            return frame->frame_format == UVC_FRAME_FORMAT_NV21;
+        case PIXEL_FORMAT_I420:
+            return frame->frame_format == UVC_FRAME_FORMAT_I420;
+        default:
+            return false;
+    }
+}
+
+static inline size_t min_frame_bytes_for_format(const uvc_frame_t *frame) {
+    if (!frame || frame->width <= 0 || frame->height <= 0) return 0;
+    const size_t wh = static_cast<size_t>(frame->width) * static_cast<size_t>(frame->height);
+    switch (frame->frame_format) {
+        case UVC_FRAME_FORMAT_YUYV:
+            return wh * 2;
+        case UVC_FRAME_FORMAT_NV12:
+        case UVC_FRAME_FORMAT_NV21:
+        case UVC_FRAME_FORMAT_I420:
+            if ((frame->width & 1) || (frame->height & 1)) return 0;
+            return (wh * 3) / 2;
+        case UVC_FRAME_FORMAT_RGBX:
+            return wh * 4;
+        case UVC_FRAME_FORMAT_RGB:
+        case UVC_FRAME_FORMAT_BGR:
+            return wh * 3;
+        case UVC_FRAME_FORMAT_MJPEG:
+            return 1;
+        default:
+            return 1;
+    }
+}
+
 UVCPreview::UVCPreview(uvc_device_handle_t *devh)
         : mPreviewWindow(NULL),
           mCaptureWindow(NULL),
@@ -478,6 +518,14 @@ void UVCPreview::uvc_preview_frame_callback(uvc_frame_t *frame, void *vptr_args)
     if UNLIKELY(!preview->isRunning() || !frame || !frame->frame_format || !frame->data ||
                 !frame->data_bytes)
         return;
+    const size_t min_bytes = min_frame_bytes_for_format(frame);
+    if (UNLIKELY(min_bytes == 0 || frame->data_bytes < min_bytes)) {
+#if LOCAL_DEBUG
+        LOGW("drop invalid frame: fmt=%d size=%zu need=%zu %dx%d", frame->frame_format,
+             frame->data_bytes, min_bytes, frame->width, frame->height);
+#endif
+        return;
+    }
 //    if (UNLIKELY(
 //            ((frame->frame_format != UVC_FRAME_FORMAT_MJPEG)
 //             && (frame->data_bytes < preview->frameBytes))
@@ -629,6 +677,10 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 //                    frame = get_frame(frame_mjpeg->width * frame_mjpeg->height * 2);
                     frame = get_frame(
                             frame_mjpeg->width * frame_mjpeg->height * PREVIEW_PIXEL_BYTES);
+                    if (UNLIKELY(!frame)) {
+                        recycle_frame(frame_mjpeg);
+                        continue;
+                    }
 //                    c_start = clock();
                     result = uvc_mjpeg2rgbx_tj(frame_mjpeg, frame);   // MJPEG => yuyv
 //                    c_end = clock();
@@ -649,7 +701,21 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
             for (; LIKELY(isRunning());) {
                 frame_yuv = waitPreviewFrame();
                 if (LIKELY(frame_yuv)) {
+                    const size_t min_bytes = min_frame_bytes_for_format(frame_yuv);
+                    if (UNLIKELY(min_bytes == 0 || frame_yuv->data_bytes < min_bytes)) {
+#if LOCAL_DEBUG
+                        LOGW("skip bad preview frame: fmt=%d size=%zu need=%zu %dx%d", frame_yuv->frame_format,
+                             frame_yuv->data_bytes, min_bytes, frame_yuv->width, frame_yuv->height);
+#endif
+                        recycle_frame(frame_yuv);
+                        continue;
+                    }
+
                     frame = get_frame(frame_yuv->width * frame_yuv->height * PREVIEW_PIXEL_BYTES);
+                    if (UNLIKELY(!frame)) {
+                        recycle_frame(frame_yuv);
+                        continue;
+                    }
                     // choose conversion based on incoming frame format
                     if (frame_yuv->frame_format == UVC_FRAME_FORMAT_MJPEG) {
                         result = uvc_mjpeg2rgbx_tj(frame_yuv, frame);
@@ -668,7 +734,33 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
 
                     if (LIKELY(!result)) {
                         draw_preview_one(frame, &mPreviewWindow);
-                        if (!addCaptureFrame(frame)) {
+
+                        bool callbackQueued = false;
+                        bool canPassRawFrame = false;
+                        pthread_mutex_lock(&capture_mutex);
+                        canPassRawFrame = mFrameCallbackObj
+                                          && !mCaptureWindow
+                                          && can_passthrough_callback_frame(mPixelFormat, frame_yuv);
+                        pthread_mutex_unlock(&capture_mutex);
+
+                        if (canPassRawFrame) {
+                            uvc_frame_t *raw_for_callback = get_frame(frame_yuv->data_bytes);
+                            if (LIKELY(raw_for_callback)) {
+                                const uvc_error_t copy_ret = uvc_duplicate_frame(frame_yuv, raw_for_callback);
+                                if (LIKELY(!copy_ret)) {
+                                    callbackQueued = addCaptureFrame(raw_for_callback);
+                                }
+                                if (!callbackQueued) {
+                                    recycle_frame(raw_for_callback);
+                                }
+                            }
+                        }
+
+                        if (!callbackQueued) {
+                            if (!addCaptureFrame(frame)) {
+                                recycle_frame(frame);
+                            }
+                        } else {
                             recycle_frame(frame);
                         }
                     } else {
@@ -919,8 +1011,10 @@ void UVCPreview::do_capture_callback(JNIEnv *env, uvc_frame_t *frame) {
 
     if (LIKELY(frame)) {
         uvc_frame_t *callback_frame = frame;
+        size_t callback_bytes = callbackPixelBytes;
+        const bool passthrough = can_passthrough_callback_frame(mPixelFormat, frame);
         if (mFrameCallbackObj && iframecallback_fields.onFrame) {
-            if (mFrameCallbackFunc) {
+            if (mFrameCallbackFunc && !passthrough) {
                 callback_frame = get_frame(callbackPixelBytes);
                 if (LIKELY(callback_frame)) {
                     int b = mFrameCallbackFunc(frame, callback_frame);
@@ -934,8 +1028,10 @@ void UVCPreview::do_capture_callback(JNIEnv *env, uvc_frame_t *frame) {
                     callback_frame = frame;
                     goto SKIP;
                 }
+            } else {
+                callback_bytes = frame->data_bytes;
             }
-            jobject buf = env->NewDirectByteBuffer(callback_frame->data, callbackPixelBytes);
+            jobject buf = env->NewDirectByteBuffer(callback_frame->data, callback_bytes);
             env->CallVoidMethod(mFrameCallbackObj, iframecallback_fields.onFrame, buf);
             env->ExceptionClear();
             env->DeleteLocalRef(buf);

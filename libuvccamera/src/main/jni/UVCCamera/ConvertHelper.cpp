@@ -233,6 +233,10 @@ int uvc_rgbx_to_yuyv(uvc_frame_t *in, uvc_frame_t *out) {
 int uvc_nv12_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
     if (in->frame_format != UVC_FRAME_FORMAT_NV12)
         return UVC_ERROR_INVALID_PARAM;
+    if (!in->data || !out || in->width <= 0 || in->height <= 0)
+        return UVC_ERROR_INVALID_PARAM;
+    if ((in->width & 1) || (in->height & 1))
+        return UVC_ERROR_INVALID_PARAM;
 
     if (uvc_ensure_frame_size(out, in->width * in->height * PIXEL_RGBX) < 0)
         return UVC_ERROR_NO_MEM;
@@ -240,18 +244,24 @@ int uvc_nv12_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
     out->width = in->width;
     out->height = in->height;
     out->frame_format = UVC_FRAME_FORMAT_RGBX;
-    if (out->library_owns_data)
-        out->step = in->width * PIXEL_RGBX;
+    out->step = in->width * PIXEL_RGBX;
     out->sequence = in->sequence;
     out->capture_time = in->capture_time;
     out->source = in->source;
 
+    const int src_stride_y = in->step > 0 ? in->step : in->width;
+    const int src_stride_uv = src_stride_y;
+    const size_t y_plane_bytes = static_cast<size_t>(src_stride_y) * static_cast<size_t>(in->height);
+    const size_t uv_plane_bytes = static_cast<size_t>(src_stride_uv) * static_cast<size_t>(in->height / 2);
+    if (in->data_bytes < y_plane_bytes + uv_plane_bytes)
+        return UVC_ERROR_INVALID_PARAM;
+
     uint8_t *src_y = (uint8_t *) in->data;
-    uint8_t *src_uv = (uint8_t *) in->data + in->width * in->height;
+    uint8_t *src_uv = (uint8_t *) in->data + y_plane_bytes;
     uint8_t *dst = (uint8_t *) out->data;
 
-    int ret = libyuv::NV12ToABGR(src_y, in->width,
-                             src_uv, in->width,
+    int ret = libyuv::NV12ToABGR(src_y, src_stride_y,
+                             src_uv, src_stride_uv,
                              dst, out->step,
                              out->width, out->height);
     if (ret != 0)
@@ -268,6 +278,10 @@ int uvc_nv12_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
 int uvc_nv21_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
     if (in->frame_format != UVC_FRAME_FORMAT_NV21)
         return UVC_ERROR_INVALID_PARAM;
+    if (!in->data || !out || in->width <= 0 || in->height <= 0)
+        return UVC_ERROR_INVALID_PARAM;
+    if ((in->width & 1) || (in->height & 1))
+        return UVC_ERROR_INVALID_PARAM;
 
     if (uvc_ensure_frame_size(out, in->width * in->height * PIXEL_RGBX) < 0)
         return UVC_ERROR_NO_MEM;
@@ -275,18 +289,24 @@ int uvc_nv21_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
     out->width = in->width;
     out->height = in->height;
     out->frame_format = UVC_FRAME_FORMAT_RGBX;
-    if (out->library_owns_data)
-        out->step = in->width * PIXEL_RGBX;
+    out->step = in->width * PIXEL_RGBX;
     out->sequence = in->sequence;
     out->capture_time = in->capture_time;
     out->source = in->source;
 
+    const int src_stride_y = in->step > 0 ? in->step : in->width;
+    const int src_stride_vu = src_stride_y;
+    const size_t y_plane_bytes = static_cast<size_t>(src_stride_y) * static_cast<size_t>(in->height);
+    const size_t vu_plane_bytes = static_cast<size_t>(src_stride_vu) * static_cast<size_t>(in->height / 2);
+    if (in->data_bytes < y_plane_bytes + vu_plane_bytes)
+        return UVC_ERROR_INVALID_PARAM;
+
     uint8_t *src_y = (uint8_t *) in->data;
-    uint8_t *src_vu = (uint8_t *) in->data + in->width * in->height;
+    uint8_t *src_vu = (uint8_t *) in->data + y_plane_bytes;
     uint8_t *dst = (uint8_t *) out->data;
 
-    int ret = libyuv::NV21ToARGB(src_y, in->step ? in->step : in->width,
-                                 src_vu, in->step ? in->step : in->width,
+    int ret = libyuv::NV21ToARGB(src_y, src_stride_y,
+                                 src_vu, src_stride_vu,
                                  dst, out->step,
                                  out->width, out->height);
     if (ret != 0)
@@ -316,6 +336,10 @@ int uvc_nv21_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
 int uvc_i420_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
     if (in->frame_format != UVC_FRAME_FORMAT_I420)
         return UVC_ERROR_INVALID_PARAM;
+    if (!in->data || !out || in->width <= 0 || in->height <= 0)
+        return UVC_ERROR_INVALID_PARAM;
+    if ((in->width & 1) || (in->height & 1))
+        return UVC_ERROR_INVALID_PARAM;
 
     if (uvc_ensure_frame_size(out, in->width * in->height * PIXEL_RGBX) < 0)
         return UVC_ERROR_NO_MEM;
@@ -323,20 +347,28 @@ int uvc_i420_to_rgbx(uvc_frame_t *in, uvc_frame_t *out) {
     out->width = in->width;
     out->height = in->height;
     out->frame_format = UVC_FRAME_FORMAT_RGBX;
-    if (out->library_owns_data)
-        out->step = in->width * PIXEL_RGBX;
+    out->step = in->width * PIXEL_RGBX;
     out->sequence = in->sequence;
     out->capture_time = in->capture_time;
     out->source = in->source;
 
+    const int src_stride_y = in->step > 0 ? in->step : in->width;
+    const int src_stride_u = src_stride_y / 2;
+    const int src_stride_v = src_stride_y / 2;
+    const size_t y_plane_bytes = static_cast<size_t>(src_stride_y) * static_cast<size_t>(in->height);
+    const size_t u_plane_bytes = static_cast<size_t>(src_stride_u) * static_cast<size_t>(in->height / 2);
+    const size_t v_plane_bytes = static_cast<size_t>(src_stride_v) * static_cast<size_t>(in->height / 2);
+    if (in->data_bytes < y_plane_bytes + u_plane_bytes + v_plane_bytes)
+        return UVC_ERROR_INVALID_PARAM;
+
     uint8_t *src_y = (uint8_t *) in->data;
-    uint8_t *src_u = (uint8_t *) in->data + in->width * in->height;
-    uint8_t *src_v = (uint8_t *) in->data + in->width * in->height + (in->width * in->height) / 4;
+    uint8_t *src_u = (uint8_t *) in->data + y_plane_bytes;
+    uint8_t *src_v = src_u + u_plane_bytes;
     uint8_t *dst = (uint8_t *) out->data;
 
-    int ret = libyuv::I420ToARGB(src_y, in->width,
-                                 src_u, in->width / 2,
-                                 src_v, in->width / 2,
+    int ret = libyuv::I420ToARGB(src_y, src_stride_y,
+                                 src_u, src_stride_u,
+                                 src_v, src_stride_v,
                                  dst, out->step,
                                  out->width, out->height);
     if (ret != 0)
