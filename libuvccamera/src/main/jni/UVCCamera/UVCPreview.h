@@ -70,6 +70,7 @@ private:
     // actual format
     int frameWidth, frameHeight;
     int frameFormatType;
+    enum uvc_frame_format negotiatedFrameFormat;
     size_t frameBytes;
 
     pthread_t preview_thread;

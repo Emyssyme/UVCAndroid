@@ -81,6 +81,44 @@ static inline size_t min_frame_bytes_for_format(const uvc_frame_t *frame) {
     }
 }
 
+static inline size_t frame_bytes_for_pixel_format(const int pixel_format, const int width, const int height) {
+    if (width <= 0 || height <= 0) return 0;
+    const size_t wh = static_cast<size_t>(width) * static_cast<size_t>(height);
+    switch (pixel_format) {
+        case PIXEL_FORMAT_RAW:
+        case PIXEL_FORMAT_YUV:
+        case PIXEL_FORMAT_RGB565:
+            return wh * 2;
+        case PIXEL_FORMAT_NV12:
+        case PIXEL_FORMAT_NV21:
+        case PIXEL_FORMAT_I420:
+            if ((width & 1) || (height & 1)) return 0;
+            return (wh * 3) / 2;
+        case PIXEL_FORMAT_RGB:
+        case PIXEL_FORMAT_BGR:
+            return wh * 3;
+        case PIXEL_FORMAT_RGBX:
+            return wh * 4;
+        default:
+            return wh * 4;
+    }
+}
+
+static inline const char *uvc_frame_format_name(const enum uvc_frame_format fmt) {
+    switch (fmt) {
+        case UVC_FRAME_FORMAT_MJPEG: return "MJPEG";
+        case UVC_FRAME_FORMAT_YUYV: return "YUYV";
+        case UVC_FRAME_FORMAT_NV12: return "NV12";
+        case UVC_FRAME_FORMAT_NV21: return "NV21";
+        case UVC_FRAME_FORMAT_I420: return "I420";
+        case UVC_FRAME_FORMAT_RGBX: return "RGBX";
+        case UVC_FRAME_FORMAT_RGB: return "RGB";
+        case UVC_FRAME_FORMAT_BGR: return "BGR";
+        case UVC_FRAME_FORMAT_UNCOMPRESSED: return "UNCOMPRESSED";
+        default: return "OTHER";
+    }
+}
+
 UVCPreview::UVCPreview(uvc_device_handle_t *devh)
         : mPreviewWindow(NULL),
           mCaptureWindow(NULL),
@@ -91,6 +129,7 @@ UVCPreview::UVCPreview(uvc_device_handle_t *devh)
           requestFps(DEFAULT_PREVIEW_FPS),
           frameWidth(DEFAULT_PREVIEW_WIDTH),
           frameHeight(DEFAULT_PREVIEW_HEIGHT),
+          negotiatedFrameFormat(UVC_FRAME_FORMAT_MJPEG),
           frameBytes(DEFAULT_PREVIEW_WIDTH * DEFAULT_PREVIEW_HEIGHT * 2),    // YUYV
           frameFormatType(DEFAULT_PREVIEW_FRAME_TYPE),
           previewBytes(DEFAULT_PREVIEW_WIDTH * DEFAULT_PREVIEW_HEIGHT * PREVIEW_PIXEL_BYTES),
@@ -238,6 +277,7 @@ int UVCPreview::setPreviewSize(int width, int height, int frameType, int fps) {
     requestHeight = height;
     requestFps = fps;
     requestFormatType = frameType;
+    negotiatedFrameFormat = frame_format;
 
     uvc_stream_ctrl_t ctrl;
 
@@ -294,6 +334,10 @@ int UVCPreview::setPreviewSize(int width, int height, int frameType, int fps) {
 #if LOCAL_DEBUG
     uvc_print_stream_ctrl(&ctrl, stderr);
 #endif
+
+    if (result == UVC_SUCCESS) {
+        negotiatedFrameFormat = frame_format;
+    }
 
     RETURN(result, int);
 }
@@ -363,7 +407,9 @@ int UVCPreview::setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pi
 
 void UVCPreview::callbackPixelFormatChanged() {
     mFrameCallbackFunc = NULL;
-    const size_t sz = requestWidth * requestHeight;
+    const int callback_width = frameWidth > 0 ? frameWidth : requestWidth;
+    const int callback_height = frameHeight > 0 ? frameHeight : requestHeight;
+    const size_t sz = static_cast<size_t>(callback_width) * static_cast<size_t>(callback_height);
     switch (mPixelFormat) {
         case PIXEL_FORMAT_RAW:
             LOGI("PIXEL_FORMAT_RAW:");
@@ -615,11 +661,15 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
     uvc_error_t result;
 
     ENTER();
+    const enum uvc_frame_format requested_stream_format =
+            negotiatedFrameFormat ? negotiatedFrameFormat : getFrameFormatByType(requestFormatType);
     result = uvc_get_stream_ctrl_format_size(mDeviceHandle, ctrl,
-                                             getFrameFormatByType(requestFormatType),
+                                             requested_stream_format,
                                              requestWidth, requestHeight,
                                              requestFps
     );
+        LOGI("prepare_preview: requested=%s %dx%d@%dfps",
+            uvc_frame_format_name(requested_stream_format), requestWidth, requestHeight, requestFps);
     if (LIKELY(!result)) {
 #if LOCAL_DEBUG
         uvc_print_stream_ctrl(ctrl, stderr);
@@ -630,8 +680,10 @@ int UVCPreview::prepare_preview(uvc_stream_ctrl_t *ctrl) {
             frameWidth = frame_desc->wWidth;
             frameHeight = frame_desc->wHeight;
             frameFormatType = frame_desc->bDescriptorSubtype;
-            LOGI("frameSize=(%d,%d)@%s", frameWidth, frameHeight,
-                 (requestFormatType == UVC_VS_FRAME_MJPEG ? "MJPEG" : "YUYV"));
+              LOGI("frameSize=(%d,%d) negotiated=%s descSubtype=0x%02x",
+                  frameWidth, frameHeight,
+                  uvc_frame_format_name(requested_stream_format),
+                  frameFormatType & 0xFF);
             pthread_mutex_lock(&preview_mutex);
             if (LIKELY(mPreviewWindow)) {
                 ANativeWindow_setBuffersGeometry(mPreviewWindow,
@@ -699,9 +751,17 @@ void UVCPreview::do_preview(uvc_stream_ctrl_t *ctrl) {
             }
         } else {
             // yuvyv mode
+            bool logged_input_format_once = false;
             for (; LIKELY(isRunning());) {
                 frame_yuv = waitPreviewFrame();
                 if (LIKELY(frame_yuv)) {
+                    if (UNLIKELY(!logged_input_format_once)) {
+                        LOGI("preview_input: fmt=%s %dx%d bytes=%zu step=%zu",
+                             uvc_frame_format_name(frame_yuv->frame_format),
+                             frame_yuv->width, frame_yuv->height,
+                             frame_yuv->data_bytes, frame_yuv->step);
+                        logged_input_format_once = true;
+                    }
                     const size_t min_bytes = min_frame_bytes_for_format(frame_yuv);
                     if (UNLIKELY(min_bytes == 0 || frame_yuv->data_bytes < min_bytes)) {
 #if LOCAL_DEBUG
@@ -821,6 +881,11 @@ void UVCPreview::draw_preview_one(uvc_frame_t *frame, ANativeWindow **window) {
     pthread_mutex_lock(&preview_mutex);
     {
         if (LIKELY(*window != NULL)) {
+            const int32_t win_w = ANativeWindow_getWidth(*window);
+            const int32_t win_h = ANativeWindow_getHeight(*window);
+            if (UNLIKELY(win_w != frame->width || win_h != frame->height)) {
+                ANativeWindow_setBuffersGeometry(*window, frame->width, frame->height, previewFormat);
+            }
             copyToSurface(frame, window);
         }
     }
@@ -1011,12 +1076,14 @@ void UVCPreview::do_capture_callback(JNIEnv *env, uvc_frame_t *frame) {
 //    ENTER();
 
     if (LIKELY(frame)) {
+        static bool logged_callback_path_once = false;
         uvc_frame_t *callback_frame = frame;
-        size_t callback_bytes = callbackPixelBytes;
+        size_t callback_bytes = frame->data_bytes;
         const bool passthrough = can_passthrough_callback_frame(mPixelFormat, frame);
         if (mFrameCallbackObj && iframecallback_fields.onFrame) {
             if (mFrameCallbackFunc && !passthrough) {
-                callback_frame = get_frame(callbackPixelBytes);
+                const size_t expected_bytes = frame_bytes_for_pixel_format(mPixelFormat, frame->width, frame->height);
+                callback_frame = get_frame(expected_bytes > 0 ? expected_bytes : callbackPixelBytes);
                 if (LIKELY(callback_frame)) {
                     int b = mFrameCallbackFunc(frame, callback_frame);
                     recycle_frame(frame);
@@ -1024,6 +1091,7 @@ void UVCPreview::do_capture_callback(JNIEnv *env, uvc_frame_t *frame) {
                         LOGW("failed to convert for callback frame");
                         goto SKIP;
                     }
+                    callback_bytes = callback_frame->data_bytes;
                 } else {
                     LOGW("failed to allocate for callback frame");
                     callback_frame = frame;
@@ -1031,6 +1099,13 @@ void UVCPreview::do_capture_callback(JNIEnv *env, uvc_frame_t *frame) {
                 }
             } else {
                 callback_bytes = frame->data_bytes;
+            }
+            if (UNLIKELY(!logged_callback_path_once)) {
+                LOGI("callback_forward: input=%s passthrough=%d pixelFormat=%d bytes=%zu outBytes=%zu size=%dx%d",
+                     uvc_frame_format_name(frame->frame_format), passthrough ? 1 : 0,
+                     mPixelFormat, frame->data_bytes, callback_bytes,
+                     frame->width, frame->height);
+                logged_callback_path_once = true;
             }
             jobject buf = env->NewDirectByteBuffer(callback_frame->data, callback_bytes);
             env->CallVoidMethod(mFrameCallbackObj, iframecallback_fields.onFrame, buf);

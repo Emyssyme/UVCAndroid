@@ -31,6 +31,7 @@ public class UvcNdiFrameForwarder implements IFrameCallback {
     private int width;
     private int height;
     private long frameCount = 0;
+    private boolean loggedStreamInfoOnce = false;
 
     /**
      * Create a frame forwarder from UVC to NDI
@@ -100,6 +101,20 @@ public class UvcNdiFrameForwarder implements IFrameCallback {
 
             // Send via NDI based on format
             if (frameData != null) {
+                final int expectedBytes = expectedFrameBytes(frameFormat, width, height);
+                if (!loggedStreamInfoOnce) {
+                    Log.i(TAG, "NDI forward start: format=" + frameFormat
+                            + " size=" + width + "x" + height
+                            + " expectedBytes=" + expectedBytes
+                            + " actualBytes=" + frameData.length);
+                    loggedStreamInfoOnce = true;
+                }
+                if (expectedBytes > 0 && frameData.length != expectedBytes) {
+                    Log.w(TAG, "NDI payload size mismatch: format=" + frameFormat
+                            + " size=" + width + "x" + height
+                            + " expectedBytes=" + expectedBytes
+                            + " actualBytes=" + frameData.length);
+                }
                 switch (frameFormat) {
                     case "nv12":
                     case "nv21":
@@ -143,5 +158,19 @@ public class UvcNdiFrameForwarder implements IFrameCallback {
      */
     public void resetFrameCount() {
         frameCount = 0;
+    }
+
+    private static int expectedFrameBytes(String format, int width, int height) {
+        if (width <= 0 || height <= 0) return -1;
+        switch (format) {
+            case "nv12":
+            case "nv21":
+                return (width * height * 3) / 2;
+            case "yuyv":
+            case "yuv422":
+                return width * height * 2;
+            default:
+                return -1;
+        }
     }
 }

@@ -9,6 +9,8 @@
     <string name="action_rotate_90_CCW">Rotate 90 CCW</string>
     <string name="action_flip_horizontally">Flip Horizontally</string>
     <string name="action_flip_vertically">Flip Vertically</string>
+    <string name="action_preview_mode_fill">Preview Mode: Fill</string>
+    <string name="action_preview_mode_fit">Preview Mode: Fit</string>
     
     <string name="saved_preview_size">saved_preview_size</string>
 

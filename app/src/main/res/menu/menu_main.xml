@@ -57,4 +57,10 @@
         android:title="@string/action_flip_vertically"
         android:visible="false"
         app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_preview_fill_toggle"
+        android:title="@string/action_preview_mode_fill"
+        android:visible="false"
+        app:showAsAction="never" />
 </menu>

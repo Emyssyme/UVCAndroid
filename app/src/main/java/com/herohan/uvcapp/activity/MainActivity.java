@@ -22,6 +22,7 @@ import com.herohan.uvcapp.ICameraHelper;
 import com.serenegiant.usb.IButtonCallback;
 import com.serenegiant.usb.Size;
 import com.serenegiant.usb.USBMonitor;
+import com.serenegiant.usb.UVCCamera;
 import com.serenegiant.utils.UriHelper;
 import com.herohan.uvcapp.R;
 import com.herohan.uvcapp.databinding.ActivityMainBinding;
@@ -41,6 +42,7 @@ import android.view.Menu;
 import android.view.MenuItem;
 import android.view.TextureView;
 import android.view.View;
+import android.view.ViewParent;
 import android.widget.Toast;
 
 import java.io.File;
@@ -61,6 +63,9 @@ public class MainActivity extends AppCompatActivity {
 
     private static final int DEFAULT_WIDTH = 640;
     private static final int DEFAULT_HEIGHT = 480;
+    private static final float ASPECT_WARNING_THRESHOLD = 0.03f;
+    private static final float EXPECTED_FIT_FILL_TOLERANCE = 0.92f;
+    private static final float PREVIEW_FILL_EXTRA_SCALE = 1.0f;
 
     /**
      * Camera preview width
@@ -89,6 +94,7 @@ public class MainActivity extends AppCompatActivity {
 
     private boolean mIsRecording = false;
     private boolean mIsCameraConnected = false;
+    private boolean mPreviewFillEnabled = false;
 
     private CameraControlsDialogFragment mControlsDialog;
     private DeviceListDialogFragment mDeviceListDialog;
@@ -181,6 +187,14 @@ public class MainActivity extends AppCompatActivity {
             flipHorizontally();
         } else if (id == R.id.action_flip_vertically) {
             flipVertically();
+        } else if (id == R.id.action_preview_fill_toggle) {
+            mPreviewFillEnabled = !mPreviewFillEnabled;
+            applyPreviewFillTransform();
+            invalidateOptionsMenu();
+            Toast.makeText(this,
+                    mPreviewFillEnabled ? getString(R.string.action_preview_mode_fill)
+                            : getString(R.string.action_preview_mode_fit),
+                    Toast.LENGTH_SHORT).show();
         }
 
         return true;
@@ -196,6 +210,7 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_rotate_90_CCW).setVisible(true);
             menu.findItem(R.id.action_flip_horizontally).setVisible(true);
             menu.findItem(R.id.action_flip_vertically).setVisible(true);
+            menu.findItem(R.id.action_preview_fill_toggle).setVisible(true);
         } else {
             menu.findItem(R.id.action_control).setVisible(false);
             menu.findItem(R.id.action_safely_eject).setVisible(false);
@@ -204,6 +219,13 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_rotate_90_CCW).setVisible(false);
             menu.findItem(R.id.action_flip_horizontally).setVisible(false);
             menu.findItem(R.id.action_flip_vertically).setVisible(false);
+            menu.findItem(R.id.action_preview_fill_toggle).setVisible(false);
+        }
+        final MenuItem previewModeItem = menu.findItem(R.id.action_preview_fill_toggle);
+        if (previewModeItem != null) {
+            previewModeItem.setTitle(mPreviewFillEnabled
+                    ? R.string.action_preview_mode_fill
+                    : R.string.action_preview_mode_fit);
         }
         return super.onPrepareOptionsMenu(menu);
     }
@@ -349,13 +371,23 @@ public class MainActivity extends AppCompatActivity {
         mBinding.viewMainPreview.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
             @Override
             public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surface, int width, int height) {
+                Log.i(TAG, "Preview surface available: " + width + "x" + height);
                 if (mCameraHelper != null) {
                     mCameraHelper.addSurface(surface, false);
                 }
+                mBinding.viewMainPreview.post(() -> {
+                    applyPreviewFillTransform();
+                    logPreviewDiagnostics("surface_available", mCameraHelper != null ? mCameraHelper.getPreviewSize() : null);
+                });
             }
 
             @Override
             public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture surface, int width, int height) {
+                Log.i(TAG, "Preview surface size changed: " + width + "x" + height);
+                mBinding.viewMainPreview.post(() -> {
+                    applyPreviewFillTransform();
+                    logPreviewDiagnostics("surface_size_changed", mCameraHelper != null ? mCameraHelper.getPreviewSize() : null);
+                });
             }
 
             @Override
@@ -438,6 +470,10 @@ public class MainActivity extends AppCompatActivity {
             if (size != null) {
                 Log.i(TAG, "✅ Camera size: " + size.width + "x" + size.height);
                 resizePreviewView(size);
+                mBinding.viewMainPreview.post(() -> {
+                    applyPreviewFillTransform();
+                    logPreviewDiagnostics("camera_open_resize", size);
+                });
             } else {
                 Log.w(TAG, "❌ Could not get camera preview size");
             }
@@ -464,16 +500,26 @@ public class MainActivity extends AppCompatActivity {
             // ✅ Step 3: Register frame callback BEFORE startPreview
             if (mFrameForwarder != null) {
                 try {
-                    mCameraHelper.setFrameCallback(mFrameForwarder, 2); // PIXEL_FORMAT_NV12 = 2
-                    Log.i(TAG, "✅ Frame callback registered with mCameraHelper");
+                    mCameraHelper.setFrameCallback(mFrameForwarder, UVCCamera.PIXEL_FORMAT_NV12);
+                    Log.i(TAG, "✅ Frame callback registered with mCameraHelper (NV12)");
                 } catch (Exception e) {
-                    Log.e(TAG, "❌ Failed to register frame callback", e);
+                    Log.w(TAG, "⚠️ NV12 callback registration failed, fallback to YUV", e);
+                    try {
+                        mCameraHelper.setFrameCallback(mFrameForwarder, UVCCamera.PIXEL_FORMAT_YUV);
+                        Log.i(TAG, "✅ Frame callback registered with mCameraHelper (YUV fallback)");
+                    } catch (Exception fallbackError) {
+                        Log.e(TAG, "❌ Failed to register frame callback", fallbackError);
+                    }
                 }
             }
             
             // ✅ Step 4: Now start preview (frames will flow to NDI)
             mCameraHelper.startPreview();
             Log.i(TAG, "✅ Camera preview started, NDI ready to stream");
+            mBinding.viewMainPreview.postDelayed(() -> {
+                applyPreviewFillTransform();
+                logPreviewDiagnostics("after_start_preview", mCameraHelper != null ? mCameraHelper.getPreviewSize() : size);
+            }, 500);
 
             // Add surface texture for display
             if (mBinding.viewMainPreview.getSurfaceTexture() != null) {
@@ -552,6 +598,93 @@ public class MainActivity extends AppCompatActivity {
         mPreviewHeight = size.height;
         // Set the aspect ratio of TextureView to match the aspect ratio of the camera
         mBinding.viewMainPreview.setAspectRatio(mPreviewWidth, mPreviewHeight);
+        mBinding.viewMainPreview.post(this::applyPreviewFillTransform);
+    }
+
+    private void applyPreviewFillTransform() {
+        final TextureView previewView = mBinding.viewMainPreview;
+        final ViewParent parent = previewView.getParent();
+        if (!(parent instanceof View)) {
+            return;
+        }
+        final View container = (View) parent;
+        final int viewWidth = previewView.getWidth();
+        final int viewHeight = previewView.getHeight();
+        final int containerWidth = container.getWidth();
+        final int containerHeight = container.getHeight();
+        if (viewWidth <= 0 || viewHeight <= 0 || containerWidth <= 0 || containerHeight <= 0) {
+            return;
+        }
+
+        final float finalScale;
+        if (mPreviewFillEnabled) {
+            final float scaleToFill = Math.max(
+                    (float) containerWidth / (float) viewWidth,
+                    (float) containerHeight / (float) viewHeight
+            ) * PREVIEW_FILL_EXTRA_SCALE;
+            finalScale = Math.max(1.0f, scaleToFill);
+        } else {
+            finalScale = 1.0f;
+        }
+        previewView.setPivotX(viewWidth * 0.5f);
+        previewView.setPivotY(viewHeight * 0.5f);
+        previewView.setScaleX(finalScale);
+        previewView.setScaleY(finalScale);
+
+        if (DEBUG) {
+            Log.i(TAG, "[PreviewFill] view=" + viewWidth + "x" + viewHeight
+                    + " container=" + containerWidth + "x" + containerHeight
+                    + " mode=" + (mPreviewFillEnabled ? "fill" : "fit")
+                    + " appliedScale=" + finalScale);
+        }
+    }
+
+    private void logPreviewDiagnostics(@NonNull String stage, @Nullable Size cameraSize) {
+        final TextureView previewView = mBinding.viewMainPreview;
+        final boolean hasSurfaceTexture = previewView.getSurfaceTexture() != null;
+        final int viewWidth = previewView.getWidth();
+        final int viewHeight = previewView.getHeight();
+        final int measuredWidth = previewView.getMeasuredWidth();
+        final int measuredHeight = previewView.getMeasuredHeight();
+        final int screenWidth = getResources().getDisplayMetrics().widthPixels;
+        final int screenHeight = getResources().getDisplayMetrics().heightPixels;
+        final ViewParent parent = previewView.getParent();
+        final int containerWidth = parent instanceof View ? ((View) parent).getWidth() : 0;
+        final int containerHeight = parent instanceof View ? ((View) parent).getHeight() : 0;
+
+        final int camWidth = cameraSize != null ? cameraSize.width : mPreviewWidth;
+        final int camHeight = cameraSize != null ? cameraSize.height : mPreviewHeight;
+
+        final float camAspect = camHeight > 0 ? (float) camWidth / (float) camHeight : 0f;
+        final float viewAspect = viewHeight > 0 ? (float) viewWidth / (float) viewHeight : 0f;
+
+        Log.i(TAG, "[PreviewCheck:" + stage + "] cam=" + camWidth + "x" + camHeight
+                + " view=" + viewWidth + "x" + viewHeight
+                + " measured=" + measuredWidth + "x" + measuredHeight
+            + " container=" + containerWidth + "x" + containerHeight
+                + " screen=" + screenWidth + "x" + screenHeight
+                + " camAspect=" + camAspect + " viewAspect=" + viewAspect);
+
+        if (camAspect > 0f && viewAspect > 0f) {
+            final float aspectDelta = Math.abs(camAspect - viewAspect);
+            if (hasSurfaceTexture && aspectDelta > ASPECT_WARNING_THRESHOLD) {
+                Log.w(TAG, "[PreviewCheck:" + stage + "] Aspect mismatch detected. delta=" + aspectDelta
+                        + " (cam=" + camAspect + ", view=" + viewAspect + ")");
+            }
+        }
+
+        if (hasSurfaceTexture && containerWidth > 0 && containerHeight > 0 && viewWidth > 0 && viewHeight > 0 && camAspect > 0f) {
+            final float viewArea = (float) viewWidth * (float) viewHeight;
+            final float containerArea = (float) containerWidth * (float) containerHeight;
+            final float areaRatio = viewArea / containerArea;
+            final float containerAspect = (float) containerWidth / (float) containerHeight;
+            final float expectedFitAreaRatio = Math.min(containerAspect / camAspect, camAspect / containerAspect);
+            if (areaRatio < expectedFitAreaRatio * EXPECTED_FIT_FILL_TOLERANCE) {
+                Log.w(TAG, "[PreviewCheck:" + stage + "] Preview viewport uses a small part of its container."
+                        + " containerAreaRatio=" + areaRatio
+                        + " expectedFitAreaRatio=" + expectedFitAreaRatio);
+            }
+        }
     }
 
     private void updateUIControls() {
