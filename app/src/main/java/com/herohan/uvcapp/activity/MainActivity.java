@@ -30,6 +30,10 @@ import com.herohan.uvcapp.fragment.DeviceListDialogFragment;
 import com.herohan.uvcapp.fragment.VideoFormatDialogFragment;
 import com.herohan.uvcapp.utils.SaveHelper;
 
+import com.serenegiant.ndi.Ndi;
+import com.serenegiant.ndi.NdiSender;
+import com.serenegiant.ndi.UvcNdiFrameForwarder;
+
 import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.Log;
@@ -74,6 +78,11 @@ public class MainActivity extends AppCompatActivity {
     private UsbDevice mUsbDevice;
     private final ICameraHelper.StateCallback mStateCallback = new MyCameraHelperCallback();
 
+    // NDI Streaming
+    private NdiSender mNdiSender;
+    private UvcNdiFrameForwarder mFrameForwarder;
+    private long mNdiStartTime = 0;
+
     private long mRecordStartTime = 0;
     private Timer mRecordTimer = null;
     private DecimalFormat mDecimalFormat;
@@ -97,6 +106,14 @@ public class MainActivity extends AppCompatActivity {
         checkCameraHelper();
 
         setListeners();
+
+        // Initialize NDI
+        try {
+            Ndi.initialize();
+            Log.i(TAG, "✅ NDI initialized. Version: " + Ndi.getNdiVersion());
+        } catch (Exception e) {
+            Log.e(TAG, "❌ Failed to initialize NDI", e);
+        }
     }
 
     @Override
@@ -415,16 +432,53 @@ public class MainActivity extends AppCompatActivity {
         @Override
         public void onCameraOpen(UsbDevice device) {
             if (DEBUG) Log.v(TAG, "onCameraOpen:device=" + device.getDeviceName());
-            mCameraHelper.startPreview();
-
-            // After connecting to the camera, you can get preview size of the camera
+            
+            // ✅ Step 1: Get camera size FIRST (before any preview setup)
             Size size = mCameraHelper.getPreviewSize();
             if (size != null) {
+                Log.i(TAG, "✅ Camera size: " + size.width + "x" + size.height);
                 resizePreviewView(size);
+            } else {
+                Log.w(TAG, "❌ Could not get camera preview size");
             }
+            
+            // ✅ Step 2: Setup NDI sender and frame forwarder BEFORE callback
+            if (size != null) {
+                try {
+                    mNdiStartTime = SystemClock.elapsedRealtime();
+                    String sourceName = "UVCAndroid-" + mNdiStartTime;
+                    mNdiSender = new NdiSender(sourceName);
+                    Log.i(TAG, "✅ NDI sender created: " + sourceName);
 
+                    // Create frame forwarder
+                    mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, "nv12", null);
+                    mFrameForwarder.setFrameDimensions(size.width, size.height);
+                    Log.i(TAG, "✅ Frame forwarder configured for " + size.width + "x" + size.height);
+                } catch (Exception e) {
+                    Log.e(TAG, "❌ Failed to create NDI sender", e);
+                    mNdiSender = null;
+                    mFrameForwarder = null;
+                }
+            }
+            
+            // ✅ Step 3: Register frame callback BEFORE startPreview
+            if (mFrameForwarder != null) {
+                try {
+                    mCameraHelper.setFrameCallback(mFrameForwarder, 2); // PIXEL_FORMAT_NV12 = 2
+                    Log.i(TAG, "✅ Frame callback registered with mCameraHelper");
+                } catch (Exception e) {
+                    Log.e(TAG, "❌ Failed to register frame callback", e);
+                }
+            }
+            
+            // ✅ Step 4: Now start preview (frames will flow to NDI)
+            mCameraHelper.startPreview();
+            Log.i(TAG, "✅ Camera preview started, NDI ready to stream");
+
+            // Add surface texture for display
             if (mBinding.viewMainPreview.getSurfaceTexture() != null) {
                 mCameraHelper.addSurface(mBinding.viewMainPreview.getSurfaceTexture(), false);
+                Log.i(TAG, "✅ Preview surface added");
             }
 
             mIsCameraConnected = true;
@@ -437,6 +491,25 @@ public class MainActivity extends AppCompatActivity {
 
             if (mIsRecording) {
                 toggleVideoRecord(false);
+            }
+
+            // ✅ Cleanup NDI resources
+            try {
+                if (mCameraHelper != null) {
+                    mCameraHelper.setFrameCallback(null, 0);
+                    Log.i(TAG, "✅ Frame callback unregistered");
+                }
+                if (mFrameForwarder != null) {
+                    mFrameForwarder = null;
+                    Log.i(TAG, "✅ Frame forwarder released");
+                }
+                if (mNdiSender != null) {
+                    mNdiSender.close();
+                    mNdiSender = null;
+                    Log.i(TAG, "✅ NDI Sender closed");
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "❌ Error stopping NDI streaming", e);
             }
 
             if (mCameraHelper != null && mBinding.viewMainPreview.getSurfaceTexture() != null) {
