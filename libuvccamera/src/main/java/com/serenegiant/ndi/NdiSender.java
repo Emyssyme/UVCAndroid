@@ -63,6 +63,16 @@ public class NdiSender {
     }
 
     /**
+     * Send a video frame in NV12 format with explicit frame rate.
+     * Use this for accurate frame rate reporting (e.g., 30fps = fpsN=30000, fpsD=1000).
+     */
+    public void sendVideoNV12WithFps(int width, int height, byte[] data, int fpsN, int fpsD) {
+        if (!closed && instancePointer != 0) {
+            nSendVideoNV12WithFps(instancePointer, width, height, data, fpsN, fpsD);
+        }
+    }
+
+    /**
      * Send a video frame in RGBA format (32-bit, 8 bits per channel with alpha)
      * @param width frame width in pixels
      * @param height frame height in pixels
@@ -146,6 +156,7 @@ public class NdiSender {
     private static native void nSendVideo(long pSend, int width, int height, ByteBuffer buffer);
     private static native void nSendVideoYUYV(long pSend, int w, int h, byte[] data);
     private static native void nSendVideoNV12(long pSend, int w, int h, byte[] data);
+    private static native void nSendVideoNV12WithFps(long pSend, int w, int h, byte[] data, int fpsN, int fpsD);
     private static native void nConvertYuyvToRgba(byte[] yuyv, ByteBuffer rgba, int w, int h);
     private static native void nConvertNv12ToRgba(byte[] nv12, ByteBuffer rgba, int w, int h);
 }

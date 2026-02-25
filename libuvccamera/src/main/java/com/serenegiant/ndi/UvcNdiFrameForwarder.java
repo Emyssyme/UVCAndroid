@@ -30,6 +30,9 @@ public class UvcNdiFrameForwarder implements IFrameCallback {
     private final INdiFrameSender callback;
     private int width;
     private int height;
+    // Frame rate as numerator/denominator (e.g., 30fps = 30000/1000)
+    private int fpsNumerator = 30000;
+    private int fpsDenominator = 1000;
     private long frameCount = 0;
     private boolean loggedStreamInfoOnce = false;
 
@@ -63,6 +66,16 @@ public class UvcNdiFrameForwarder implements IFrameCallback {
     public void setFrameDimensions(int width, int height) {
         this.width = width;
         this.height = height;
+    }
+
+    /**
+     * Set the frame rate for NDI transmission.
+     * @param fpsNumerator   e.g. 30000 for 30fps
+     * @param fpsDenominator e.g. 1000 for 30fps (30000/1000 = 30)
+     */
+    public void setFrameRate(int fpsNumerator, int fpsDenominator) {
+        this.fpsNumerator = fpsNumerator;
+        this.fpsDenominator = fpsDenominator;
     }
 
     /**
@@ -118,7 +131,7 @@ public class UvcNdiFrameForwarder implements IFrameCallback {
                 switch (frameFormat) {
                     case "nv12":
                     case "nv21":
-                        ndiSender.sendVideoNV12(width, height, frameData);
+                        ndiSender.sendVideoNV12WithFps(width, height, frameData, fpsNumerator, fpsDenominator);
                         break;
                     case "yuyv":
                     case "yuv422":

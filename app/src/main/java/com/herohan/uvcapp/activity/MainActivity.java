@@ -489,6 +489,8 @@ public class MainActivity extends AppCompatActivity {
                     // Create frame forwarder
                     mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, "nv12", null);
                     mFrameForwarder.setFrameDimensions(size.width, size.height);
+                    // Set 30fps for NDI (30000/1000). Cam Link 4K outputs 4K@30fps over USB.
+                    mFrameForwarder.setFrameRate(30000, 1000);
                     Log.i(TAG, "✅ Frame forwarder configured for " + size.width + "x" + size.height);
                 } catch (Exception e) {
                     Log.e(TAG, "❌ Failed to create NDI sender", e);
@@ -795,11 +797,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setCustomVideoCaptureConfig() {
+        // For 4K recording: use high bitrate (50 Mbps) and 30fps
+        // Previous value was ~6.4 Mbps which caused severe artifacts at 4K
         mCameraHelper.setVideoCaptureConfig(
                 mCameraHelper.getVideoCaptureConfig()
 //                        .setAudioCaptureEnable(false)
-                        .setBitRate((int) (1024 * 1024 * 25 * 0.25))
-                        .setVideoFrameRate(25)
+                        .setBitRate(50 * 1024 * 1024)
+                        .setVideoFrameRate(30)
                         .setIFrameInterval(1));
     }
 

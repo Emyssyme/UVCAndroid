@@ -22,7 +22,7 @@ extern "C" {
         
         send_create_struct.p_ndi_name = sourceName;
         send_create_struct.clock_audio = false;  // We manage audio timing ourselves
-        send_create_struct.clock_video = false;  // We manage video timing ourselves
+        send_create_struct.clock_video = true;   // Let NDI SDK handle video frame pacing for smooth playback
         
         // Create the sender
         NDIlib_send_instance_t sender = NDIlib_send_create(&send_create_struct);
@@ -157,18 +157,49 @@ extern "C" {
         videoFrame.yres = height;
         videoFrame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
         videoFrame.p_data = reinterpret_cast<uint8_t*>(dataPtr);
-        // NV12: Y plane = width * height, UV plane = width * height/2 (packed)
-        // Line stride is width for Y, width for UV (but UV is interleaved with 2x horizontal stride)
-        videoFrame.line_stride_in_bytes = width;
+        // NV12: line stride must be the full row width in bytes (Y plane stride = width)
+        // NDI expects stride to match the actual memory layout of the Y plane
+        videoFrame.line_stride_in_bytes = width; // correct: 1 byte per pixel for Y plane
         videoFrame.FourCC = NDIlib_FourCC_type_NV12;
-        videoFrame.frame_rate_N = 30000;
-        videoFrame.frame_rate_D = 1000;
+        // Use 60000/2000 = 30fps; adjust numerator/denominator for other rates
+        videoFrame.frame_rate_N = 60000;
+        videoFrame.frame_rate_D = 2000;
         videoFrame.p_metadata = nullptr;
 
         // Send the frame (async)
         NDIlib_send_send_video_v2(sender, &videoFrame);
 
         // Release array
+        env->ReleaseByteArrayElements(jData, dataPtr, JNI_ABORT);
+    }
+
+    /**
+     * Send video frame in NV12 format with explicit frame rate
+     */
+    JNIEXPORT void JNICALL
+    Java_com_serenegiant_ndi_NdiSender_nSendVideoNV12WithFps(JNIEnv* env, jclass jClazz,
+                                                              jlong pSend, jint width, jint height,
+                                                              jbyteArray jData, jint fpsN, jint fpsD) {
+        auto sender = reinterpret_cast<NDIlib_send_instance_t>(pSend);
+        if (sender == nullptr) return;
+
+        jbyte* dataPtr = env->GetByteArrayElements(jData, nullptr);
+        if (dataPtr == nullptr) return;
+
+        NDIlib_video_frame_v2_t videoFrame;
+        std::memset(&videoFrame, 0, sizeof(videoFrame));
+
+        videoFrame.xres = width;
+        videoFrame.yres = height;
+        videoFrame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
+        videoFrame.p_data = reinterpret_cast<uint8_t*>(dataPtr);
+        videoFrame.line_stride_in_bytes = width;
+        videoFrame.FourCC = NDIlib_FourCC_type_NV12;
+        videoFrame.frame_rate_N = fpsN;
+        videoFrame.frame_rate_D = fpsD;
+        videoFrame.p_metadata = nullptr;
+
+        NDIlib_send_send_video_v2(sender, &videoFrame);
         env->ReleaseByteArrayElements(jData, dataPtr, JNI_ABORT);
     }
 
