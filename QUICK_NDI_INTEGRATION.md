@@ -2,6 +2,14 @@
 
 This guide shows how to add NDI streaming to an existing UVCAndroid-based application in just a few lines of code.
 
+> **Note:** the sender now tags frames as *progressive* and advertises 30 fps, so receivers (OBS, etc.) will see 4K‑30p instead of defaulting to 60i.
+
+> **Note on streams:** preview, NDI and file recording are three independent consumers of the
+> camera frames.  Preview is drawn to a Surface/TextureView, NDI uses a frame callback, and
+> recording (if you need it) is handled by a separate encoder configuration.  They can all run
+> concurrently and you can adjust each path independently.  The NDI flow still starts
+> automatically as shown below, while you are free to tune recording for the best compression.
+
 ## Step 1: Update Your Activity Constructor
 
 Add NDI initialization:
@@ -26,6 +34,9 @@ protected void onCreate(Bundle savedInstanceState) {
 ```
 
 ## Step 2: Create NDI Sender When Camera is Ready
+
+(Preview configuration is unaffected – you keep whatever surface/texture setup you already had.)
+
 
 ```java
 import com.serenegiant.ndi.NdiSender;
@@ -66,6 +77,31 @@ if (mNdiForwarder != null) {
     mUVCCamera.setFrameCallback(null, 0);
 }
 ```
+
+## Step 3.5: (Optional) Configure High‑Quality Recording
+
+If you also want to record a local file with the best possible quality, adjust the video capture
+configuration before starting the camera.  The example app uses `CameraHelper`, but the idea is
+that you increase the bitrate/frame‑rate to whatever your device and storage can sustain.
+
+```java
+// call this once (for example from onCreate) before opening the camera
+private void setCustomVideoCaptureConfig() {
+    mCameraHelper.setVideoCaptureConfig(
+            mCameraHelper.getVideoCaptureConfig()
+                    // use a large bitrate for high quality
+                    .setBitRate(30 * 1024 * 1024)   // 30 Mbps
+                    .setVideoFrameRate(30)
+                    .setIFrameInterval(1)
+                    // optionally disable audio if you only need video
+                    //.setAudioCaptureEnable(false)
+    );
+}
+```
+
+Then start/stop recording as shown in the main app (`toggleVideoRecord()` etc.).  This
+configuration is completely separate from the NDI sender; recording uses the usual
+`VideoCapture` path and does **not** affect the NDI or preview streams.
 
 ## Step 4: Cleanup in onDestroy
 
@@ -133,6 +169,8 @@ public class CameraActivity extends Activity {
         }
         
         mTextureView = findViewById(R.id.camera_view);
+    // NOTE: the UVCCameraTextureView supports pinch‑to‑zoom and double‑tap (100%)
+    // so you can see the original resolution even when the view is smaller.
         mUSBMonitor = new USBMonitor(this, onDeviceConnectListener);
         mUSBMonitor.register();
     }
@@ -148,11 +186,12 @@ public class CameraActivity extends Activity {
                 // NEW: Setup NDI when camera is ready
                 setupNdiStreaming();
                 
-                // Start camera
+                // Start camera preview (regular Surface/TextureView path)
                 mUVCCamera.setPreviewSize(1920, 1080);
                 mUVCCamera.setPreviewDisplay(mTextureView.getSurfaceTexture());
                 
-                // NEW: Forward frames to NDI
+                // NEW: Forward frames to NDI.  This callback runs in parallel to the preview
+                // and does not interfere with the Surface output; the two streams are independent.
                 if (mNdiForwarder != null) {
                     mUVCCamera.setFrameCallback(mNdiForwarder, UVCCamera.PIXEL_FORMAT_NV12);
                 }
@@ -233,16 +272,27 @@ public class CameraActivity extends Activity {
 
 ## Format Support
 
-Update the format string based on your camera:
+Update the format string based on your camera and desired bandwidth:
 
 ```java
-// For NV12 (most common for modern USB capture cards)
-mNdiForwarder = new UvcNdiFrameForwarder(mNdiSender, "nv12");
+// Default (maximum quality)
+// the forwarder will transmit RGBA frames; this mode uses the most bandwidth but
+// avoids additional NDI compression.  Your network must support the resulting
+// data rate (e.g. several hundred Mbps at 1080p30).
+mNdiForwarder = new UvcNdiFrameForwarder(mNdiSender, "rgba");
 mUVCCamera.setFrameCallback(mNdiForwarder, UVCCamera.PIXEL_FORMAT_NV12);
 
-// For YUYV
-mNdiForwarder = new UvcNdiFrameForwarder(mNdiSender, "yuyv");
-mUVCCamera.setFrameCallback(mNdiForwarder, UVCCamera.PIXEL_FORMAT_YUYV);
+// Alternative efficient formats:
+// mNdiForwarder = new UvcNdiFrameForwarder(mNdiSender, "nv12");
+// mUVCCamera.setFrameCallback(mNdiForwarder, UVCCamera.PIXEL_FORMAT_NV12);
+
+// mNdiForwarder = new UvcNdiFrameForwarder(mNdiSender, "yuyv");
+// mUVCCamera.setFrameCallback(mNdiForwarder, UVCCamera.PIXEL_FORMAT_YUYV);
+```
+```markdown
+// Note: the preview path itself is unaffected by this choice; only the network
+// stream changes.  RGBA will generate very high bandwidth usage (e.g. ~370 Mbps
+// at 1080p30) so use it only on fast LANs or for short bursts.
 ```
 
 ## Testing
@@ -284,11 +334,13 @@ After adding NDI support:
 
 ## Next Steps
 
-1. **Add UI controls** - Button to start/stop streaming
+1. **Add UI controls** - Button to start/stop streaming *and* toggle NDI quality.  The sample app now includes an ``NDI Mode`` entry in the overflow menu which switches between
+   high‑quality (RGBA) and efficient (NV12) on the fly.
 2. **Add event callbacks** - Monitor stream quality
 3. **Add frame rate control** - Adjust FPS based on network
 4. **Add resolution selection** - Dynamic resolution change
 5. **Add audio support** - Future enhancement
+
 
 See [NDI_INTEGRATION_GUIDE.md](NDI_INTEGRATION_GUIDE.md) for advanced usage patterns.
 

@@ -48,13 +48,17 @@ public class AspectRatioTextureView extends TextureView    // API >= 14
     private static final boolean DEBUG = BuildConfig.DEBUG;    // TODO set false on release
     private static final String TAG = AspectRatioTextureView.class.getSimpleName();
     private static final float MIN_SCALE = 1.0f;
-    private static final float MAX_SCALE = 5.0f;
+    // default maximum scale, can be changed dynamically via setMaxScale()
+    private static final float DEFAULT_MAX_SCALE = 5.0f;
 
     private double mRequestedAspect = -1.0;
     private CameraViewInterface.Callback mCallback;
     private float mCurrentScale = MIN_SCALE;
     private float mTranslationX = 0f;
     private float mTranslationY = 0f;
+    // maximum allowed scale (may be greater than DEFAULT_MAX_SCALE when showing 1:1 pixels)
+    private float mMaxScale = DEFAULT_MAX_SCALE;
+
     private final ScaleGestureDetector mScaleGestureDetector;
     private final GestureDetector mGestureDetector;
 
@@ -73,7 +77,8 @@ public class AspectRatioTextureView extends TextureView    // API >= 14
         mScaleGestureDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override
             public boolean onScale(ScaleGestureDetector detector) {
-                final float targetScale = clamp(mCurrentScale * detector.getScaleFactor(), MIN_SCALE, MAX_SCALE);
+                // clamp target scale between MIN_SCALE and dynamic mMaxScale
+                final float targetScale = clamp(mCurrentScale * detector.getScaleFactor(), MIN_SCALE, mMaxScale);
                 final float appliedScale = targetScale / mCurrentScale;
                 if (Math.abs(appliedScale - 1.0f) < 1e-4f) {
                     return false;
@@ -99,6 +104,20 @@ public class AspectRatioTextureView extends TextureView    // API >= 14
                 mTranslationX -= distanceX;
                 mTranslationY -= distanceY;
                 applyTouchTransform();
+                return true;
+            }
+
+            @Override
+            public boolean onDoubleTap(MotionEvent e) {
+                // toggle between original size (max scale) and fit-to-view
+                if (Math.abs(mCurrentScale - MIN_SCALE) < 1e-4f) {
+                    setPivotX(e.getX());
+                    setPivotY(e.getY());
+                    mCurrentScale = mMaxScale;
+                    applyTouchTransform();
+                } else {
+                    resetTouchTransform();
+                }
                 return true;
             }
         });
@@ -171,6 +190,28 @@ public class AspectRatioTextureView extends TextureView    // API >= 14
 
     private static float clamp(float value, float min, float max) {
         return Math.max(min, Math.min(max, value));
+    }
+
+    /**
+     * change the maximum allowed scale factor for zoom operations
+     * @param maxScale new maximum; must be >= MIN_SCALE
+     */
+    public void setMaxScale(final float maxScale) {
+        if (maxScale >= MIN_SCALE) {
+            mMaxScale = maxScale;
+            // if current scale is greater than new max, clamp it
+            if (mCurrentScale > mMaxScale) {
+                mCurrentScale = mMaxScale;
+                applyTouchTransform();
+            }
+        }
+    }
+
+    /**
+     * return the currently configured maximum zoom scale
+     */
+    public float getMaxScale() {
+        return mMaxScale;
     }
 
     @Override

@@ -77,11 +77,12 @@ extern "C" {
         videoFrame.xres = width;
         videoFrame.yres = height;
         videoFrame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
+        videoFrame.frame_format_type = NDIlib_frame_format_type_progressive;
         videoFrame.p_data = static_cast<uint8_t*>(bufferPtr);
         videoFrame.line_stride_in_bytes = width * 4; // Assume RGBA
         videoFrame.FourCC = NDIlib_FourCC_type_RGBA;
         videoFrame.frame_rate_N = 30000;
-        videoFrame.frame_rate_D = 1000;
+        videoFrame.frame_rate_D = 1001;  // 29.97 fps typical
         videoFrame.p_metadata = nullptr;
 
         // Send the frame (async)
@@ -115,11 +116,12 @@ extern "C" {
         videoFrame.xres = width;
         videoFrame.yres = height;
         videoFrame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
+        videoFrame.frame_format_type = NDIlib_frame_format_type_progressive;
         videoFrame.p_data = reinterpret_cast<uint8_t*>(dataPtr);
         videoFrame.line_stride_in_bytes = width * 2; // YUYV is 2 bytes per pixel
         videoFrame.FourCC = NDIlib_FourCC_type_UYVY;
         videoFrame.frame_rate_N = 30000;
-        videoFrame.frame_rate_D = 1000;
+        videoFrame.frame_rate_D = 1001;
         videoFrame.p_metadata = nullptr;
 
         // Send the frame (async)
@@ -156,13 +158,14 @@ extern "C" {
         videoFrame.xres = width;
         videoFrame.yres = height;
         videoFrame.picture_aspect_ratio = static_cast<float>(width) / static_cast<float>(height);
+        videoFrame.frame_format_type = NDIlib_frame_format_type_progressive;
         videoFrame.p_data = reinterpret_cast<uint8_t*>(dataPtr);
         // NV12: Y plane = width * height, UV plane = width * height/2 (packed)
         // Line stride is width for Y, width for UV (but UV is interleaved with 2x horizontal stride)
         videoFrame.line_stride_in_bytes = width;
         videoFrame.FourCC = NDIlib_FourCC_type_NV12;
         videoFrame.frame_rate_N = 30000;
-        videoFrame.frame_rate_D = 1000;
+        videoFrame.frame_rate_D = 1001;
         videoFrame.p_metadata = nullptr;
 
         // Send the frame (async)

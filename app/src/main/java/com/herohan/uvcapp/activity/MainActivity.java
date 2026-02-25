@@ -36,6 +36,9 @@ import com.serenegiant.ndi.NdiSender;
 import com.serenegiant.ndi.UvcNdiFrameForwarder;
 
 import android.os.SystemClock;
+import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaFormat;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.Menu;
@@ -46,6 +49,8 @@ import android.view.ViewParent;
 import android.widget.Toast;
 
 import java.io.File;
+import java.net.InetAddress;
+import java.nio.ByteBuffer;
 import java.text.DecimalFormat;
 import java.util.Timer;
 import java.util.TimerTask;
@@ -79,11 +84,13 @@ public class MainActivity extends AppCompatActivity {
     private int mPreviewRotation = 0;
 
     private ICameraHelper mCameraHelper;
+    private MultiFrameCallback mMultiCallback; // dispatches frames to NDI/RTP
 
     private UsbDevice mUsbDevice;
     private final ICameraHelper.StateCallback mStateCallback = new MyCameraHelperCallback();
 
     // NDI Streaming
+    private static final String DEFAULT_NDI_FORMAT = "rgba"; // highest-quality, uncompressed
     private NdiSender mNdiSender;
     private UvcNdiFrameForwarder mFrameForwarder;
     private long mNdiStartTime = 0;
@@ -95,6 +102,8 @@ public class MainActivity extends AppCompatActivity {
     private boolean mIsRecording = false;
     private boolean mIsCameraConnected = false;
     private boolean mPreviewFillEnabled = false;
+    private boolean mNdiHighQuality = true;   // toggle state for NDI mode
+    // RTP streaming removed per request; keep NDI only
 
     private CameraControlsDialogFragment mControlsDialog;
     private DeviceListDialogFragment mDeviceListDialog;
@@ -195,8 +204,15 @@ public class MainActivity extends AppCompatActivity {
                     mPreviewFillEnabled ? getString(R.string.action_preview_mode_fill)
                             : getString(R.string.action_preview_mode_fit),
                     Toast.LENGTH_SHORT).show();
+        } else if (id == R.id.action_ndimode) {
+            // toggle NDI format
+            setNdiFormat(!mNdiHighQuality);
+            invalidateOptionsMenu();
+            Toast.makeText(this,
+                    mNdiHighQuality ? getString(R.string.action_ndimode_high)
+                                   : getString(R.string.action_ndimode_low),
+                    Toast.LENGTH_SHORT).show();
         }
-
         return true;
     }
 
@@ -211,6 +227,7 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_flip_horizontally).setVisible(true);
             menu.findItem(R.id.action_flip_vertically).setVisible(true);
             menu.findItem(R.id.action_preview_fill_toggle).setVisible(true);
+            menu.findItem(R.id.action_ndimode).setVisible(true);
         } else {
             menu.findItem(R.id.action_control).setVisible(false);
             menu.findItem(R.id.action_safely_eject).setVisible(false);
@@ -220,12 +237,19 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_flip_horizontally).setVisible(false);
             menu.findItem(R.id.action_flip_vertically).setVisible(false);
             menu.findItem(R.id.action_preview_fill_toggle).setVisible(false);
+            menu.findItem(R.id.action_ndimode).setVisible(false);
         }
         final MenuItem previewModeItem = menu.findItem(R.id.action_preview_fill_toggle);
         if (previewModeItem != null) {
             previewModeItem.setTitle(mPreviewFillEnabled
                     ? R.string.action_preview_mode_fill
                     : R.string.action_preview_mode_fit);
+        }
+        final MenuItem ndiModeItem = menu.findItem(R.id.action_ndimode);
+        if (ndiModeItem != null) {
+            ndiModeItem.setTitle(mNdiHighQuality
+                    ? R.string.action_ndimode_high
+                    : R.string.action_ndimode_low);
         }
         return super.onPrepareOptionsMenu(menu);
     }
@@ -314,6 +338,35 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * Switch between high‑quality RGBA and efficient YUV NDI modes.
+     * This tears down and re‑creates the forwarder and updates callback.
+     */
+    private void setNdiFormat(final boolean highQuality) {
+        // change desired output type without tearing down camera
+        mNdiHighQuality = highQuality;
+        if (mFrameForwarder != null) {
+            mFrameForwarder.setNdiFormat(mNdiHighQuality ? "rgba" : "nv12");
+            Log.i(TAG, "NDI format set to " + (mNdiHighQuality ? "RGBA" : "NV12"));
+        }
+        // re-register combined callback so that the correct frame receiver is used
+        if (mCameraHelper != null && mMultiCallback != null) {
+            mCameraHelper.setFrameCallback(mMultiCallback, UVCCamera.PIXEL_FORMAT_NV12);
+        }
+    }
+
+    // PROMOTE incoming UVC frames to NDI and/or RTP
+    // frame callback for NDI only
+    private class MultiFrameCallback implements com.serenegiant.usb.IFrameCallback {
+        @Override
+        public void onFrame(java.nio.ByteBuffer frame) {
+            if (mFrameForwarder != null) {
+                mFrameForwarder.onFrame(frame);
+            }
+        }
+    }
+
+
     private void rotateBy(int angle) {
         mPreviewRotation += angle;
         mPreviewRotation %= 360;
@@ -375,6 +428,8 @@ public class MainActivity extends AppCompatActivity {
                 if (mCameraHelper != null) {
                     mCameraHelper.addSurface(surface, false);
                 }
+                // give a quick hint about zooming controls
+                Toast.makeText(MainActivity.this, "Preview: pinch to zoom, double-tap for 100%", Toast.LENGTH_SHORT).show();
                 mBinding.viewMainPreview.post(() -> {
                     applyPreviewFillTransform();
                     logPreviewDiagnostics("surface_available", mCameraHelper != null ? mCameraHelper.getPreviewSize() : null);
@@ -387,6 +442,18 @@ public class MainActivity extends AppCompatActivity {
                 mBinding.viewMainPreview.post(() -> {
                     applyPreviewFillTransform();
                     logPreviewDiagnostics("surface_size_changed", mCameraHelper != null ? mCameraHelper.getPreviewSize() : null);
+                    // update zoom limit in case the view dimension changed
+                    final TextureView previewView = mBinding.viewMainPreview;
+                    final int viewW = previewView.getWidth();
+                    final int viewH = previewView.getHeight();
+                    if (viewW > 0 && viewH > 0) {
+                        final float scaleX = (float) mPreviewWidth / (float) viewW;
+                        final float scaleY = (float) mPreviewHeight / (float) viewH;
+                        final float required = Math.max(1.0f, Math.max(scaleX, scaleY));
+                        if (previewView instanceof com.serenegiant.widget.UVCCameraTextureView) {
+                            ((com.serenegiant.widget.UVCCameraTextureView)previewView).setMaxScale(required);
+                        }
+                    }
                 });
             }
 
@@ -478,7 +545,7 @@ public class MainActivity extends AppCompatActivity {
                 Log.w(TAG, "❌ Could not get camera preview size");
             }
             
-            // ✅ Step 2: Setup NDI sender and frame forwarder BEFORE callback
+            // ✅ Step 2: Setup NDI sender and forwarder (format toggled via helper)
             if (size != null) {
                 try {
                     mNdiStartTime = SystemClock.elapsedRealtime();
@@ -486,10 +553,11 @@ public class MainActivity extends AppCompatActivity {
                     mNdiSender = new NdiSender(sourceName);
                     Log.i(TAG, "✅ NDI sender created: " + sourceName);
 
-                    // Create frame forwarder
+                    // create forwarder with known camera format (assume NV12)
                     mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, "nv12", null);
                     mFrameForwarder.setFrameDimensions(size.width, size.height);
-                    Log.i(TAG, "✅ Frame forwarder configured for " + size.width + "x" + size.height);
+                    // now apply quality mode (will register callback)
+                    setNdiFormat(mNdiHighQuality);
                 } catch (Exception e) {
                     Log.e(TAG, "❌ Failed to create NDI sender", e);
                     mNdiSender = null;
@@ -497,19 +565,18 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
             
-            // ✅ Step 3: Register frame callback BEFORE startPreview
-            if (mFrameForwarder != null) {
+            // ✅ Step 3: register a combined frame callback BEFORE startPreview
+            mMultiCallback = new MultiFrameCallback();
+            try {
+                mCameraHelper.setFrameCallback(mMultiCallback, UVCCamera.PIXEL_FORMAT_NV12);
+                Log.i(TAG, "✅ Multi-frame callback registered with mCameraHelper (NV12)");
+            } catch (Exception e) {
+                Log.w(TAG, "⚠️ NV12 callback registration failed, fallback to YUV", e);
                 try {
-                    mCameraHelper.setFrameCallback(mFrameForwarder, UVCCamera.PIXEL_FORMAT_NV12);
-                    Log.i(TAG, "✅ Frame callback registered with mCameraHelper (NV12)");
-                } catch (Exception e) {
-                    Log.w(TAG, "⚠️ NV12 callback registration failed, fallback to YUV", e);
-                    try {
-                        mCameraHelper.setFrameCallback(mFrameForwarder, UVCCamera.PIXEL_FORMAT_YUV);
-                        Log.i(TAG, "✅ Frame callback registered with mCameraHelper (YUV fallback)");
-                    } catch (Exception fallbackError) {
-                        Log.e(TAG, "❌ Failed to register frame callback", fallbackError);
-                    }
+                    mCameraHelper.setFrameCallback(mMultiCallback, UVCCamera.PIXEL_FORMAT_YUV);
+                    Log.i(TAG, "✅ Multi-frame callback registered with mCameraHelper (YUV fallback)");
+                } catch (Exception fallbackError) {
+                    Log.e(TAG, "❌ Failed to register multi-frame callback", fallbackError);
                 }
             }
             
@@ -539,7 +606,7 @@ public class MainActivity extends AppCompatActivity {
                 toggleVideoRecord(false);
             }
 
-            // ✅ Cleanup NDI resources
+            // ✅ Cleanup NDI/RTP resources
             try {
                 if (mCameraHelper != null) {
                     mCameraHelper.setFrameCallback(null, 0);
@@ -554,8 +621,8 @@ public class MainActivity extends AppCompatActivity {
                     mNdiSender = null;
                     Log.i(TAG, "✅ NDI Sender closed");
                 }
-            } catch (Exception e) {
-                Log.e(TAG, "❌ Error stopping NDI streaming", e);
+                } catch (Exception e) {
+                Log.e(TAG, "❌ Error stopping streams", e);
             }
 
             if (mCameraHelper != null && mBinding.viewMainPreview.getSurfaceTexture() != null) {
@@ -593,12 +660,29 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void resizePreviewView(Size size) {
-        // Update the preview size
+        // Update the preview size (camera capture resolution)
         mPreviewWidth = size.width;
         mPreviewHeight = size.height;
         // Set the aspect ratio of TextureView to match the aspect ratio of the camera
         mBinding.viewMainPreview.setAspectRatio(mPreviewWidth, mPreviewHeight);
+        // apply fill/fit transform if necessary
         mBinding.viewMainPreview.post(this::applyPreviewFillTransform);
+        
+        // calculate the zoom factor required for 1:1 pixel mapping and update maxscale
+        mBinding.viewMainPreview.post(() -> {
+            final TextureView previewView = mBinding.viewMainPreview;
+            final int viewW = previewView.getWidth();
+            final int viewH = previewView.getHeight();
+            if (viewW > 0 && viewH > 0) {
+                final float scaleX = (float) mPreviewWidth / (float) viewW;
+                final float scaleY = (float) mPreviewHeight / (float) viewH;
+                final float required = Math.max(1.0f, Math.max(scaleX, scaleY));
+                if (previewView instanceof com.serenegiant.widget.UVCCameraTextureView) {
+                    ((com.serenegiant.widget.UVCCameraTextureView)previewView).setMaxScale(required);
+                    if (DEBUG) Log.i(TAG, "set max preview zoom scale=" + required);
+                }
+            }
+        });
     }
 
     private void applyPreviewFillTransform() {
@@ -795,11 +879,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setCustomVideoCaptureConfig() {
+        // this config only affects the recorded file; NDI/preview are independent
         mCameraHelper.setVideoCaptureConfig(
                 mCameraHelper.getVideoCaptureConfig()
-//                        .setAudioCaptureEnable(false)
-                        .setBitRate((int) (1024 * 1024 * 25 * 0.25))
-                        .setVideoFrameRate(25)
+//                        .setAudioCaptureEnable(false) // disable audio if not needed
+                        // bump bitrate up to max allowed by your device/network for best image quality
+                        .setBitRate(30 * 1024 * 1024)   // ~30 Mbps
+                        .setVideoFrameRate(30)
                         .setIFrameInterval(1));
     }
 

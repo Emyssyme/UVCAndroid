@@ -69,7 +69,9 @@ public class UVCCameraTextureView extends AspectRatioTextureView    // API >= 14
     private boolean mRequestCaptureStillImage;
     private Callback mCallback;
     private static final float MIN_SCALE = 1.0f;
-    private static final float MAX_SCALE = 5.0f;
+    private static final float DEFAULT_MAX_SCALE = 5.0f;
+    // dynamic maximum zoom scale; updated from outside when camera resolution/preview size changes
+    private float mMaxScale = DEFAULT_MAX_SCALE;
     private float mCurrentScale = MIN_SCALE;
     private final Matrix mTouchTransform = new Matrix();
     private final ScaleGestureDetector mScaleGestureDetector;
@@ -95,7 +97,7 @@ public class UVCCameraTextureView extends AspectRatioTextureView    // API >= 14
         mScaleGestureDetector = new ScaleGestureDetector(context, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
             @Override
             public boolean onScale(ScaleGestureDetector detector) {
-                final float targetScale = clamp(mCurrentScale * detector.getScaleFactor(), MIN_SCALE, MAX_SCALE);
+                final float targetScale = clamp(mCurrentScale * detector.getScaleFactor(), MIN_SCALE, mMaxScale);
                 final float appliedScale = targetScale / mCurrentScale;
                 if (Math.abs(appliedScale - 1.0f) < 1e-4f) {
                     return false;
@@ -121,6 +123,19 @@ public class UVCCameraTextureView extends AspectRatioTextureView    // API >= 14
                 mTouchTransform.postTranslate(-distanceX, -distanceY);
                 constrainTranslation();
                 applyTouchTransform();
+                return true;
+            }
+
+            @Override
+            public boolean onDoubleTap(MotionEvent e) {
+                if (Math.abs(mCurrentScale - MIN_SCALE) < 1e-4f) {
+                    mTouchTransform.postScale(mMaxScale, mMaxScale, e.getX(), e.getY());
+                    mCurrentScale = mMaxScale;
+                    constrainTranslation();
+                    applyTouchTransform();
+                } else {
+                    resetTouchTransform();
+                }
                 return true;
             }
         });
@@ -195,6 +210,24 @@ public class UVCCameraTextureView extends AspectRatioTextureView    // API >= 14
 
     private static float clamp(float value, float min, float max) {
         return Math.max(min, Math.min(max, value));
+    }
+
+    /**
+     * change the maximum zoom scale (used to reach pixel‑perfect preview)
+     * @param maxScale must be >= MIN_SCALE
+     */
+    public void setMaxScale(final float maxScale) {
+        if (maxScale >= MIN_SCALE) {
+            mMaxScale = maxScale;
+            if (mCurrentScale > mMaxScale) {
+                mCurrentScale = mMaxScale;
+                applyTouchTransform();
+            }
+        }
+    }
+
+    public float getMaxScale() {
+        return mMaxScale;
     }
 
     @Override
