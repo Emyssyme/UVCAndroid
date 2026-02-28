@@ -46,10 +46,35 @@ public class NdiCameraExampleActivity extends Activity {
     private TextView mStatusText;
     private Button mStartButton;
     private Button mStopButton;
+    private View mTallyIndicator;
     
     private final AtomicBoolean mNdiActive = new AtomicBoolean(false);
     private long mFrameCount = 0;
     private long mLastStatusUpdate = 0;
+
+    // handler for periodic tasks
+    private final android.os.Handler mHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable mTallyPoller = new Runnable() {
+        @Override
+        public void run() {
+            if (mNdiSender != null) {
+                NdiSender.Tally tally = mNdiSender.getTally();
+                if (tally != null) {
+                    if (tally.program) {
+                        mTallyIndicator.setBackgroundColor(android.graphics.Color.RED);
+                    } else if (tally.preview) {
+                        mTallyIndicator.setBackgroundColor(android.graphics.Color.GREEN);
+                    } else {
+                        mTallyIndicator.setBackgroundColor(android.graphics.Color.GRAY);
+                    }
+                }
+            }
+            // schedule again if still active
+            if (mNdiActive.get()) {
+                mHandler.postDelayed(this, 50);
+            }
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -69,6 +94,7 @@ public class NdiCameraExampleActivity extends Activity {
 
         // Setup UI
         mStatusText = findViewById(R.id.status_text);
+        mTallyIndicator = findViewById(R.id.tally_indicator);
         mStartButton = findViewById(R.id.start_button);
         mStopButton = findViewById(R.id.stop_button);
         mTextureView = findViewById(R.id.camera_view);
@@ -143,6 +169,8 @@ public class NdiCameraExampleActivity extends Activity {
             String sourceName = "AndroidCamera-" + System.currentTimeMillis();
             mNdiSender = new NdiSender(sourceName);
             Log.i(TAG, "NDI sender created: " + sourceName);
+            // start polling tally state
+            mHandler.post(mTallyPoller);
 
             // Create frame forwarder
             mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, "nv12", new INdiFrameSender() {
@@ -218,6 +246,8 @@ public class NdiCameraExampleActivity extends Activity {
         if (!mNdiActive.getAndSet(false)) {
             return;
         }
+        // stop tally polling immediately
+        stopTallyPolling();
 
         try {
             if (mUVCCamera != null) {

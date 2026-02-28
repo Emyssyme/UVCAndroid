@@ -29,6 +29,15 @@
         android:backgroundColor="#f0f0f0"
         android:padding="8dp" />
 
+    <!-- simple circular view used as tally indicator -->
+    <View
+        android:id="@+id/tally_indicator"
+        android:layout_width="36dp"
+        android:layout_height="36dp"
+        android:layout_gravity="center_horizontal"
+        android:layout_marginTop="8dp"
+        android:background="@drawable/tally_circle" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"

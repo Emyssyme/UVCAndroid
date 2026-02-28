@@ -47,6 +47,8 @@ import android.view.TextureView;
 import android.view.View;
 import android.view.ViewParent;
 import android.widget.Toast;
+import android.graphics.Color;
+import android.os.Handler;
 
 import java.io.File;
 import java.net.InetAddress;
@@ -108,6 +110,26 @@ public class MainActivity extends AppCompatActivity {
     private CameraControlsDialogFragment mControlsDialog;
     private DeviceListDialogFragment mDeviceListDialog;
     private VideoFormatDialogFragment mFormatDialog;
+
+    // tally indicator state
+    private View mTallyIndicator;
+    private final Handler mHandler = new Handler();
+    private final Runnable mTallyPoller = new Runnable() {
+        @Override
+        public void run() {
+            if (mNdiSender != null) {
+                NdiSender.Tally t = mNdiSender.getTally();
+                if (t != null) {
+                    if (t.program) mTallyIndicator.setBackgroundColor(Color.RED);
+                    else if (t.preview) mTallyIndicator.setBackgroundColor(Color.GREEN);
+                    else mTallyIndicator.setBackgroundColor(Color.GRAY);
+                }
+            }
+            if (mNdiSender != null) {
+                mHandler.postDelayed(this, 50);
+            }
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -518,6 +540,11 @@ public class MainActivity extends AppCompatActivity {
             if (DEBUG) Log.v(TAG, "onDeviceOpen:device=" + device.getDeviceName());
 
             mCameraHelper.openCamera(getSavedPreviewSize());
+            // obtain tally indicator reference when view binding available
+            mTallyIndicator = findViewById(R.id.tally_indicator);
+            if (mTallyIndicator != null) {
+                mTallyIndicator.setBackgroundColor(Color.GRAY);
+            }
 
             mCameraHelper.setButtonCallback(new IButtonCallback() {
                 @Override
@@ -552,6 +579,8 @@ public class MainActivity extends AppCompatActivity {
                     String sourceName = "UVCAndroid-" + mNdiStartTime;
                     mNdiSender = new NdiSender(sourceName);
                     Log.i(TAG, "✅ NDI sender created: " + sourceName);
+                    // start polling tally indicator
+                    mHandler.post(mTallyPoller);
 
                     // create forwarder with known camera format (assume NV12)
                     mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, "nv12", null);
@@ -617,6 +646,7 @@ public class MainActivity extends AppCompatActivity {
                     Log.i(TAG, "✅ Frame forwarder released");
                 }
                 if (mNdiSender != null) {
+                    stopTallyPolling();
                     mNdiSender.close();
                     mNdiSender = null;
                     Log.i(TAG, "✅ NDI Sender closed");
@@ -809,6 +839,13 @@ public class MainActivity extends AppCompatActivity {
         }
         Gson gson = new Gson();
         return gson.fromJson(sizeStr, Size.class);
+    }
+
+    private void stopTallyPolling() {
+        mHandler.removeCallbacks(mTallyPoller);
+        if (mTallyIndicator != null) {
+            mTallyIndicator.setBackgroundColor(Color.GRAY);
+        }
     }
 
     private void setSavedPreviewSize(Size size) {

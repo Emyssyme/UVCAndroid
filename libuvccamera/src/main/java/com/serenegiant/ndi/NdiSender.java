@@ -148,4 +148,29 @@ public class NdiSender {
     private static native void nSendVideoNV12(long pSend, int w, int h, byte[] data);
     private static native void nConvertYuyvToRgba(byte[] yuyv, ByteBuffer rgba, int w, int h);
     private static native void nConvertNv12ToRgba(byte[] nv12, ByteBuffer rgba, int w, int h);
+
+    // ---------------------------------------
+    /**
+     * Simple tally state returned by {@link #getTally()}.
+     * program = on air, preview = queued but not on air.
+     */
+    public static class Tally {
+        public boolean program;
+        public boolean preview;
+    }
+
+    /**
+     * Query the current tally state from the native sender. Can be polled frequently.
+     * @return Tally object or null if sender is closed/not available.
+     */
+    public Tally getTally() {
+        if (closed || instancePointer == 0) return null;
+        int mask = nSendGetTally(instancePointer);
+        Tally t = new Tally();
+        t.program = (mask & 1) != 0;
+        t.preview = (mask & 2) != 0;
+        return t;
+    }
+
+    private static native int nSendGetTally(long pSend);
 }

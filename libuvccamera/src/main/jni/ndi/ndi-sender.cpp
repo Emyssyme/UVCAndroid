@@ -175,4 +175,25 @@ extern "C" {
         env->ReleaseByteArrayElements(jData, dataPtr, JNI_ABORT);
     }
 
+    /**
+     * Query the tally state from a sender.  Returns bit mask: bit0=program, bit1=preview.
+     */
+    JNIEXPORT jint JNICALL
+    Java_com_serenegiant_ndi_NdiSender_nSendGetTally(JNIEnv* env, jclass jClazz, jlong pSend) {
+        auto sender = reinterpret_cast<NDIlib_send_instance_t>(pSend);
+        if (sender == nullptr) {
+            return 0;
+        }
+        NDIlib_tally_t tally;
+        // timeout=0 polls immediately; the return value indicates whether the state
+        // has changed since the last call, which we ignore here because we want the
+        // current state every time.
+        bool ok = NDIlib_send_get_tally(sender, &tally, 0);
+        (void)ok; // we don't care about change flag
+        int mask = 0;
+        if (tally.on_program) mask |= 1;
+        if (tally.on_preview) mask |= 2;
+        return mask;
+    }
+
 } // extern "C"

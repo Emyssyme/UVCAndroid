@@ -35,6 +35,16 @@
             android:layout_centerInParent="true"
             android:visibility="invisible" />
 
+        <!-- tally indicator circle -->
+        <View
+            android:id="@+id/tally_indicator"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:layout_alignParentTop="true"
+            android:layout_alignParentEnd="true"
+            android:layout_margin="8dp"
+            android:background="@drawable/tally_circle" />
+
         <TextView
             android:id="@+id/tvConnectUSBCameraTip"
             android:layout_width="wrap_content"

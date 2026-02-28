@@ -318,7 +318,12 @@ int UVCPreview::setPreviewSize(int width, int height, int frameType, int fps) {
     // YUV420 fallbacks (NV12, NV21) so devices like Elgato CamLink 4K
     // which advertise NV12/I420 are handled.
     if (result != UVC_SUCCESS && frame_format == UVC_FRAME_FORMAT_UNCOMPRESSED) {
-        enum uvc_frame_format fallback_formats[] = {UVC_FRAME_FORMAT_NV12, UVC_FRAME_FORMAT_NV21, UVC_FRAME_FORMAT_YUYV};
+        enum uvc_frame_format fallback_formats[] = {
+                UVC_FRAME_FORMAT_NV12,
+                UVC_FRAME_FORMAT_NV21,
+                UVC_FRAME_FORMAT_YUYV,
+                UVC_FRAME_FORMAT_MJPEG
+        };
         const int num_fallbacks = sizeof(fallback_formats) / sizeof(fallback_formats[0]);
         for (int i = 0; i < num_fallbacks; ++i) {
             enum uvc_frame_format ff = fallback_formats[i];
