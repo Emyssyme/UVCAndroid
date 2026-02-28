@@ -6,6 +6,10 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- required if we start a foreground service to keep the camera alive -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- allow mediaPlayback-type FGS without runtime approval -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
     <application
         android:name="com.herohan.uvcapp.MyApplication"
@@ -21,7 +25,8 @@
             android:exported="true"
             android:label="@string/app_name"
             android:launchMode="singleTask"
-            android:theme="@style/Theme.Usbvideo.NoActionBar">
+            android:theme="@style/Theme.Usbvideo.NoActionBar"
+            android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
 
@@ -36,6 +41,12 @@
                 android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
                 android:resource="@xml/device_filter" />
         </activity>
+
+        <!-- service used to keep the process alive when the activity is backgrounded -->
+        <service
+            android:name="com.herohan.uvcapp.CameraKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
     </application>
 
 </manifest>

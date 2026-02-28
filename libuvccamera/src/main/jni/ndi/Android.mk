@@ -25,7 +25,7 @@ LOCAL_C_INCLUDES := \
 
 LOCAL_SHARED_LIBRARIES := ndi
 
-LOCAL_LDLIBS := -llog
+LOCAL_LDLIBS := -llog -lc++_shared
 
 LOCAL_LDFLAGS := -Wl,-z,max-page-size=0x4000
 

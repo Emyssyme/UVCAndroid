@@ -3,6 +3,7 @@ package com.herohan.uvcapp.activity;
 import android.Manifest;
 import android.content.Intent;
 import android.content.res.ColorStateList;
+import android.content.res.Configuration;
 import android.graphics.SurfaceTexture;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
@@ -30,6 +31,7 @@ import com.herohan.uvcapp.fragment.CameraControlsDialogFragment;
 import com.herohan.uvcapp.fragment.DeviceListDialogFragment;
 import com.herohan.uvcapp.fragment.VideoFormatDialogFragment;
 import com.herohan.uvcapp.utils.SaveHelper;
+import com.herohan.uvcapp.CameraKeepAliveService;
 
 import com.serenegiant.ndi.Ndi;
 import com.serenegiant.ndi.NdiSender;
@@ -115,6 +117,9 @@ public class MainActivity extends AppCompatActivity {
     // tally indicator state
     private View mTallyIndicator;
     private final Handler mHandler = new Handler();
+
+    // keys used for saving instance state (if we ever switch to state restoration)
+    private static final String KEY_USB_DEVICE_ID = "usb_device_id";
     private final Runnable mTallyPoller = new Runnable() {
         @Override
         public void run() {
@@ -166,10 +171,20 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private SurfaceTexture mDummySurfaceTexture;
+
     @Override
     protected void onStart() {
         super.onStart();
 
+        // remove dummy surface if we added one while backgrounded
+        if (mDummySurfaceTexture != null) {
+            if (mCameraHelper != null) {
+                mCameraHelper.removeSurface(mDummySurfaceTexture);
+            }
+            mDummySurfaceTexture.release();
+            mDummySurfaceTexture = null;
+        }
         initPreviewView();
     }
 
@@ -178,6 +193,13 @@ public class MainActivity extends AppCompatActivity {
         super.onStop();
         if (mIsRecording) {
             toggleVideoRecord(false);
+        }
+        // keep the camera running by attaching an offscreen texture when the
+        // UI goes away; this prevents the underlying UVCCamera from shutting
+        // down due to lack of a surface.
+        if (mIsCameraConnected && mCameraHelper != null && mDummySurfaceTexture == null) {
+            mDummySurfaceTexture = new SurfaceTexture(0);
+            mCameraHelper.addSurface(mDummySurfaceTexture, false);
         }
     }
 
@@ -444,6 +466,10 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void initPreviewView() {
+        // ensure we survive orientation changes by handling them ourselves
+        // without letting Android destroy/recreate the activity.  the
+        // manifest is updated accordingly, and this method will be invoked
+        // again after a config change, so we recalc the transform.
         mBinding.viewMainPreview.setAspectRatio(mPreviewWidth, mPreviewHeight);
         mBinding.viewMainPreview.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
             @Override
@@ -561,6 +587,12 @@ public class MainActivity extends AppCompatActivity {
         public void onCameraOpen(UsbDevice device) {
             if (DEBUG) Log.v(TAG, "onCameraOpen:device=" + device.getDeviceName());
             
+            // start a foreground notification so that Android doesn't kill the
+            // process when our activity goes to the background.  this is a
+            // lightweight service that merely keeps the process alive while a
+            // camera is opened.
+            startKeepAliveService();
+            
             // ✅ Step 1: Get camera size FIRST (before any preview setup)
             Size size = mCameraHelper.getPreviewSize();
             if (size != null) {
@@ -633,8 +665,20 @@ public class MainActivity extends AppCompatActivity {
         public void onCameraClose(UsbDevice device) {
             if (DEBUG) Log.v(TAG, "onCameraClose:device=" + device.getDeviceName());
 
+            // stop the foreground service; no camera is active any more
+            stopKeepAliveService();
+
             if (mIsRecording) {
                 toggleVideoRecord(false);
+            }
+
+            // if we added an offscreen texture earlier, remove it now
+            if (mDummySurfaceTexture != null) {
+                try {
+                    mCameraHelper.removeSurface(mDummySurfaceTexture);
+                } catch (Exception ignored) {}
+                mDummySurfaceTexture.release();
+                mDummySurfaceTexture = null;
             }
 
             // ✅ Cleanup NDI/RTP resources
@@ -676,7 +720,13 @@ public class MainActivity extends AppCompatActivity {
         public void onDetach(UsbDevice device) {
             if (DEBUG) Log.v(TAG, "onDetach:device=" + device.getDeviceName());
 
+            // make sure camera is fully torn down and UI is updated; the service
+            // will already have removed the camera, but we rely on onCameraClose
+            // to do the heavy lifting so request a close here too.
             if (device.equals(mUsbDevice)) {
+                if (mCameraHelper != null) {
+                    mCameraHelper.closeCamera();
+                }
                 mUsbDevice = null;
             }
         }
@@ -692,6 +742,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void resizePreviewView(Size size) {
+        // called after orientation changes as well
         // Update the preview size (camera capture resolution)
         mPreviewWidth = size.width;
         mPreviewHeight = size.height;
@@ -699,7 +750,6 @@ public class MainActivity extends AppCompatActivity {
         mBinding.viewMainPreview.setAspectRatio(mPreviewWidth, mPreviewHeight);
         // apply fill/fit transform if necessary
         mBinding.viewMainPreview.post(this::applyPreviewFillTransform);
-        
         // calculate the zoom factor required for 1:1 pixel mapping and update maxscale
         mBinding.viewMainPreview.post(() -> {
             final TextureView previewView = mBinding.viewMainPreview;
@@ -717,7 +767,28 @@ public class MainActivity extends AppCompatActivity {
         });
     }
 
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        // re-apply transform since the container dimensions have changed
+        mBinding.viewMainPreview.post(this::applyPreviewFillTransform);
+    }
+
+    /**
+     * Helpers for keeping the process alive when the activity is backgrounded.
+     */
+    private void startKeepAliveService() {
+        startService(new Intent(this, CameraKeepAliveService.class));
+    }
+
+    private void stopKeepAliveService() {
+        stopService(new Intent(this, CameraKeepAliveService.class));
+    }
+
     private void applyPreviewFillTransform() {
+        // (no additional changes)
+        // this is also invoked from onConfigurationChanged when the view
+        // dimensions shift due to rotation
         final TextureView previewView = mBinding.viewMainPreview;
         final ViewParent parent = previewView.getParent();
         if (!(parent instanceof View)) {
@@ -756,6 +827,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void logPreviewDiagnostics(@NonNull String stage, @Nullable Size cameraSize) {
+        // (no change) method left intact here
+        // for debugging orientation/resizing issues
         final TextureView previewView = mBinding.viewMainPreview;
         final boolean hasSurfaceTexture = previewView.getSurfaceTexture() != null;
         final int viewWidth = previewView.getWidth();
