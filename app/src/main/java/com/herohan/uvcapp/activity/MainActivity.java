@@ -104,7 +104,8 @@ public class MainActivity extends AppCompatActivity {
     private boolean mIsRecording = false;
     private boolean mIsCameraConnected = false;
     private boolean mPreviewFillEnabled = false;
-    private boolean mNdiHighQuality = true;   // toggle state for NDI mode
+    // start in efficient (NV12) mode instead of RGBA high‑quality; user can toggle later
+    private boolean mNdiHighQuality = false;   // toggle state for NDI mode
     // RTP streaming removed per request; keep NDI only
 
     private CameraControlsDialogFragment mControlsDialog;
@@ -378,6 +379,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // PROMOTE incoming UVC frames to NDI and/or RTP
+    // note: default format will be NV12 (low-latency) since mNdiHighQuality=false
     // frame callback for NDI only
     private class MultiFrameCallback implements com.serenegiant.usb.IFrameCallback {
         @Override
