@@ -70,4 +70,11 @@
         android:visible="false"
         app:showAsAction="never" />
 
+    <!-- allow user to change the NDI source name -->
+    <item
+        android:id="@+id/action_set_ndi_name"
+        android:title="@string/action_set_ndi_name"
+        android:visible="false"
+        app:showAsAction="never" />
+
 </menu>

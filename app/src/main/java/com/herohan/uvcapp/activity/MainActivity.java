@@ -8,6 +8,9 @@ import android.graphics.SurfaceTexture;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
 import android.os.Bundle;
+import android.app.AlertDialog;
+import android.preference.PreferenceManager;
+import android.widget.EditText;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -63,6 +66,16 @@ public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = MainActivity.class.getSimpleName();
     private static final boolean DEBUG = true;
+
+    private static final String PREF_NDI_NAME = "pref_ndi_name";
+
+    // remember camera input format used by the current forwarder (always nv12
+    // in this app, but we track it so that we can recreate the forwarder when
+    // renaming the sender).
+    private String mNdiCameraFormat = "nv12";
+
+    // cached stream name; defaults to saved preference or device name later
+    private String mNdiSourceName;
 
     private ActivityMainBinding mBinding;
 
@@ -152,6 +165,9 @@ public class MainActivity extends AppCompatActivity {
 
         // run-time prompt to ignore battery optimizations (optional)
         requestIgnoreBatteryOptimizations();
+
+        // load previously saved NDI name (may be empty)
+        mNdiSourceName = getSavedNdiName();
 
         // Initialize NDI
         try {
@@ -260,6 +276,8 @@ public class MainActivity extends AppCompatActivity {
                     mNdiHighQuality ? getString(R.string.action_ndimode_high)
                                    : getString(R.string.action_ndimode_low),
                     Toast.LENGTH_SHORT).show();
+        } else if (id == R.id.action_set_ndi_name) {
+            showSetNdiNameDialog();
         }
         return true;
     }
@@ -298,6 +316,11 @@ public class MainActivity extends AppCompatActivity {
             ndiModeItem.setTitle(mNdiHighQuality
                     ? R.string.action_ndimode_high
                     : R.string.action_ndimode_low);
+        }
+        // show the "set name" option when the camera is connected
+        MenuItem nameItem = menu.findItem(R.id.action_set_ndi_name);
+        if (nameItem != null) {
+            nameItem.setVisible(mIsCameraConnected);
         }
         return super.onPrepareOptionsMenu(menu);
     }
@@ -613,14 +636,24 @@ public class MainActivity extends AppCompatActivity {
             if (size != null) {
                 try {
                     mNdiStartTime = SystemClock.elapsedRealtime();
-                    String sourceName = "UVCAndroid-" + mNdiStartTime;
+                    // choose stream name: preference first, otherwise derive it from
+                    // the USB device.  using getProductName()/getManufacturerName
+                    // usually yields the actual camera model rather than the generic
+                    // device path which can look like "/dev/bus/usb/...".
+                    String sourceName = mNdiSourceName;
+                    if (TextUtils.isEmpty(sourceName)) {
+                        sourceName = getDefaultNdiName(device);
+                        // remember this default so future streams reuse it
+                        setSavedNdiName(sourceName);
+                    }
                     mNdiSender = new NdiSender(sourceName);
                     Log.i(TAG, "✅ NDI sender created: " + sourceName);
                     // start polling tally indicator
                     mHandler.post(mTallyPoller);
 
                     // create forwarder with known camera format (assume NV12)
-                    mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, "nv12", null);
+                    mNdiCameraFormat = "nv12";
+                    mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
                     mFrameForwarder.setFrameDimensions(size.width, size.height);
                     // now apply quality mode (will register callback)
                     setNdiFormat(mNdiHighQuality);
@@ -801,6 +834,87 @@ public class MainActivity extends AppCompatActivity {
                 Intent intent = new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
                 intent.setData(android.net.Uri.parse("package:" + getPackageName()));
                 startActivity(intent);
+            }
+        }
+    }
+
+    private void setSavedNdiName(final String name) {
+        PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .edit()
+                .putString(PREF_NDI_NAME, name)
+                .apply();
+        mNdiSourceName = name;
+    }
+
+    private String getSavedNdiName() {
+        return PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getString(PREF_NDI_NAME, "");
+    }
+
+    /**
+     * Produce the default stream name.  per user request we now prefer the
+     * phone itself (manufacturer/model) rather than the USB peripheral name.
+     * If the build information is missing for some reason we still fall back
+     * to the USB device name or a timestamp.
+     */
+    private String getDefaultNdiName(@Nullable UsbDevice device) {
+        // first try to use the handset identity, since that's what was
+        // requested
+        String phoneName = android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL;
+        if (!TextUtils.isEmpty(phoneName) && !phoneName.trim().isEmpty()) {
+            return phoneName.trim();
+        }
+        // if that somehow fails, try the connected device
+        if (device != null) {
+            String name = device.getProductName();
+            if (!TextUtils.isEmpty(name)) return name;
+            name = device.getManufacturerName();
+            if (!TextUtils.isEmpty(name)) return name;
+            name = device.getDeviceName();
+            if (!TextUtils.isEmpty(name)) return name;
+        }
+        // final fallback
+        return "UVCAndroid-" + mNdiStartTime;
+    }
+
+    private void showSetNdiNameDialog() {
+        String current = getSavedNdiName();
+        if (TextUtils.isEmpty(current) && mUsbDevice != null) {
+            current = mUsbDevice.getDeviceName();
+        }
+        final EditText input = new EditText(this);
+        input.setSingleLine();
+        input.setText(current);
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.action_set_ndi_name)
+                .setView(input)
+                .setPositiveButton(android.R.string.ok, (dialog, which) -> {
+                    String name = input.getText().toString().trim();
+                    if (!TextUtils.isEmpty(name)) {
+                        setSavedNdiName(name);
+                        updateNdiSourceName(name);
+                    }
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    /**
+     * Recreate the NDI sender with a new name while the camera is active.
+     */
+    private void updateNdiSourceName(final String newName) {
+        if (mNdiSender != null) {
+            try {
+                stopTallyPolling();
+                mNdiSender.close();
+            } catch (Exception ignored) {}
+            mNdiSender = new NdiSender(newName);
+            if (mFrameForwarder != null) {
+                mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
+                mFrameForwarder.setFrameDimensions(mPreviewWidth, mPreviewHeight);
+                setNdiFormat(mNdiHighQuality);
             }
         }
     }
