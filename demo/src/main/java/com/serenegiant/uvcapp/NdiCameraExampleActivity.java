@@ -21,6 +21,7 @@ import com.serenegiant.usb.IFrameCallback;
 import com.serenegiant.usb.USBMonitor;
 import com.serenegiant.usb.UVCCamera;
 import com.serenegiant.widget.UVCCameraTextureView;
+import com.herohan.uvcdemo.R;
 
 import com.serenegiant.ndi.Ndi;
 import com.serenegiant.ndi.NdiSender;
@@ -115,17 +116,21 @@ public class NdiCameraExampleActivity extends Activity {
         @Override
         public void onAttach(UsbDevice device) {
             Log.i(TAG, "USB device attached: " + device.getDeviceName());
-            // Auto-open first UVC device
             if (mUVCCamera == null) {
                 mUSBMonitor.requestPermission(device);
             }
         }
 
         @Override
-        public void onConnect(UsbDevice device, USBMonitor.UsbControlBlock ctrlBlock, boolean createNew) {
-            Log.i(TAG, "USB device connected");
+        public void onDetach(UsbDevice device) {
+            Log.i(TAG, "USB device detached");
+        }
+
+        @Override
+        public void onDeviceOpen(UsbDevice device, USBMonitor.UsbControlBlock ctrlBlock, boolean createNew) {
+            Log.i(TAG, "USB device opened");
             if (mUVCCamera == null) {
-                mUVCCamera = new UVCCamera();
+                mUVCCamera = new UVCCamera(new com.serenegiant.usb.UVCParam());
                 mUVCCamera.open(ctrlBlock);
                 Log.i(TAG, "UVC camera opened");
                 updateStatus("Camera ready. Press 'Start' to stream");
@@ -133,19 +138,14 @@ public class NdiCameraExampleActivity extends Activity {
         }
 
         @Override
-        public void onDisconnect(UsbDevice device, USBMonitor.UsbControlBlock ctrlBlock) {
-            Log.i(TAG, "USB device disconnected");
+        public void onDeviceClose(UsbDevice device, USBMonitor.UsbControlBlock ctrlBlock) {
+            Log.i(TAG, "USB device closed");
             if (mUVCCamera != null) {
                 mUVCCamera.close();
                 mUVCCamera = null;
             }
             stopNdiStreaming();
             updateStatus("Camera disconnected");
-        }
-
-        @Override
-        public void onDettach(UsbDevice device) {
-            Log.i(TAG, "USB device detached");
         }
 
         @Override
@@ -207,10 +207,11 @@ public class NdiCameraExampleActivity extends Activity {
                 @Override
                 public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture surface, int width, int height) {
                     try {
-                        mUVCCamera.setPreviewDisplay(new android.view.SurfaceTexture(0));
+                        android.view.Surface previewSurface = new android.view.Surface(surface);
+                        mUVCCamera.setPreviewDisplay(previewSurface);
                         mUVCCamera.setFrameCallback(mFrameForwarder, UVCCamera.PIXEL_FORMAT_NV12);
-                        mUVCCamera.startCapture();
-                        
+                        mUVCCamera.startCapture(previewSurface);
+
                         mNdiActive.set(true);
                         mStartButton.setEnabled(false);
                         mStopButton.setEnabled(true);
@@ -232,7 +233,7 @@ public class NdiCameraExampleActivity extends Activity {
                 }
 
                 @Override
-                public void onSurfaceTextureFrameAvailable(android.graphics.SurfaceTexture surface) {
+                public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture surface) {
                 }
             });
 
@@ -247,7 +248,7 @@ public class NdiCameraExampleActivity extends Activity {
             return;
         }
         // stop tally polling immediately
-        stopTallyPolling();
+        mHandler.removeCallbacks(mTallyPoller);
 
         try {
             if (mUVCCamera != null) {
