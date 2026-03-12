@@ -150,6 +150,9 @@ public class MainActivity extends AppCompatActivity {
 
         setListeners();
 
+        // run-time prompt to ignore battery optimizations (optional)
+        requestIgnoreBatteryOptimizations();
+
         // Initialize NDI
         try {
             Ndi.initialize();
@@ -783,6 +786,23 @@ public class MainActivity extends AppCompatActivity {
 
     private void stopKeepAliveService() {
         stopService(new Intent(this, CameraKeepAliveService.class));
+    }
+
+    /**
+     * If the device is subject to battery optimizations, prompt the user
+     * to exclude our app.  Once the app is exempt the OS is much less
+     * aggressive about throttling network access or background execution
+     * when the screen is off.
+     */
+    private void requestIgnoreBatteryOptimizations() {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+            android.os.PowerManager pm = (android.os.PowerManager) getSystemService(POWER_SERVICE);
+            if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
+                Intent intent = new Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                intent.setData(android.net.Uri.parse("package:" + getPackageName()));
+                startActivity(intent);
+            }
+        }
     }
 
     private void applyPreviewFillTransform() {
