@@ -4,12 +4,16 @@ import android.Manifest;
 import android.content.Intent;
 import android.content.res.ColorStateList;
 import android.content.res.Configuration;
+import android.graphics.Matrix;
 import android.graphics.SurfaceTexture;
+import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
 import android.os.Bundle;
 import android.app.AlertDialog;
 import android.preference.PreferenceManager;
+import android.util.Log;
+import android.view.Surface;
 import android.widget.EditText;
 
 import androidx.annotation.NonNull;
@@ -18,6 +22,8 @@ import androidx.appcompat.app.AppCompatActivity;
 
 import com.google.gson.Gson;
 import com.herohan.uvcapp.ImageCapture;
+import com.herohan.uvcapp.InternalCameraHelper;
+import com.herohan.uvcapp.InternalCameraInfo;
 import com.herohan.uvcapp.VideoCapture;
 import com.hjq.permissions.XXPermissions;
 import com.serenegiant.opengl.renderer.MirrorMode;
@@ -32,6 +38,8 @@ import com.herohan.uvcapp.R;
 import com.herohan.uvcapp.databinding.ActivityMainBinding;
 import com.herohan.uvcapp.fragment.CameraControlsDialogFragment;
 import com.herohan.uvcapp.fragment.DeviceListDialogFragment;
+import com.herohan.uvcapp.fragment.InternalCameraListDialogFragment;
+import com.herohan.uvcapp.fragment.InternalCameraResolutionDialogFragment;
 import com.herohan.uvcapp.fragment.VideoFormatDialogFragment;
 import com.herohan.uvcapp.utils.SaveHelper;
 import com.herohan.uvcapp.CameraKeepAliveService;
@@ -59,6 +67,9 @@ import java.io.File;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.text.DecimalFormat;
+import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Timer;
 import java.util.TimerTask;
 
@@ -127,6 +138,22 @@ public class MainActivity extends AppCompatActivity {
     private DeviceListDialogFragment mDeviceListDialog;
     private VideoFormatDialogFragment mFormatDialog;
 
+    // ── Internal (phone) camera ──────────────────────────────────────────────
+    private enum CameraMode { USB, INTERNAL }
+    private CameraMode mCameraMode = CameraMode.USB;
+
+    private InternalCameraHelper mInternalCameraHelper;
+    private InternalCameraInfo   mCurrentInternalCamera;
+    private android.util.Size    mInternalPreviewSize;
+    // Pending reopen: when resolution changes, we close the current camera then open a new one
+    // from onClosed() instead of racing with the close.
+    private InternalCameraInfo   mPendingOpenCamera;
+    private android.util.Size    mPendingOpenSize;
+
+    private InternalCameraListDialogFragment       mInternalCameraListDialog;
+    private InternalCameraResolutionDialogFragment mInternalResolutionDialog;
+    // ────────────────────────────────────────────────────────────────────────
+
     // tally indicator state
     private View mTallyIndicator;
     private final Handler mHandler = new Handler();
@@ -138,10 +165,10 @@ public class MainActivity extends AppCompatActivity {
         public void run() {
             if (mNdiSender != null) {
                 NdiSender.Tally t = mNdiSender.getTally();
-                if (t != null) {
-                    if (t.program) mTallyIndicator.setBackgroundColor(Color.RED);
+                if (t != null && mTallyIndicator != null) {
+                    if (t.program)       mTallyIndicator.setBackgroundColor(Color.RED);
                     else if (t.preview) mTallyIndicator.setBackgroundColor(Color.GREEN);
-                    else mTallyIndicator.setBackgroundColor(Color.GRAY);
+                    else                mTallyIndicator.setBackgroundColor(Color.GRAY);
                 }
             }
             if (mNdiSender != null) {
@@ -158,6 +185,12 @@ public class MainActivity extends AppCompatActivity {
         setContentView(mBinding.getRoot());
 
         setSupportActionBar(mBinding.toolbar);
+
+        // Assign tally indicator early so both USB and internal camera paths can use it
+        mTallyIndicator = findViewById(R.id.tally_indicator);
+        if (mTallyIndicator != null) {
+            mTallyIndicator.setBackgroundColor(Color.GRAY);
+        }
 
         checkCameraHelper();
 
@@ -226,6 +259,10 @@ public class MainActivity extends AppCompatActivity {
     protected void onDestroy() {
         super.onDestroy();
         clearCameraHelper();
+        if (mInternalCameraHelper != null) {
+            mInternalCameraHelper.closeCamera();
+            mInternalCameraHelper = null;
+        }
     }
 
     @Override
@@ -278,13 +315,25 @@ public class MainActivity extends AppCompatActivity {
                     Toast.LENGTH_SHORT).show();
         } else if (id == R.id.action_set_ndi_name) {
             showSetNdiNameDialog();
+        } else if (id == R.id.action_use_internal_camera) {
+            switchToInternalCamera();
+        } else if (id == R.id.action_use_usb_camera) {
+            switchToUsbCamera();
+        } else if (id == R.id.action_select_internal_camera) {
+            showInternalCameraListDialog();
+        } else if (id == R.id.action_internal_camera_resolution) {
+            showInternalCameraResolutionDialog();
         }
         return true;
     }
 
     @Override
     public boolean onPrepareOptionsMenu(Menu menu) {
-        if (mIsCameraConnected) {
+        final boolean usbMode      = mCameraMode == CameraMode.USB;
+        final boolean internalMode = mCameraMode == CameraMode.INTERNAL;
+
+        // ── UVC-only items ───────────────────────────────────────────────────
+        if (mIsCameraConnected && usbMode) {
             menu.findItem(R.id.action_control).setVisible(true);
             menu.findItem(R.id.action_safely_eject).setVisible(true);
             menu.findItem(R.id.action_video_format).setVisible(true);
@@ -305,6 +354,11 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_preview_fill_toggle).setVisible(false);
             menu.findItem(R.id.action_ndimode).setVisible(false);
         }
+
+        // USB device icon — only in USB mode
+        menu.findItem(R.id.action_device).setVisible(usbMode);
+
+        // ── Labels for toggle items ──────────────────────────────────────────
         final MenuItem previewModeItem = menu.findItem(R.id.action_preview_fill_toggle);
         if (previewModeItem != null) {
             previewModeItem.setTitle(mPreviewFillEnabled
@@ -317,11 +371,18 @@ public class MainActivity extends AppCompatActivity {
                     ? R.string.action_ndimode_high
                     : R.string.action_ndimode_low);
         }
-        // show the "set name" option when the camera is connected
         MenuItem nameItem = menu.findItem(R.id.action_set_ndi_name);
         if (nameItem != null) {
             nameItem.setVisible(mIsCameraConnected);
         }
+
+        // ── Internal camera items ────────────────────────────────────────────
+        menu.findItem(R.id.action_use_internal_camera).setVisible(usbMode);
+        menu.findItem(R.id.action_use_usb_camera).setVisible(internalMode);
+        menu.findItem(R.id.action_select_internal_camera).setVisible(internalMode);
+        menu.findItem(R.id.action_internal_camera_resolution)
+                .setVisible(internalMode && mIsCameraConnected);
+
         return super.onPrepareOptionsMenu(menu);
     }
 
@@ -501,41 +562,48 @@ public class MainActivity extends AppCompatActivity {
             @Override
             public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surface, int width, int height) {
                 Log.i(TAG, "Preview surface available: " + width + "x" + height);
-                if (mCameraHelper != null) {
+                if (mCameraMode == CameraMode.INTERNAL && mInternalCameraHelper != null) {
+                    mInternalCameraHelper.startPreview(surface);
+                    mBinding.viewMainPreview.post(() -> applyInternalCameraTransform());
+                } else if (mCameraHelper != null) {
                     mCameraHelper.addSurface(surface, false);
+                    Toast.makeText(MainActivity.this, "Preview: pinch to zoom, double-tap for 100%", Toast.LENGTH_SHORT).show();
+                    mBinding.viewMainPreview.post(() -> {
+                        applyPreviewFillTransform();
+                        logPreviewDiagnostics("surface_available", mCameraHelper != null ? mCameraHelper.getPreviewSize() : null);
+                    });
                 }
-                // give a quick hint about zooming controls
-                Toast.makeText(MainActivity.this, "Preview: pinch to zoom, double-tap for 100%", Toast.LENGTH_SHORT).show();
-                mBinding.viewMainPreview.post(() -> {
-                    applyPreviewFillTransform();
-                    logPreviewDiagnostics("surface_available", mCameraHelper != null ? mCameraHelper.getPreviewSize() : null);
-                });
             }
 
             @Override
             public void onSurfaceTextureSizeChanged(@NonNull SurfaceTexture surface, int width, int height) {
                 Log.i(TAG, "Preview surface size changed: " + width + "x" + height);
-                mBinding.viewMainPreview.post(() -> {
-                    applyPreviewFillTransform();
-                    logPreviewDiagnostics("surface_size_changed", mCameraHelper != null ? mCameraHelper.getPreviewSize() : null);
-                    // update zoom limit in case the view dimension changed
-                    final TextureView previewView = mBinding.viewMainPreview;
-                    final int viewW = previewView.getWidth();
-                    final int viewH = previewView.getHeight();
-                    if (viewW > 0 && viewH > 0) {
-                        final float scaleX = (float) mPreviewWidth / (float) viewW;
-                        final float scaleY = (float) mPreviewHeight / (float) viewH;
-                        final float required = Math.max(1.0f, Math.max(scaleX, scaleY));
-                        if (previewView instanceof com.serenegiant.widget.UVCCameraTextureView) {
-                            ((com.serenegiant.widget.UVCCameraTextureView)previewView).setMaxScale(required);
+                if (mCameraMode == CameraMode.INTERNAL) {
+                    mBinding.viewMainPreview.post(() -> applyInternalCameraTransform());
+                } else {
+                    mBinding.viewMainPreview.post(() -> {
+                        applyPreviewFillTransform();
+                        logPreviewDiagnostics("surface_size_changed", mCameraHelper != null ? mCameraHelper.getPreviewSize() : null);
+                        final TextureView previewView = mBinding.viewMainPreview;
+                        final int viewW = previewView.getWidth();
+                        final int viewH = previewView.getHeight();
+                        if (viewW > 0 && viewH > 0) {
+                            final float scaleX = (float) mPreviewWidth / (float) viewW;
+                            final float scaleY = (float) mPreviewHeight / (float) viewH;
+                            final float required = Math.max(1.0f, Math.max(scaleX, scaleY));
+                            if (previewView instanceof com.serenegiant.widget.UVCCameraTextureView) {
+                                ((com.serenegiant.widget.UVCCameraTextureView)previewView).setMaxScale(required);
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
 
             @Override
             public boolean onSurfaceTextureDestroyed(@NonNull SurfaceTexture surface) {
-                if (mCameraHelper != null) {
+                if (mCameraMode == CameraMode.INTERNAL && mInternalCameraHelper != null) {
+                    mInternalCameraHelper.stopPreview();
+                } else if (mCameraHelper != null) {
                     mCameraHelper.removeSurface(surface);
                 }
                 return false;
@@ -543,7 +611,6 @@ public class MainActivity extends AppCompatActivity {
 
             @Override
             public void onSurfaceTextureUpdated(@NonNull SurfaceTexture surface) {
-
             }
         });
     }
@@ -594,11 +661,6 @@ public class MainActivity extends AppCompatActivity {
             if (DEBUG) Log.v(TAG, "onDeviceOpen:device=" + device.getDeviceName());
 
             mCameraHelper.openCamera(getSavedPreviewSize());
-            // obtain tally indicator reference when view binding available
-            mTallyIndicator = findViewById(R.id.tally_indicator);
-            if (mTallyIndicator != null) {
-                mTallyIndicator.setBackgroundColor(Color.GRAY);
-            }
 
             mCameraHelper.setButtonCallback(new IButtonCallback() {
                 @Override
@@ -717,25 +779,7 @@ public class MainActivity extends AppCompatActivity {
                 mDummySurfaceTexture = null;
             }
 
-            // ✅ Cleanup NDI/RTP resources
-            try {
-                if (mCameraHelper != null) {
-                    mCameraHelper.setFrameCallback(null, 0);
-                    Log.i(TAG, "✅ Frame callback unregistered");
-                }
-                if (mFrameForwarder != null) {
-                    mFrameForwarder = null;
-                    Log.i(TAG, "✅ Frame forwarder released");
-                }
-                if (mNdiSender != null) {
-                    stopTallyPolling();
-                    mNdiSender.close();
-                    mNdiSender = null;
-                    Log.i(TAG, "✅ NDI Sender closed");
-                }
-                } catch (Exception e) {
-                Log.e(TAG, "❌ Error stopping streams", e);
-            }
+            cleanupNdiAndStreaming();
 
             if (mCameraHelper != null && mBinding.viewMainPreview.getSurfaceTexture() != null) {
                 mCameraHelper.removeSurface(mBinding.viewMainPreview.getSurfaceTexture());
@@ -806,8 +850,23 @@ public class MainActivity extends AppCompatActivity {
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
-        // re-apply transform since the container dimensions have changed
-        mBinding.viewMainPreview.post(this::applyPreviewFillTransform);
+        if (mCameraMode == CameraMode.INTERNAL) {
+            mBinding.viewMainPreview.post(() -> {
+                // Recalculate dimension swap for the new orientation
+                if (mCurrentInternalCamera != null && mInternalPreviewSize != null) {
+                    boolean swap = isSwapDimensionsNeeded(mCurrentInternalCamera.sensorOrientation, mCurrentInternalCamera.lensFacing);
+                    int w = swap ? mInternalPreviewSize.getHeight() : mInternalPreviewSize.getWidth();
+                    int h = swap ? mInternalPreviewSize.getWidth()  : mInternalPreviewSize.getHeight();
+                    mPreviewWidth  = w;
+                    mPreviewHeight = h;
+                    mBinding.viewMainPreview.setAspectRatio(w, h);
+                }
+                applyInternalCameraTransform();
+            });
+        } else {
+            // re-apply transform since the container dimensions have changed
+            mBinding.viewMainPreview.post(this::applyPreviewFillTransform);
+        }
     }
 
     /**
@@ -1079,6 +1138,23 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
+        if (mCameraMode == CameraMode.INTERNAL && mInternalCameraHelper != null) {
+            File file = new File(SaveHelper.getSavePhotoPath());
+            mInternalCameraHelper.takePicture(file, new InternalCameraHelper.OnPictureTakenListener() {
+                @Override
+                public void onSuccess(File f) {
+                    Toast.makeText(MainActivity.this,
+                            "Saved \"" + f.getAbsolutePath() + "\"", Toast.LENGTH_SHORT).show();
+                }
+
+                @Override
+                public void onError(String message) {
+                    Toast.makeText(MainActivity.this, message, Toast.LENGTH_SHORT).show();
+                }
+            });
+            return;
+        }
+
         try {
             File file = new File(SaveHelper.getSavePhotoPath());
             ImageCapture.OutputFileOptions options =
@@ -1102,6 +1178,11 @@ public class MainActivity extends AppCompatActivity {
     }
 
     public void toggleVideoRecord(boolean isRecording) {
+        if (mCameraMode == CameraMode.INTERNAL) {
+            toggleInternalVideoRecord(isRecording);
+            return;
+        }
+
         try {
             if (isRecording) {
                 if (mIsCameraConnected && mCameraHelper != null && !mCameraHelper.isRecording()) {
@@ -1120,8 +1201,51 @@ public class MainActivity extends AppCompatActivity {
         }
 
         mIsRecording = isRecording;
-
         updateUIControls();
+    }
+
+    private void toggleInternalVideoRecord(boolean isRecording) {
+        if (isRecording) {
+            if (!mIsCameraConnected || mInternalCameraHelper == null
+                    || mInternalCameraHelper.isRecording()) return;
+
+            File file = new File(SaveHelper.getSaveVideoPath());
+            int displayRotation = getWindowManager().getDefaultDisplay().getRotation();
+            mInternalCameraHelper.startRecording(file, displayRotation,
+                    new InternalCameraHelper.OnRecordingStateListener() {
+                        @Override
+                        public void onStarted() {
+                            mIsRecording = true;
+                            startRecordTimer();
+                            updateUIControls();
+                        }
+
+                        @Override
+                        public void onStopped(File f) {
+                            mIsRecording = false;
+                            stopRecordTimer();
+                            updateUIControls();
+                            Toast.makeText(MainActivity.this,
+                                    "Saved \"" + f.getAbsolutePath() + "\"",
+                                    Toast.LENGTH_SHORT).show();
+                        }
+
+                        @Override
+                        public void onError(String message) {
+                            mIsRecording = false;
+                            stopRecordTimer();
+                            updateUIControls();
+                            Toast.makeText(MainActivity.this, message, Toast.LENGTH_LONG).show();
+                        }
+                    });
+        } else {
+            if (mInternalCameraHelper != null && mInternalCameraHelper.isRecording()) {
+                mInternalCameraHelper.stopRecording();
+            }
+            mIsRecording = false;
+            stopRecordTimer();
+            updateUIControls();
+        }
     }
 
     private void setCustomVideoCaptureConfig() {
@@ -1222,5 +1346,368 @@ public class MainActivity extends AppCompatActivity {
         String mm = mDecimalFormat.format(time % 3600 / 60);
         String ss = mDecimalFormat.format(time % 60);
         return hh + ":" + mm + ":" + ss;
+    }
+
+    // =========================================================================
+    //  Internal (phone) camera — mode switching
+    // =========================================================================
+
+    private void switchToInternalCamera() {
+        if (mCameraMode == CameraMode.INTERNAL) {
+            showInternalCameraListDialog();
+            return;
+        }
+        // Close any active USB camera
+        if (mIsCameraConnected && mCameraHelper != null) {
+            mCameraHelper.closeCamera();
+            mIsCameraConnected = false;
+        }
+        mCameraMode = CameraMode.INTERNAL;
+        mPreviewFillEnabled = false; // internal camera should show full frame (fit) not cropped fill
+        resetPreviewViewState();
+        updateUIControls();
+        invalidateOptionsMenu();
+        showInternalCameraListDialog();
+    }
+
+    private void switchToUsbCamera() {
+        if (mCameraMode == CameraMode.USB) return;
+        // Close any open internal camera
+        if (mInternalCameraHelper != null) {
+            mInternalCameraHelper.closeCamera();
+        }
+        mCameraMode            = CameraMode.USB;
+        mCurrentInternalCamera = null;
+        mInternalPreviewSize   = null;
+        resetPreviewViewState();
+        updateUIControls();
+        invalidateOptionsMenu();
+        Toast.makeText(this, "USB Camera mode — connect a USB camera",
+                Toast.LENGTH_SHORT).show();
+    }
+
+    // =========================================================================
+    //  Internal camera — list / resolution dialogs
+    // =========================================================================
+
+    private void showInternalCameraListDialog() {
+        if (mInternalCameraListDialog != null && mInternalCameraListDialog.isAdded()) return;
+
+        List<InternalCameraInfo> cameras = InternalCameraHelper.getAvailableCameras(this);
+        mInternalCameraListDialog = new InternalCameraListDialogFragment(cameras);
+        mInternalCameraListDialog.setOnCameraSelectedListener(cameraInfo -> {
+            // Default to the best size at or below 1080p — very large preview sizes
+            // (e.g. 4000×3000) can trigger ERROR_CAMERA_SERVICE on some devices.
+            android.util.Size[] sizes =
+                    InternalCameraHelper.getSupportedSizes(this, cameraInfo.cameraId);
+            android.util.Size selectedSize = pickDefaultPreviewSize(sizes);
+            openInternalCamera(cameraInfo, selectedSize);
+        });
+        mInternalCameraListDialog.show(getSupportFragmentManager(), "internal_camera_list");
+    }
+
+    private void showInternalCameraResolutionDialog() {
+        if (mCurrentInternalCamera == null) return;
+        if (mInternalResolutionDialog != null && mInternalResolutionDialog.isAdded()) return;
+
+        android.util.Size[] sizesArr =
+                InternalCameraHelper.getSupportedSizes(this, mCurrentInternalCamera.cameraId);
+        List<android.util.Size> sizes = Arrays.asList(sizesArr);
+
+        mInternalResolutionDialog = new InternalCameraResolutionDialogFragment(
+                sizes, mInternalPreviewSize);
+        mInternalResolutionDialog.setOnResolutionSelectedListener(size -> {
+            if (mCurrentInternalCamera == null) return;
+            // Store pending reopen; the actual openCamera call happens inside
+            // InternalCameraStateCallback.onClosed() to avoid racing with the async close.
+            mPendingOpenCamera = mCurrentInternalCamera;
+            mPendingOpenSize   = size;
+            if (mInternalCameraHelper != null) {
+                mInternalCameraHelper.closeCamera();
+            } else {
+                InternalCameraInfo pending     = mPendingOpenCamera;
+                android.util.Size  pendingSize = mPendingOpenSize;
+                mPendingOpenCamera = null;
+                mPendingOpenSize   = null;
+                openInternalCamera(pending, pendingSize);
+            }
+        });
+        mInternalResolutionDialog.show(getSupportFragmentManager(), "internal_resolution");
+    }
+
+    // =========================================================================
+    //  Internal camera — open / orientation
+    // =========================================================================
+
+    private void openInternalCamera(InternalCameraInfo cameraInfo,
+                                    android.util.Size previewSize) {
+        // If a camera is already open, close it first and let onClosed() reopen via the
+        // pending mechanism — ensures NDI resources are fully released before the new
+        // NdiSender is created (same name would fail otherwise).
+        if (mIsCameraConnected && mInternalCameraHelper != null) {
+            mPendingOpenCamera = cameraInfo;
+            mPendingOpenSize   = previewSize;
+            mInternalCameraHelper.closeCamera();
+            return;
+        }
+
+        mCurrentInternalCamera = cameraInfo;
+        mInternalPreviewSize   = previewSize;
+
+        // Choose view aspect ratio based on sensor orientation so the displayed
+        // frame area matches the actual rotated buffer orientation.
+        boolean swap  = isSwapDimensionsNeeded(cameraInfo.sensorOrientation, cameraInfo.lensFacing);
+        int viewW = swap ? previewSize.getHeight() : previewSize.getWidth();
+        int viewH = swap ? previewSize.getWidth()  : previewSize.getHeight();
+        mPreviewWidth  = viewW;
+        mPreviewHeight = viewH;
+        mBinding.viewMainPreview.setAspectRatio(viewW, viewH);
+
+        if (mInternalCameraHelper == null) {
+            mInternalCameraHelper = new InternalCameraHelper(this);
+            mInternalCameraHelper.setStateCallback(new InternalCameraStateCallback());
+        }
+
+        // Wire up frame delivery for NDI (set before openCamera so the reader is
+        // included in the initial capture session)
+        mInternalCameraHelper.setFrameListener((nv12Frame, width, height) -> {
+            if (mFrameForwarder != null) {
+                mFrameForwarder.onFrame(nv12Frame);
+            }
+        });
+
+        XXPermissions.with(this)
+                .permission(Manifest.permission.CAMERA)
+                .request((permissions, all) ->
+                        mInternalCameraHelper.openCamera(cameraInfo, previewSize));
+    }
+
+    /**
+     * Picks the largest preview size whose area is at or below 1920×1080 pixels.
+     * Very-large preview sizes (e.g. 4000×3000 from a 12 MP sensor) cause
+     * ERROR_CAMERA_SERVICE on many devices because they exceed the camera service's
+     * concurrent stream limits for SurfaceTexture outputs.
+     */
+    private static android.util.Size pickDefaultPreviewSize(android.util.Size[] sizes) {
+        final int MAX_AREA = 1920 * 1080; // 1080p cap
+        // sizes[] is sorted largest-area first by getSupportedSizes()
+        for (android.util.Size s : sizes) {
+            if (s.getWidth() * s.getHeight() <= MAX_AREA) {
+                return s; // first (largest) size that fits
+            }
+        }
+        // All reported sizes are above 1080p — just take the smallest
+        return (sizes.length > 0)
+                ? sizes[sizes.length - 1]
+                : new android.util.Size(1280, 720);
+    }
+
+    /**
+     * Returns true when the sensor's native buffer dimensions must be swapped in order
+     * to show the image with the correct display orientation.
+     */
+    private boolean isSwapDimensionsNeeded(int sensorOrientation, int lensFacing) {
+        int displayRotation = getWindowManager().getDefaultDisplay().getRotation();
+        int displayDegrees  = displayRotation * 90;
+        boolean isFront = (lensFacing == CameraCharacteristics.LENS_FACING_FRONT);
+        int rotationNeeded = isFront
+                ? (sensorOrientation + displayDegrees) % 360
+                : (sensorOrientation - displayDegrees + 360) % 360;
+        return rotationNeeded % 180 != 0;
+    }
+
+    /**
+     * Clears all view-level transforms so switching between UVC and internal preview
+     * starts from a clean state. UVC preview uses view scale/translation, while the
+     * internal path uses TextureView content transforms; mixing them causes stretch.
+     */
+    private void resetPreviewViewState() {
+        final com.serenegiant.widget.AspectRatioTextureView tv = mBinding.viewMainPreview;
+        tv.setPivotX(tv.getWidth() * 0.5f);
+        tv.setPivotY(tv.getHeight() * 0.5f);
+        tv.setScaleX(1f);
+        tv.setScaleY(1f);
+        tv.setTranslationX(0f);
+        tv.setTranslationY(0f);
+        tv.setRotation(0f);
+        tv.setTransform(new Matrix());
+    }
+
+    /**
+     * Applies a {@link Matrix} to the TextureView so the Camera2 sensor buffer is
+     * displayed correctly regardless of device orientation.
+     */
+    private void applyInternalCameraTransform() {
+        if (mCurrentInternalCamera == null || mInternalPreviewSize == null) return;
+
+        final com.serenegiant.widget.AspectRatioTextureView tv = mBinding.viewMainPreview;
+        final int viewW = tv.getWidth();
+        final int viewH = tv.getHeight();
+        if (viewW <= 0 || viewH <= 0) {
+            tv.post(this::applyInternalCameraTransform);
+            return;
+        }
+
+        final int sensorOrientation   = mCurrentInternalCamera.sensorOrientation;
+        final int displayRotation     = getWindowManager().getDefaultDisplay().getRotation();
+        final int displayDegrees      = displayRotation * 90;
+        final boolean isFront         =
+                mCurrentInternalCamera.lensFacing == CameraCharacteristics.LENS_FACING_FRONT;
+
+        final int rotationNeeded;
+        if (isFront) {
+            rotationNeeded = (sensorOrientation + displayDegrees) % 360;
+        } else {
+            rotationNeeded = (sensorOrientation - displayDegrees + 360) % 360;
+        }
+
+        final Matrix matrix = new Matrix();
+        final float cx = viewW / 2f;
+        final float cy = viewH / 2f;
+        final int   bufW   = mInternalPreviewSize.getWidth();
+        final int   bufH   = mInternalPreviewSize.getHeight();
+
+        final int transformRotation = (rotationNeeded + 270) % 360;
+        if (transformRotation % 180 != 0) {
+            // 90° or 270° rotation needed.
+            // Map view rect to buffer rect with width/height swapped.
+            final android.graphics.RectF viewRect = new android.graphics.RectF(0f, 0f, viewW, viewH);
+            final android.graphics.RectF bufferRect = new android.graphics.RectF(0f, 0f, bufH, bufW);
+            bufferRect.offset(cx - bufferRect.centerX(), cy - bufferRect.centerY());
+            matrix.setRectToRect(viewRect, bufferRect, Matrix.ScaleToFit.FILL);
+            final float scale = Math.max((float) viewH / (float) bufH, (float) viewW / (float) bufW);
+            matrix.postScale(scale, scale, cx, cy);
+        }
+        if (transformRotation != 0) {
+            matrix.postRotate(transformRotation, cx, cy);
+        }
+        if (isFront) {
+            matrix.postScale(-1f, 1f, cx, cy);
+        }
+        tv.setTransform(matrix);
+        // apply fill transform (if enabled) to make preview as large as possible
+        applyPreviewFillTransform();
+
+        if (DEBUG) {
+            Log.i(TAG, "[InternalCam] sensorOrient=" + sensorOrientation
+                    + " displayRot=" + displayRotation
+                    + " rotNeeded=" + rotationNeeded
+                    + " transformRot=" + transformRotation
+                    + " view=" + viewW + "x" + viewH
+                    + " buf=" + bufW + "x" + bufH);
+        }
+    }
+
+    // =========================================================================
+    //  Internal camera — state callback
+    // =========================================================================
+
+    private class InternalCameraStateCallback
+            implements InternalCameraHelper.OnCameraStateCallback {
+
+        @Override
+        public void onOpened(InternalCameraInfo cameraInfo, android.util.Size previewSize) {
+            // Attach the TextureView surface so Camera2 can start streaming
+            SurfaceTexture st = mBinding.viewMainPreview.getSurfaceTexture();
+            if (st != null && mInternalCameraHelper != null) {
+                mInternalCameraHelper.startPreview(st);
+            }
+
+            // Set up NDI streaming
+            setupNdiForInternalCamera(cameraInfo, previewSize);
+
+            startKeepAliveService();
+            mIsCameraConnected = true;
+            updateUIControls();
+            mBinding.viewMainPreview.post(() -> applyInternalCameraTransform());
+        }
+
+        @Override
+        public void onClosed(InternalCameraInfo cameraInfo) {
+            // Always mark disconnected before doing pending reopen. This prevents the
+            // openInternalCamera() path from thinking we're already connected and
+            // re-entering close->open recursion.
+            mIsCameraConnected = false;
+
+            // If a resolution change (or camera switch) requested a reopen, do that
+            // now that the device is fully closed — avoids racing with the async HAL cleanup.
+            if (mPendingOpenCamera != null) {
+                InternalCameraInfo pending     = mPendingOpenCamera;
+                android.util.Size  pendingSize = mPendingOpenSize;
+                mPendingOpenCamera = null;
+                mPendingOpenSize   = null;
+                // Must release old NdiSender before creating a new one
+                cleanupNdiAndStreaming();
+                openInternalCamera(pending, pendingSize);
+                return;
+            }
+
+            stopKeepAliveService();
+            if (mIsRecording) {
+                mIsRecording = false;
+                stopRecordTimer();
+            }
+            cleanupNdiAndStreaming();
+            updateUIControls();
+            closeAllDialogFragment();
+        }
+
+        @Override
+        public void onError(InternalCameraInfo cameraInfo, String message) {
+            Toast.makeText(MainActivity.this,
+                    "Camera error: " + message, Toast.LENGTH_SHORT).show();
+            // Discard the errored helper so the next openInternalCamera creates a fresh one.
+            mInternalCameraHelper = null;
+            mIsCameraConnected = false;
+            updateUIControls();
+        }
+    }
+
+    // =========================================================================
+    //  NDI helpers shared by both USB and internal paths
+    // =========================================================================
+
+    private void setupNdiForInternalCamera(InternalCameraInfo cameraInfo,
+                                           android.util.Size previewSize) {
+        try {
+            mNdiStartTime = SystemClock.elapsedRealtime();
+            String sourceName = mNdiSourceName;
+            if (TextUtils.isEmpty(sourceName)) {
+                sourceName = android.os.Build.MANUFACTURER
+                        + " " + android.os.Build.MODEL
+                        + " — " + cameraInfo.displayName;
+                setSavedNdiName(sourceName);
+            }
+            mNdiSender = new NdiSender(sourceName);
+            mHandler.post(mTallyPoller);
+
+            mNdiCameraFormat = "nv12";
+            mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
+            mFrameForwarder.setFrameDimensions(previewSize.getWidth(), previewSize.getHeight());
+            Log.i(TAG, "NDI ready for internal camera: " + sourceName);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to set up NDI for internal camera", e);
+            mNdiSender      = null;
+            mFrameForwarder = null;
+        }
+    }
+
+    /** Tears down NDI sender and frame forwarder — used by both camera paths. */
+    private void cleanupNdiAndStreaming() {
+        try {
+            if (mCameraHelper != null) {
+                mCameraHelper.setFrameCallback(null, 0);
+            }
+            if (mFrameForwarder != null) {
+                mFrameForwarder = null;
+            }
+            if (mNdiSender != null) {
+                stopTallyPolling();
+                mNdiSender.close();
+                mNdiSender = null;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Error stopping NDI", e);
+        }
     }
 }

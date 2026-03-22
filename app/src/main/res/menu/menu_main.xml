@@ -77,4 +77,29 @@
         android:visible="false"
         app:showAsAction="never" />
 
+    <!-- ── Internal (phone) camera ── -->
+    <item
+        android:id="@+id/action_use_internal_camera"
+        android:title="@string/action_use_internal_camera"
+        android:visible="true"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_use_usb_camera"
+        android:title="@string/action_use_usb_camera"
+        android:visible="false"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_select_internal_camera"
+        android:title="@string/action_select_internal_camera"
+        android:visible="false"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_internal_camera_resolution"
+        android:title="@string/action_internal_camera_resolution"
+        android:visible="false"
+        app:showAsAction="never" />
+
 </menu>

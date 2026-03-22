@@ -17,7 +17,7 @@
     
     <string name="saved_preview_size">saved_preview_size</string>
 
-    <string name="main_connect_usb_tip">Connect the USB camera</string>
+    <string name="main_connect_usb_tip">Connect a USB camera or tap &#8942; → Use Phone Camera</string>
 
     <string name="device_list_dialog_title">Device</string>
     <string name="device_list_empty_tip">Please connect a USB Camera</string>
@@ -54,4 +54,18 @@
     <string name="camera_controls_text_60hz">60Hz</string>
     <string name="camera_controls_button_close">Close</string>
     <string name="camera_controls_button_reset">Reset</string>
+
+    <!-- Internal (phone) camera -->
+    <string name="action_use_internal_camera">Use Phone Camera</string>
+    <string name="action_use_usb_camera">Use USB Camera</string>
+    <string name="action_select_internal_camera">Select Camera</string>
+    <string name="action_internal_camera_resolution">Camera Resolution</string>
+
+    <string name="internal_camera_list_title">Select Internal Camera</string>
+    <string name="internal_camera_list_empty">No internal cameras found</string>
+    <string name="internal_camera_resolution_title">Select Resolution</string>
+    <string name="internal_camera_resolution_empty">No resolutions available</string>
+
+    <string name="main_connect_camera_tip">Connect a USB camera or use the Phone Camera</string>
+    <string name="main_select_camera_tip">Select a camera from the menu</string>
 </resources>
