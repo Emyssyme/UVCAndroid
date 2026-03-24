@@ -123,6 +123,19 @@ public class MainActivity extends AppCompatActivity {
     private UvcNdiFrameForwarder mFrameForwarder;
     private long mNdiStartTime = 0;
 
+    // Single-slot latest-frame buffer + worker thread for NDI frame forwarding.
+    // Keeps latency tight under backpressure and reduces GC activity for 4K streams.
+    private final java.util.concurrent.atomic.AtomicReference<java.nio.ByteBuffer> mNdiLatestFrame
+            = new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicReference<java.nio.ByteBuffer> mNdiReusableBuffer
+            = new java.util.concurrent.atomic.AtomicReference<>();
+
+    private volatile boolean mNdiWorkerRunning = false;
+    private Thread mNdiWorkerThread;
+
+    private long mLastQueueFullLog = 0;
+    private static final long QUEUE_FULL_LOG_INTERVAL_MS = 500;
+
     private long mRecordStartTime = 0;
     private Timer mRecordTimer = null;
     private DecimalFormat mDecimalFormat;
@@ -493,9 +506,7 @@ public class MainActivity extends AppCompatActivity {
     private class MultiFrameCallback implements com.serenegiant.usb.IFrameCallback {
         @Override
         public void onFrame(java.nio.ByteBuffer frame) {
-            if (mFrameForwarder != null) {
-                mFrameForwarder.onFrame(frame);
-            }
+            enqueueNdiFrame(frame);
         }
     }
 
@@ -719,6 +730,7 @@ public class MainActivity extends AppCompatActivity {
                     mFrameForwarder.setFrameDimensions(size.width, size.height);
                     // now apply quality mode (will register callback)
                     setNdiFormat(mNdiHighQuality);
+                    startNdiForwardingThread();
                 } catch (Exception e) {
                     Log.e(TAG, "❌ Failed to create NDI sender", e);
                     mNdiSender = null;
@@ -1471,9 +1483,7 @@ public class MainActivity extends AppCompatActivity {
         // Wire up frame delivery for NDI (set before openCamera so the reader is
         // included in the initial capture session)
         mInternalCameraHelper.setFrameListener((nv12Frame, width, height) -> {
-            if (mFrameForwarder != null) {
-                mFrameForwarder.onFrame(nv12Frame);
-            }
+            enqueueNdiFrame(nv12Frame);
         });
 
         XXPermissions.with(this)
@@ -1684,6 +1694,7 @@ public class MainActivity extends AppCompatActivity {
             mNdiCameraFormat = "nv12";
             mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
             mFrameForwarder.setFrameDimensions(previewSize.getWidth(), previewSize.getHeight());
+            startNdiForwardingThread();
             Log.i(TAG, "NDI ready for internal camera: " + sourceName);
         } catch (Exception e) {
             Log.e(TAG, "Failed to set up NDI for internal camera", e);
@@ -1706,8 +1717,94 @@ public class MainActivity extends AppCompatActivity {
                 mNdiSender.close();
                 mNdiSender = null;
             }
+            stopNdiForwardingThread();
         } catch (Exception e) {
             Log.e(TAG, "Error stopping NDI", e);
         }
+    }
+
+    private void startNdiForwardingThread() {
+        if (mNdiWorkerRunning) {
+            return;
+        }
+        mNdiWorkerRunning = true;
+        mNdiWorkerThread = new Thread(() -> {
+            while (mNdiWorkerRunning && !Thread.currentThread().isInterrupted()) {
+                try {
+                    java.nio.ByteBuffer frame = mNdiLatestFrame.getAndSet(null);
+                    if (frame == null) {
+                        try {
+                            Thread.sleep(10);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                        continue;
+                    }
+                    if (mFrameForwarder != null) {
+                        mFrameForwarder.onFrame(frame);
+                    }
+                    mNdiReusableBuffer.set(frame);
+                } catch (Exception e) {
+                    Log.w(TAG, "Error in NDI forwarding thread", e);
+                }
+            }
+        }, "NdiFrameForwarder");
+        mNdiWorkerThread.setPriority(Thread.MAX_PRIORITY);
+        mNdiWorkerThread.start();
+    }
+
+    private void stopNdiForwardingThread() {
+        mNdiWorkerRunning = false;
+        if (mNdiWorkerThread != null) {
+            mNdiWorkerThread.interrupt();
+            try {
+                mNdiWorkerThread.join(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            mNdiWorkerThread = null;
+        }
+        mNdiLatestFrame.set(null);
+        mNdiReusableBuffer.set(null);
+    }
+
+    private void enqueueNdiFrame(java.nio.ByteBuffer frame) {
+        if (frame == null || mFrameForwarder == null) {
+            return;
+        }
+
+        java.nio.ByteBuffer frameCopy = copyFrameBuffer(frame);
+        if (frameCopy == null) {
+            return;
+        }
+
+        java.nio.ByteBuffer old = mNdiLatestFrame.getAndSet(frameCopy);
+        if (old != null) {
+            long now = System.currentTimeMillis();
+            if (now - mLastQueueFullLog > QUEUE_FULL_LOG_INTERVAL_MS) {
+                Log.w(TAG, "NDI frame queue full: dropped oldest frame");
+                mLastQueueFullLog = now;
+            }
+            // Reclaim the dropped buffer.
+            mNdiReusableBuffer.set(old);
+        }
+    }
+
+    private java.nio.ByteBuffer copyFrameBuffer(java.nio.ByteBuffer src) {
+        if (src == null || src.remaining() <= 0) {
+            return null;
+        }
+
+        int needed = src.remaining();
+        java.nio.ByteBuffer dest = mNdiReusableBuffer.getAndSet(null);
+        if (dest == null || dest.capacity() < needed) {
+            dest = java.nio.ByteBuffer.allocateDirect(needed);
+        }
+        dest.clear();
+        int oldPos = src.position();
+        dest.put(src);
+        dest.flip();
+        src.position(oldPos);
+        return dest;
     }
 }
