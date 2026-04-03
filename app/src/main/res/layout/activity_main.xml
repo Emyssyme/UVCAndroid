@@ -35,6 +35,57 @@
             android:layout_centerInParent="true"
             android:visibility="invisible" />
 
+        <!-- quick AWB/AE/AF controls (always visible) -->
+        <LinearLayout
+            android:id="@+id/internal_camera_quick_buttons"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_alignParentTop="true"
+            android:layout_margin="8dp"
+            android:orientation="horizontal"
+            android:gravity="center_horizontal"
+            android:visibility="gone"
+            android:background="#66000000"
+            android:padding="4dp">
+
+            <Button
+                android:id="@+id/btnQuickAe"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="AE Auto"
+                android:textColor="@color/white"
+                android:backgroundTint="#AA000000"
+                android:layout_marginEnd="4dp" />
+
+            <Button
+                android:id="@+id/btnQuickAwb"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="AWB Auto"
+                android:textColor="@color/white"
+                android:backgroundTint="#AA000000"
+                android:layout_marginEnd="4dp" />
+
+            <Button
+                android:id="@+id/btnQuickAf"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="AF Auto"
+                android:textColor="@color/white"
+                android:backgroundTint="#AA000000" />
+        </LinearLayout>
+
+        <!-- tap-to-focus marker -->
+        <View
+            android:id="@+id/tap_focus_marker"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_alignParentTop="true"
+            android:layout_alignParentStart="true"
+            android:layout_margin="0dp"
+            android:visibility="gone"
+            android:background="@drawable/tap_focus_marker" />
+
         <!-- tally indicator circle -->
         <View
             android:id="@+id/tally_indicator"
@@ -66,6 +117,164 @@
             android:textSize="14sp"
             android:visibility="gone"
             tools:text="99:99:99" />
+
+        <LinearLayout
+            android:id="@+id/internal_camera_controls"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_alignParentBottom="true"
+            android:layout_margin="8dp"
+            android:background="#66000000"
+            android:orientation="vertical"
+            android:padding="8dp"
+            android:visibility="gone">
+
+            <TextView
+                android:id="@+id/tvInternalCameraControlsLabel"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Internal Camera Controls"
+                android:textColor="@color/white"
+                android:textStyle="bold"
+                android:textSize="14sp" />
+
+            <TextView
+                android:id="@+id/tvInternalZoomValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Zoom: 1.0x"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:layout_marginTop="6dp" />
+
+            <SeekBar
+                android:id="@+id/seekbarInternalZoom"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp" />
+
+            <TextView
+                android:id="@+id/tvInternalExposureMode"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="AE: Auto"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:layout_marginTop="8dp" />
+
+            <TextView
+                android:id="@+id/tvInternalExposureValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="EV: 0"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:layout_marginTop="4dp" />
+
+            <SeekBar
+                android:id="@+id/seekbarInternalExposure"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp" />
+
+            <TextView
+                android:id="@+id/tvInternalKelvinValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Kelvin: 4500K"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:layout_marginTop="8dp"
+                android:visibility="gone" />
+
+            <SeekBar
+                android:id="@+id/seekbarInternalKelvin"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/tvInternalFocusValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Focus: infinity"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:layout_marginTop="8dp" />
+
+            <SeekBar
+                android:id="@+id/seekbarInternalFocus"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp" />
+
+            <TextView
+                android:id="@+id/tvInternalIsoValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="ISO: 100"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:layout_marginTop="8dp" />
+
+            <SeekBar
+                android:id="@+id/seekbarInternalIso"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp" />
+
+            <TextView
+                android:id="@+id/tvInternalExposureTimeValue"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Shutter: 1/100"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:layout_marginTop="8dp" />
+
+            <SeekBar
+                android:id="@+id/seekbarInternalExposureTime"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginTop="8dp">
+
+                <Button
+                    android:id="@+id/btnInternalAeToggle"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:text="AE Auto"
+                    android:textColor="@color/white"
+                    android:backgroundTint="#AA000000" />
+
+                <Button
+                    android:id="@+id/btnInternalAwbToggle"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="4dp"
+                    android:text="AWB Auto"
+                    android:textColor="@color/white"
+                    android:backgroundTint="#AA000000" />
+
+                <Button
+                    android:id="@+id/btnInternalAfToggle"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="4dp"
+                    android:text="AF Auto"
+                    android:textColor="@color/white"
+                    android:backgroundTint="#AA000000" />
+            </LinearLayout>
+        </LinearLayout>
 
         <com.google.android.material.floatingactionbutton.FloatingActionButton
             android:id="@+id/fabVideo"

@@ -3,6 +3,7 @@ package com.herohan.uvcapp;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.graphics.ImageFormat;
+import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
@@ -10,8 +11,11 @@ import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.TotalCaptureResult;
+import android.hardware.camera2.params.RggbChannelVector;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
+import android.util.Range;
 import android.media.ImageReader;
 import android.media.MediaRecorder;
 import android.os.Handler;
@@ -115,6 +119,29 @@ public class InternalCameraHelper {
     private MediaRecorder  mMediaRecorder;
     private boolean        mIsRecording = false;
     private File           mRecordingFile;
+
+    // Internal camera controls (DroidCam-style)
+    private float  mCurrentZoom = 1.0f;
+    private float  mMaxDigitalZoom = 1.0f;
+    private int    mCurrentExposureCompensation = 0;
+    private Range<Integer> mAeCompensationRange = new Range<>(0, 0);
+    private int    mAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+
+    private boolean mAeAuto = true;
+    private int     mAeMode = CaptureRequest.CONTROL_AE_MODE_ON;
+    private boolean mAwbAuto = true;
+    private int     mAwbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO;
+    private int     mAwbTemperatureKelvin = 4500;
+
+    private float  mCurrentFocusDistance = 0f;
+    private float  mMinFocusDistance = 0f;
+
+    private Range<Integer> mSensitivityRange = new Range<>(100, 100);
+    private int            mCurrentSensitivity = 100;
+
+    private Range<Long>    mExposureTimeRange = new Range<>(100000L, 100000L);
+    private long           mCurrentExposureTime = 100000L;
+    private boolean        mTapToFocusMode = false;
 
     // Flags for lazy preview start
     private boolean mCameraReadyForPreview = false;
@@ -260,6 +287,69 @@ public class InternalCameraHelper {
         mClosed            = false;
         mCurrentCameraInfo = cameraInfo;
         mPreviewSize       = previewSize;
+
+        // initialize camera control ranges for internal camera GUI
+        try {
+            CameraCharacteristics characteristics = mCameraManager.getCameraCharacteristics(cameraInfo.cameraId);
+            Float maxZoom = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+            mMaxDigitalZoom = (maxZoom == null || maxZoom < 1.0f) ? 1.0f : maxZoom;
+            mCurrentZoom = 1.0f;
+            Range<Integer> aeRange = characteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+            if (aeRange != null) {
+                mAeCompensationRange = aeRange;
+            } else {
+                mAeCompensationRange = new Range<>(0, 0);
+            }
+            mCurrentExposureCompensation = 0;
+
+            mMinFocusDistance = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) != null
+                    ? characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+                    : 0f;
+            mCurrentFocusDistance = 0f; // infinity
+
+            Range<Integer> sensitivityRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+            if (sensitivityRange != null) {
+                mSensitivityRange = sensitivityRange;
+                mCurrentSensitivity = Math.max(100, mSensitivityRange.getLower());
+            } else {
+                mSensitivityRange = new Range<>(100, 100);
+                mCurrentSensitivity = 100;
+            }
+
+            Range<Long> exposureTimeRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
+            if (exposureTimeRange != null) {
+                mExposureTimeRange = exposureTimeRange;
+                mCurrentExposureTime = Math.max(100000L, mExposureTimeRange.getLower());
+            } else {
+                mExposureTimeRange = new Range<>(100000L, 100000L);
+                mCurrentExposureTime = 100000L;
+            }
+
+            mAeAuto = true;
+            mAeMode = CaptureRequest.CONTROL_AE_MODE_ON;
+            mAwbAuto = true;
+            mAwbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO;
+            mAwbTemperatureKelvin = 4500;
+            mAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+        } catch (CameraAccessException e) {
+            Log.w(TAG, "Failed to retrieve camera characteristics", e);
+            mMaxDigitalZoom = 1.0f;
+            mAeCompensationRange = new Range<>(0, 0);
+            mCurrentExposureCompensation = 0;
+            mMinFocusDistance = 0f;
+            mCurrentFocusDistance = 0f;
+            mSensitivityRange = new Range<>(100, 100);
+            mCurrentSensitivity = 100;
+            mExposureTimeRange = new Range<>(100000L, 100000L);
+            mCurrentExposureTime = 100000L;
+            mAeAuto = true;
+            mAeMode = CaptureRequest.CONTROL_AE_MODE_ON;
+            mAwbAuto = true;
+            mAwbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO;
+            mAwbTemperatureKelvin = 4500;
+            mAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+        }
+
         startBackgroundThread();
 
         // Defensively close any device that was not properly released by a previous session.
@@ -406,11 +496,7 @@ public class InternalCameraHelper {
             if (mNdiYuvReader != null)
                 previewBuilder.addTarget(mNdiYuvReader.getSurface());
 
-            // Continuous auto-focus and auto-exposure
-            previewBuilder.set(CaptureRequest.CONTROL_AF_MODE,
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
-            previewBuilder.set(CaptureRequest.CONTROL_AE_MODE,
-                    CaptureRequest.CONTROL_AE_MODE_ON);
+            applyCameraSettings(previewBuilder);
 
             mCameraDevice.createCaptureSession(surfaces,
                     new CameraCaptureSession.StateCallback() {
@@ -434,6 +520,303 @@ public class InternalCameraHelper {
         } catch (CameraAccessException e) {
             Log.e(TAG, "startPreviewSession failed", e);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helper camera settings
+    // -------------------------------------------------------------------------
+
+    private void applyCameraSettings(CaptureRequest.Builder builder) {
+        if (builder == null) return;
+
+        // AE mode and compensation
+        builder.set(CaptureRequest.CONTROL_AE_MODE, mAeMode);
+        if (mAeCompensationRange != null && mAeCompensationRange.getLower() <= mCurrentExposureCompensation
+                && mCurrentExposureCompensation <= mAeCompensationRange.getUpper()) {
+            builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mCurrentExposureCompensation);
+        }
+
+        if (!mAeAuto) {
+            if (mExposureTimeRange != null) {
+                final long exposed = Math.max(mExposureTimeRange.getLower(), Math.min(mExposureTimeRange.getUpper(), mCurrentExposureTime));
+                builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposed);
+            }
+            if (mSensitivityRange != null) {
+                final int iso = Math.max(mSensitivityRange.getLower(), Math.min(mSensitivityRange.getUpper(), mCurrentSensitivity));
+                builder.set(CaptureRequest.SENSOR_SENSITIVITY, iso);
+            }
+        }
+
+        // AWB mode
+        builder.set(CaptureRequest.CONTROL_AWB_MODE, mAwbMode);
+        if (!mAwbAuto && mAwbMode == CaptureRequest.CONTROL_AWB_MODE_OFF) {
+            builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_FAST);
+            builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, getRggbFromKelvin(mAwbTemperatureKelvin));
+        }
+
+        // AF mode and focus distance
+        builder.set(CaptureRequest.CONTROL_AF_MODE, mAfMode);
+        if (mAfMode == CaptureRequest.CONTROL_AF_MODE_OFF && mMinFocusDistance > 0f) {
+            float clampedFocus = Math.max(0f, Math.min(mMinFocusDistance, mCurrentFocusDistance));
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, clampedFocus);
+        }
+
+        // Zoom (digital crop)
+        if (mCurrentZoom > 1.0f && mCurrentCameraInfo != null) {
+            try {
+                CameraCharacteristics characteristics = mCameraManager.getCameraCharacteristics(mCurrentCameraInfo.cameraId);
+                Rect sensorArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+                if (sensorArray != null) {
+                    float zoomRatio = Math.min(mCurrentZoom, mMaxDigitalZoom);
+                    int cropW = Math.round(sensorArray.width() / zoomRatio);
+                    int cropH = Math.round(sensorArray.height() / zoomRatio);
+                    int cropX = (sensorArray.width() - cropW) / 2;
+                    int cropY = (sensorArray.height() - cropH) / 2;
+                    builder.set(CaptureRequest.SCALER_CROP_REGION,
+                            new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
+                }
+            } catch (CameraAccessException e) {
+                Log.w(TAG, "applyCameraSettings: error computing crop region", e);
+            }
+        }
+    }
+
+    private void tryUpdatePreviewRequest() {
+        if (mCaptureSession == null || mCameraDevice == null) return;
+        try {
+            CaptureRequest.Builder builder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            if (mPreviewSurfaceTexture != null) {
+                Surface previewSurface = new Surface(mPreviewSurfaceTexture);
+                builder.addTarget(previewSurface);
+            }
+            applyCameraSettings(builder);
+            mCaptureSession.setRepeatingRequest(builder.build(), null, mBackgroundHandler);
+        } catch (CameraAccessException e) {
+            Log.w(TAG, "tryUpdatePreviewRequest failed", e);
+        }
+    }
+
+    public float getMaxDigitalZoom() {
+        return mMaxDigitalZoom;
+    }
+
+    public float getCurrentZoom() {
+        return mCurrentZoom;
+    }
+
+    public void setCurrentZoom(float zoom) {
+        mCurrentZoom = Math.max(1.0f, Math.min(mMaxDigitalZoom, zoom));
+        tryUpdatePreviewRequest();
+    }
+
+    public Range<Integer> getAeCompensationRange() {
+        return mAeCompensationRange;
+    }
+
+    public int getCurrentExposureCompensation() {
+        return mCurrentExposureCompensation;
+    }
+
+    public void setExposureCompensation(int compensation) {
+        if (mAeCompensationRange == null) return;
+        int clamped = Math.max(mAeCompensationRange.getLower(), Math.min(mAeCompensationRange.getUpper(), compensation));
+        mCurrentExposureCompensation = clamped;
+        tryUpdatePreviewRequest();
+    }
+
+    public int getAfMode() {
+        return mAfMode;
+    }
+
+    public void toggleAfMode() {
+        if (mAfMode == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
+            mAfMode = CaptureRequest.CONTROL_AF_MODE_OFF;
+        } else {
+            mAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+        }
+        tryUpdatePreviewRequest();
+    }
+
+    public boolean isAeAuto() {
+        return mAeAuto;
+    }
+
+    public void setAeAuto(boolean enabled) {
+        mAeAuto = enabled;
+        mAeMode = enabled ? CaptureRequest.CONTROL_AE_MODE_ON : CaptureRequest.CONTROL_AE_MODE_OFF;
+        tryUpdatePreviewRequest();
+    }
+
+    public void toggleAeMode() {
+        setAeAuto(!mAeAuto);
+    }
+
+    public float getCurrentFocusDistance() {
+        return mCurrentFocusDistance;
+    }
+
+    public float getMinFocusDistance() {
+        return mMinFocusDistance;
+    }
+
+    public void setFocusDistance(float distance) {
+        mCurrentFocusDistance = Math.max(0f, Math.min(mMinFocusDistance, distance));
+        if (mAfMode == CaptureRequest.CONTROL_AF_MODE_OFF) {
+            tryUpdatePreviewRequest();
+        }
+    }
+
+    public Range<Integer> getSensitivityRange() {
+        return mSensitivityRange;
+    }
+
+    public int getCurrentSensitivity() {
+        return mCurrentSensitivity;
+    }
+
+    public void setSensitivity(int iso) {
+        mCurrentSensitivity = Math.max(mSensitivityRange.getLower(), Math.min(mSensitivityRange.getUpper(), iso));
+        if (!mAeAuto) tryUpdatePreviewRequest();
+    }
+
+    public Range<Long> getExposureTimeRange() {
+        return mExposureTimeRange;
+    }
+
+    public long getCurrentExposureTime() {
+        return mCurrentExposureTime;
+    }
+
+    public void setExposureTime(long exposureTime) {
+        mCurrentExposureTime = Math.max(mExposureTimeRange.getLower(), Math.min(mExposureTimeRange.getUpper(), exposureTime));
+        if (!mAeAuto) tryUpdatePreviewRequest();
+    }
+
+    public int getAwbTemperatureKelvin() {
+        return mAwbTemperatureKelvin;
+    }
+
+    public void setAwbTemperatureKelvin(int kelvin) {
+        mAwbTemperatureKelvin = Math.max(1000, Math.min(10000, kelvin));
+        if (!mAwbAuto) tryUpdatePreviewRequest();
+    }
+
+    public boolean isAwbAuto() {
+        return mAwbAuto;
+    }
+
+    public void setAwbAuto(boolean enabled) {
+        mAwbAuto = enabled;
+        mAwbMode = enabled ? CaptureRequest.CONTROL_AWB_MODE_AUTO : CaptureRequest.CONTROL_AWB_MODE_OFF;
+        tryUpdatePreviewRequest();
+    }
+
+    public void toggleAwbMode() {
+        setAwbAuto(!mAwbAuto);
+    }
+
+    public boolean isTapToFocusMode() {
+        return mTapToFocusMode;
+    }
+
+    public void setTapToFocusMode(boolean enabled) {
+        mTapToFocusMode = enabled;
+        if (enabled) {
+            // keep AF idle until tap event
+            mAfMode = CaptureRequest.CONTROL_AF_MODE_OFF;
+        } else {
+            if (mAfMode == CaptureRequest.CONTROL_AF_MODE_OFF) {
+                mAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+            }
+        }
+        tryUpdatePreviewRequest();
+    }
+
+    public void setAfMode(int mode) {
+        mAfMode = mode;
+        if (mode != CaptureRequest.CONTROL_AF_MODE_OFF) {
+            setTapToFocusMode(false);
+        }
+        tryUpdatePreviewRequest();
+    }
+
+    public void triggerTapToFocus(float x, float y, int viewWidth, int viewHeight) {
+        if (!mTapToFocusMode || mCameraDevice == null || mCaptureSession == null || mPreviewSurfaceTexture == null) return;
+        try {
+            CaptureRequest.Builder builder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            mPreviewSurfaceTexture.setDefaultBufferSize(mPreviewSize.getWidth(), mPreviewSize.getHeight());
+            builder.addTarget(new Surface(mPreviewSurfaceTexture));
+            applyCameraSettings(builder);
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
+
+            mCaptureSession.capture(builder.build(), new CameraCaptureSession.CaptureCallback() {
+                @Override
+                public void onCaptureCompleted(@NonNull CameraCaptureSession session,
+                                               @NonNull CaptureRequest request,
+                                               @NonNull TotalCaptureResult result) {
+                    // return to continuous video after AF run
+                    if (mTapToFocusMode) {
+                        mAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+                        tryUpdatePreviewRequest();
+                    }
+                }
+            }, mBackgroundHandler);
+
+        } catch (CameraAccessException e) {
+            Log.w(TAG, "triggerTapToFocus: failed", e);
+        }
+    }
+
+    private static int clamp(int min, int max, int value) {
+        return value < min ? min : (value > max ? max : value);
+    }
+
+    private RggbChannelVector getRggbFromKelvin(int kelvin) {
+        int temp = Math.max(1000, Math.min(40000, kelvin));
+        double tempK = temp / 100.0;
+
+        double red;
+        if (tempK <= 66) {
+            red = 255;
+        } else {
+            red = 329.698727446 * Math.pow(tempK - 60, -0.1332047592);
+            red = Math.max(0, Math.min(255, red));
+        }
+
+        double green;
+        if (tempK <= 66) {
+            green = 99.4708025861 * Math.log(tempK) - 161.1195681661;
+        } else {
+            green = 288.1221695283 * Math.pow(tempK - 60, -0.0755148492);
+        }
+        green = Math.max(0, Math.min(255, green));
+
+        double blue;
+        if (tempK >= 66) {
+            blue = 255;
+        } else if (tempK <= 19) {
+            blue = 0;
+        } else {
+            blue = 138.5177312231 * Math.log(tempK - 10) - 305.0447927307;
+            blue = Math.max(0, Math.min(255, blue));
+        }
+
+        float rNorm = (float) (red / 255.0);
+        float gNorm = (float) (green / 255.0);
+        float bNorm = (float) (blue / 255.0);
+
+        if (gNorm <= 0.001f) {
+            return new RggbChannelVector(1f, 1f, 1f, 1f);
+        }
+
+        float rGain = rNorm / gNorm;
+        float bGain = bNorm / gNorm;
+
+        rGain = Math.max(0.1f, Math.min(10f, rGain));
+        bGain = Math.max(0.1f, Math.min(10f, bGain));
+
+        return new RggbChannelVector(rGain, 1f, 1f, bGain);
     }
 
     // -------------------------------------------------------------------------
@@ -627,6 +1010,7 @@ public class InternalCameraHelper {
 
                                 builder.set(CaptureRequest.CONTROL_MODE,
                                         CaptureRequest.CONTROL_MODE_AUTO);
+                                applyCameraSettings(builder);
                                 session.setRepeatingRequest(
                                         builder.build(), null, mBackgroundHandler);
 

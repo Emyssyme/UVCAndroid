@@ -68,4 +68,19 @@
 
     <string name="main_connect_camera_tip">Connect a USB camera or use the Phone Camera</string>
     <string name="main_select_camera_tip">Select a camera from the menu</string>
+
+    <string name="internal_camera_controls_label">Internal Camera Controls</string>
+    <string name="internal_camera_zoom_label">Zoom: %1$.1fx</string>
+    <string name="internal_camera_exposure_mode_auto">AE: Auto</string>
+    <string name="internal_camera_exposure_mode_manual">AE: Manual</string>
+    <string name="internal_camera_exposure_label">EV: %1$d</string>
+    <string name="internal_camera_focus_label">Focus: %1$s</string>
+    <string name="internal_camera_iso_label">ISO: %1$d</string>
+    <string name="internal_camera_exposure_time_label">Shutter: %1$s</string>
+    <string name="internal_camera_ae_auto">AE Auto</string>
+    <string name="internal_camera_ae_off">AE Manual</string>
+    <string name="internal_camera_awb_auto">AWB Auto</string>
+    <string name="internal_camera_awb_off">AWB Manual</string>
+    <string name="internal_camera_af_auto">AF Auto</string>
+    <string name="internal_camera_af_off">AF Off</string>
 </resources>

@@ -7,14 +7,19 @@ import android.content.res.Configuration;
 import android.graphics.Matrix;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CaptureRequest;
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbManager;
 import android.os.Bundle;
 import android.app.AlertDialog;
 import android.preference.PreferenceManager;
 import android.util.Log;
+import android.view.Menu;
+import android.view.MenuItem;
 import android.view.Surface;
 import android.widget.EditText;
+import android.widget.SeekBar;
+import android.util.Range;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
@@ -56,6 +61,7 @@ import android.text.TextUtils;
 import android.util.Log;
 import android.view.Menu;
 import android.view.MenuItem;
+import android.view.MotionEvent;
 import android.view.TextureView;
 import android.view.View;
 import android.view.ViewParent;
@@ -68,6 +74,7 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.text.DecimalFormat;
 import java.util.Arrays;
+import java.util.Locale;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Timer;
@@ -99,6 +106,20 @@ public class MainActivity extends AppCompatActivity {
     private static final float ASPECT_WARNING_THRESHOLD = 0.03f;
     private static final float EXPECTED_FIT_FILL_TOLERANCE = 0.92f;
     private static final float PREVIEW_FILL_EXTRA_SCALE = 1.0f;
+    private static final long[] PRO_SHUTTER_VALUES_NS = new long[] {
+            1_000_000L, // 1/1000
+            2_000_000L, // 1/500
+            4_000_000L, // 1/250
+            8_000_000L, // 1/125
+            16_666_667L, // 1/60
+            22_222_222L, // 1/45
+            33_333_333L, // 1/30
+            66_666_667L, // 1/15
+            100_000_000L, // 1/10
+            125_000_000L, // 1/8
+            250_000_000L, // 1/4
+            500_000_000L  // 1/2
+    };
 
     /**
      * Camera preview width
@@ -253,6 +274,29 @@ public class MainActivity extends AppCompatActivity {
         initPreviewView();
     }
 
+    private final Runnable mHideTapFocusMarker = () -> runOnUiThread(() -> {
+        if (mBinding != null) {
+            mBinding.tapFocusMarker.setVisibility(View.GONE);
+        }
+    });
+
+    private void showTapFocusMarker(float x, float y) {
+        runOnUiThread(() -> {
+            if (mBinding == null || mBinding.tapFocusMarker == null) return;
+            int markerW = mBinding.tapFocusMarker.getWidth();
+            int markerH = mBinding.tapFocusMarker.getHeight();
+            if (markerW == 0 || markerH == 0) {
+                markerW = (int) getResources().getDisplayMetrics().density * 48;
+                markerH = markerW;
+            }
+            mBinding.tapFocusMarker.setX(x - markerW / 2f);
+            mBinding.tapFocusMarker.setY(y - markerH / 2f);
+            mBinding.tapFocusMarker.setVisibility(View.VISIBLE);
+            mHandler.removeCallbacks(mHideTapFocusMarker);
+            mHandler.postDelayed(mHideTapFocusMarker, 700);
+        });
+    }
+
     @Override
     protected void onStop() {
         super.onStop();
@@ -294,7 +338,14 @@ public class MainActivity extends AppCompatActivity {
 
         //noinspection SimplifiableIfStatement
         if (id == R.id.action_control) {
-            showCameraControlsDialog();
+            if (mCameraMode == CameraMode.INTERNAL) {
+                boolean visible = mBinding.internalCameraControls.getVisibility() == View.VISIBLE;
+                mBinding.internalCameraControls.setVisibility(visible ? View.GONE : View.VISIBLE);
+                mBinding.internalCameraQuickButtons.setVisibility(visible ? View.GONE : View.VISIBLE);
+                if (!visible) updateInternalCameraControlPanel();
+            } else {
+                showCameraControlsDialog();
+            }
         } else if (id == R.id.action_device) {
             showDeviceListDialog();
         } else if (id == R.id.action_safely_eject) {
@@ -357,7 +408,6 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_preview_fill_toggle).setVisible(true);
             menu.findItem(R.id.action_ndimode).setVisible(true);
         } else {
-            menu.findItem(R.id.action_control).setVisible(false);
             menu.findItem(R.id.action_safely_eject).setVisible(false);
             menu.findItem(R.id.action_video_format).setVisible(false);
             menu.findItem(R.id.action_rotate_90_CW).setVisible(false);
@@ -367,6 +417,9 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_preview_fill_toggle).setVisible(false);
             menu.findItem(R.id.action_ndimode).setVisible(false);
         }
+
+        // internal and USB preview can use control UI toggle
+        menu.findItem(R.id.action_control).setVisible(usbMode || internalMode);
 
         // USB device icon — only in USB mode
         menu.findItem(R.id.action_device).setVisible(usbMode);
@@ -416,6 +469,8 @@ public class MainActivity extends AppCompatActivity {
                         toggleVideoRecord(!mIsRecording);
                     });
         });
+
+        setupInternalCameraControlPanel();
     }
 
     private void showCameraControlsDialog() {
@@ -569,6 +624,17 @@ public class MainActivity extends AppCompatActivity {
         // manifest is updated accordingly, and this method will be invoked
         // again after a config change, so we recalc the transform.
         mBinding.viewMainPreview.setAspectRatio(mPreviewWidth, mPreviewHeight);
+        mBinding.viewMainPreview.setOnTouchListener((v, event) -> {
+            if (mCameraMode == CameraMode.INTERNAL && mInternalCameraHelper != null && mInternalCameraHelper.isTapToFocusMode()) {
+                if (event.getAction() == MotionEvent.ACTION_UP) {
+                    mInternalCameraHelper.triggerTapToFocus(event.getX(), event.getY(), v.getWidth(), v.getHeight());
+                    showTapFocusMarker(event.getX(), event.getY());
+                }
+                return true;
+            }
+            return false;
+        });
+
         mBinding.viewMainPreview.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
             @Override
             public void onSurfaceTextureAvailable(@NonNull SurfaceTexture surface, int width, int height) {
@@ -1083,6 +1149,8 @@ public class MainActivity extends AppCompatActivity {
 
     private void updateUIControls() {
         runOnUiThread(() -> {
+            boolean internalShown = mCameraMode == CameraMode.INTERNAL && mIsCameraConnected;
+
             if (mIsCameraConnected) {
                 mBinding.viewMainPreview.setVisibility(View.VISIBLE);
                 mBinding.tvConnectUSBCameraTip.setVisibility(View.GONE);
@@ -1107,8 +1175,264 @@ public class MainActivity extends AppCompatActivity {
 
                 mBinding.tvVideoRecordTime.setVisibility(View.GONE);
             }
+
+mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.GONE);
+            mBinding.internalCameraQuickButtons.setVisibility(internalShown ? View.VISIBLE : View.GONE);
+            if (internalShown) {
+                updateInternalCameraControlPanel();
+            }
+
             invalidateOptionsMenu();
         });
+    }
+
+    private void setupInternalCameraControlPanel() {
+        mBinding.seekbarInternalZoom.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (mInternalCameraHelper == null) return;
+                float maxZoom = Math.max(1.0f, mInternalCameraHelper.getMaxDigitalZoom());
+                float zoom = 1.0f + (maxZoom - 1.0f) * progress / 100f;
+                mInternalCameraHelper.setCurrentZoom(zoom);
+                mBinding.tvInternalZoomValue.setText(getString(R.string.internal_camera_zoom_label, zoom));
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+
+        mBinding.seekbarInternalExposure.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (mInternalCameraHelper == null) return;
+                Range<Integer> range = mInternalCameraHelper.getAeCompensationRange();
+                if (range == null) return;
+                int value = range.getLower() + Math.round((range.getUpper() - range.getLower()) * (progress / 100f));
+                mInternalCameraHelper.setExposureCompensation(value);
+                mBinding.tvInternalExposureValue.setText(getString(R.string.internal_camera_exposure_label, value));
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+
+        mBinding.seekbarInternalKelvin.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (mInternalCameraHelper == null) return;
+                int kelvin = 2000 + Math.round(8000 * (progress / 100f));
+                mInternalCameraHelper.setAwbTemperatureKelvin(kelvin);
+                mBinding.tvInternalKelvinValue.setText("Kelvin: " + kelvin + "K");
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+
+        mBinding.seekbarInternalFocus.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (mInternalCameraHelper == null) return;
+                float maxFocus = mInternalCameraHelper.getMinFocusDistance();
+                float focus = maxFocus * progress / 100f;
+                mInternalCameraHelper.setFocusDistance(focus);
+                String focusText = (progress == 0) ? "infinity" : String.format(Locale.US, "%.2f", focus);
+                mBinding.tvInternalFocusValue.setText(getString(R.string.internal_camera_focus_label, focusText));
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+
+        mBinding.seekbarInternalIso.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (mInternalCameraHelper == null) return;
+                Range<Integer> range = mInternalCameraHelper.getSensitivityRange();
+                if (range == null) return;
+                int iso = range.getLower() + Math.round((range.getUpper() - range.getLower()) * (progress / 100f));
+                mInternalCameraHelper.setSensitivity(iso);
+                mBinding.tvInternalIsoValue.setText(getString(R.string.internal_camera_iso_label, iso));
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+
+        mBinding.seekbarInternalExposureTime.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                if (mInternalCameraHelper == null) return;
+                int idx = Math.round((PRO_SHUTTER_VALUES_NS.length - 1) * progress / 100f);
+                idx = Math.max(0, Math.min(PRO_SHUTTER_VALUES_NS.length - 1, idx));
+                long exposure = PRO_SHUTTER_VALUES_NS[idx];
+                mInternalCameraHelper.setExposureTime(exposure);
+                mBinding.tvInternalExposureTimeValue.setText(getString(R.string.internal_camera_exposure_time_label, formatExposureTime(exposure)));
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+
+        mBinding.btnInternalAeToggle.setOnClickListener(v -> {
+            if (mInternalCameraHelper == null) return;
+            boolean nextAuto = !mInternalCameraHelper.isAeAuto();
+            mInternalCameraHelper.setAeAuto(nextAuto);
+            mBinding.btnInternalAeToggle.setText(nextAuto ? getString(R.string.internal_camera_ae_auto) : getString(R.string.internal_camera_ae_off));
+            mBinding.btnQuickAe.setText(nextAuto ? "AE Auto" : "AE Manual");
+            mBinding.tvInternalExposureMode.setText(nextAuto ? getString(R.string.internal_camera_exposure_mode_auto) : getString(R.string.internal_camera_exposure_mode_manual));
+        });
+
+        mBinding.btnQuickAe.setOnClickListener(v -> {
+            if (mInternalCameraHelper == null) return;
+            boolean nextAuto = !mInternalCameraHelper.isAeAuto();
+            mInternalCameraHelper.setAeAuto(nextAuto);
+            mBinding.btnInternalAeToggle.setText(nextAuto ? getString(R.string.internal_camera_ae_auto) : getString(R.string.internal_camera_ae_off));
+            mBinding.btnQuickAe.setText(nextAuto ? "AE Auto" : "AE Manual");
+            mBinding.tvInternalExposureMode.setText(nextAuto ? getString(R.string.internal_camera_exposure_mode_auto) : getString(R.string.internal_camera_exposure_mode_manual));
+        });
+
+        mBinding.btnInternalAwbToggle.setOnClickListener(v -> {
+            if (mInternalCameraHelper == null) return;
+            boolean awbAuto = !mInternalCameraHelper.isAwbAuto();
+            mInternalCameraHelper.setAwbAuto(awbAuto);
+            mBinding.btnInternalAwbToggle.setText(awbAuto ? getString(R.string.internal_camera_awb_auto) : getString(R.string.internal_camera_awb_off));
+            mBinding.btnQuickAwb.setText(awbAuto ? "AWB Auto" : "AWB Manual");
+            mBinding.tvInternalKelvinValue.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
+            mBinding.seekbarInternalKelvin.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
+        });
+
+        mBinding.btnQuickAwb.setOnClickListener(v -> {
+            if (mInternalCameraHelper == null) return;
+            boolean awbAuto = !mInternalCameraHelper.isAwbAuto();
+            mInternalCameraHelper.setAwbAuto(awbAuto);
+            mBinding.btnInternalAwbToggle.setText(awbAuto ? getString(R.string.internal_camera_awb_auto) : getString(R.string.internal_camera_awb_off));
+            mBinding.btnQuickAwb.setText(awbAuto ? "AWB Auto" : "AWB Manual");
+            mBinding.tvInternalKelvinValue.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
+            mBinding.seekbarInternalKelvin.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
+        });
+
+        mBinding.btnInternalAfToggle.setOnClickListener(v -> {
+            if (mInternalCameraHelper == null) return;
+            if (mInternalCameraHelper.isTapToFocusMode()) {
+                mInternalCameraHelper.setTapToFocusMode(false);
+                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+                mBinding.btnInternalAfToggle.setText("AF: Off");
+            } else if (mInternalCameraHelper.getAfMode() == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
+                mInternalCameraHelper.setTapToFocusMode(true);
+                mBinding.btnInternalAfToggle.setText("AF: Tap");
+            } else {
+                mInternalCameraHelper.setTapToFocusMode(false);
+                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+                mBinding.btnInternalAfToggle.setText("AF: Auto");
+            }
+            mBinding.btnQuickAf.setText(mInternalCameraHelper.isTapToFocusMode() ? "AF Tap" :
+                    (mInternalCameraHelper.getAfMode() == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO ? "AF Auto" : "AF Off"));
+        });
+
+        mBinding.btnQuickAf.setOnClickListener(v -> {
+            if (mInternalCameraHelper == null) return;
+            if (mInternalCameraHelper.isTapToFocusMode()) {
+                mInternalCameraHelper.setTapToFocusMode(false);
+                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+                mBinding.btnQuickAf.setText("AF Off");
+                mBinding.btnInternalAfToggle.setText("AF: Off");
+            } else if (mInternalCameraHelper.getAfMode() == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
+                mInternalCameraHelper.setTapToFocusMode(true);
+                mBinding.btnQuickAf.setText("AF Tap");
+                mBinding.btnInternalAfToggle.setText("AF: Tap");
+            } else {
+                mInternalCameraHelper.setTapToFocusMode(false);
+                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+                mBinding.btnQuickAf.setText("AF Auto");
+                mBinding.btnInternalAfToggle.setText("AF: Auto");
+            }
+        });
+    }
+
+    private void updateInternalCameraControlPanel() {
+        if (mInternalCameraHelper == null) return;
+
+        float maxZoom = Math.max(1.0f, mInternalCameraHelper.getMaxDigitalZoom());
+        mBinding.seekbarInternalZoom.setProgress((int) ((mInternalCameraHelper.getCurrentZoom() - 1.0f) / (maxZoom - 1.0f) * 100));
+        mBinding.tvInternalZoomValue.setText(getString(R.string.internal_camera_zoom_label, mInternalCameraHelper.getCurrentZoom()));
+
+        Range<Integer> aeRange = mInternalCameraHelper.getAeCompensationRange();
+        if (aeRange != null && aeRange.getUpper() > aeRange.getLower()) {
+            int exposureValue = mInternalCameraHelper.getCurrentExposureCompensation();
+            int progress = (int) ((exposureValue - aeRange.getLower()) / (float) (aeRange.getUpper() - aeRange.getLower()) * 100f);
+            mBinding.seekbarInternalExposure.setProgress(progress);
+            mBinding.tvInternalExposureValue.setText(getString(R.string.internal_camera_exposure_label, exposureValue));
+            mBinding.seekbarInternalExposure.setEnabled(true);
+        } else {
+            mBinding.seekbarInternalExposure.setProgress(50);
+            mBinding.tvInternalExposureValue.setText(getString(R.string.internal_camera_exposure_label, 0));
+            mBinding.seekbarInternalExposure.setEnabled(false);
+        }
+
+        float minFocus = mInternalCameraHelper.getMinFocusDistance();
+        mBinding.seekbarInternalFocus.setProgress((int) ((mInternalCameraHelper.getCurrentFocusDistance() / Math.max(minFocus, 1f)) * 100));
+        String focusText = (mInternalCameraHelper.getCurrentFocusDistance() <= 0f || minFocus <= 0f) ? "infinity" : String.format("%.2f", mInternalCameraHelper.getCurrentFocusDistance());
+        mBinding.tvInternalFocusValue.setText(getString(R.string.internal_camera_focus_label, focusText));
+
+        Range<Integer> isoRange = mInternalCameraHelper.getSensitivityRange();
+        if (isoRange != null && isoRange.getUpper() > isoRange.getLower()) {
+            int iso = mInternalCameraHelper.getCurrentSensitivity();
+            int progress = (int) ((iso - isoRange.getLower()) / (float) (isoRange.getUpper() - isoRange.getLower()) * 100f);
+            mBinding.seekbarInternalIso.setProgress(progress);
+            mBinding.tvInternalIsoValue.setText(getString(R.string.internal_camera_iso_label, iso));
+        }
+
+        long exp = mInternalCameraHelper.getCurrentExposureTime();
+        int idx = 0;
+        for (int i = 0; i < PRO_SHUTTER_VALUES_NS.length; i++) {
+            if (exp >= PRO_SHUTTER_VALUES_NS[i]) idx = i;
+        }
+        mBinding.seekbarInternalExposureTime.setProgress((int) (idx * 100f / (PRO_SHUTTER_VALUES_NS.length - 1)));
+        mBinding.tvInternalExposureTimeValue.setText(getString(R.string.internal_camera_exposure_time_label, formatExposureTime(exp)));
+
+        boolean aeAuto = mInternalCameraHelper.isAeAuto();
+        mBinding.btnInternalAeToggle.setText(aeAuto ? getString(R.string.internal_camera_ae_auto) : getString(R.string.internal_camera_ae_off));
+        mBinding.btnQuickAe.setText(aeAuto ? "AE Auto" : "AE Manual");
+        mBinding.tvInternalExposureMode.setText(aeAuto ? getString(R.string.internal_camera_exposure_mode_auto) : getString(R.string.internal_camera_exposure_mode_manual));
+
+        boolean awbAuto = mInternalCameraHelper.isAwbAuto();
+        mBinding.btnInternalAwbToggle.setText(awbAuto ? getString(R.string.internal_camera_awb_auto) : getString(R.string.internal_camera_awb_off));
+        mBinding.btnQuickAwb.setText(awbAuto ? "AWB Auto" : "AWB Manual");
+        mBinding.tvInternalKelvinValue.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
+        mBinding.seekbarInternalKelvin.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
+        if (!awbAuto) {
+            int kelvin = mInternalCameraHelper.getAwbTemperatureKelvin();
+            mBinding.tvInternalKelvinValue.setText("Kelvin: " + kelvin + "K");
+            mBinding.seekbarInternalKelvin.setProgress((kelvin - 2000) * 100 / 8000);
+        }
+
+        if (mInternalCameraHelper.isTapToFocusMode()) {
+            mBinding.btnInternalAfToggle.setText("AF: Tap");
+            mBinding.btnQuickAf.setText("AF Tap");
+        } else if (mInternalCameraHelper.getAfMode() == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
+            mBinding.btnInternalAfToggle.setText("AF: Auto");
+            mBinding.btnQuickAf.setText("AF Auto");
+        } else {
+            mBinding.btnInternalAfToggle.setText("AF: Off");
+            mBinding.btnQuickAf.setText("AF Off");
+        }
+    }
+
+    private String formatExposureTime(long exposureTime) {
+        if (exposureTime <= 0) {
+            return "1/1000000";
+        }
+        for (long val : PRO_SHUTTER_VALUES_NS) {
+            if (exposureTime == val) {
+                double seconds = val / 1_000_000_000.0;
+                if (seconds >= 1.0) {
+                    return String.format(Locale.US, "%.1fs", seconds);
+                }
+                int den = (int) Math.round(1.0 / seconds);
+                return "1/" + den;
+            }
+        }
+        double seconds = exposureTime / 1_000_000_000.0;
+        if (seconds >= 1.0) {
+            return String.format(Locale.US, "%.1fs", seconds);
+        }
+        int den = (int) Math.round(1.0 / seconds);
+        return "1/" + den;
     }
 
     private Size getSavedPreviewSize() {
