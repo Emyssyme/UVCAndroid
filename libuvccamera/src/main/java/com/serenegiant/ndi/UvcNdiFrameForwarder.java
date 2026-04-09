@@ -32,7 +32,16 @@ public class UvcNdiFrameForwarder implements IFrameCallback {
     private int width;
     private int height;
     private long frameCount = 0;
+    private long sentFrameCount = 0;
     private boolean loggedStreamInfoOnce = false;
+
+    // target frame rate control (0 = passthrough)
+    private int targetFps = 0;
+    private long minFrameIntervalNs = 0;
+    private long lastNdiSendTimeNs = 0;
+
+    // Reusable frame buffer to reduce per-frame allocations (especially for 4K)
+    private byte[] reusableFrameData = null;
 
     /**
      * Create a frame forwarder from UVC to NDI
@@ -89,12 +98,29 @@ public class UvcNdiFrameForwarder implements IFrameCallback {
 
             frameCount++;
 
-            // Convert frame to byte array if needed
+            if (targetFps > 0) {
+                final long nowNs = System.nanoTime();
+                if (lastNdiSendTimeNs > 0 && (nowNs - lastNdiSendTimeNs) < minFrameIntervalNs) {
+                    // drop frame to reduce output frame rate
+                    if ((frameCount % 100) == 0) {
+                        Log.d(TAG, "Skipping frame to meet targetFps=" + targetFps
+                                + " (frameCount=" + frameCount + ")");
+                    }
+                    return;
+                }
+                lastNdiSendTimeNs = nowNs;
+            }
+
+            // Convert frame to byte array if needed (reuse existing buffer to avoid GC churn)
             byte[] frameData = null;
             if (frame != null && frame.remaining() > 0) {
-                frameData = new byte[frame.remaining()];
+                int size = frame.remaining();
+                if (reusableFrameData == null || reusableFrameData.length < size) {
+                    reusableFrameData = new byte[size];
+                }
+                frameData = reusableFrameData;
                 int pos = frame.position();
-                frame.get(frameData);
+                frame.get(frameData, 0, size);
                 frame.position(pos); // Restore position for potential reuse
             }
 
@@ -163,10 +189,12 @@ public class UvcNdiFrameForwarder implements IFrameCallback {
                             + " expectedBytes=" + expectedBytes
                             + " actualBytes=" + actualBytes);
                 }
+
+                sentFrameCount++;
             }
 
-            if (frameCount % 100 == 0) {
-                Log.d(TAG, "Forwarded " + frameCount + " frames to NDI");
+            if ((sentFrameCount % 100) == 0) {
+                Log.d(TAG, "Forwarded " + sentFrameCount + " frames to NDI (targetFps=" + targetFps + ")");
             }
 
         } catch (Exception e) {
@@ -190,6 +218,35 @@ public class UvcNdiFrameForwarder implements IFrameCallback {
      */
     public void resetFrameCount() {
         frameCount = 0;
+        sentFrameCount = 0;
+    }
+
+    /**
+     * Set target NDI output frame rate.
+     * Use 25 or 24 for reduced load.
+     * Set 0 to disable (passthrough all frames).
+     */
+    public void setTargetFps(final int fps) {
+        targetFps = Math.max(0, fps);
+        if (targetFps > 0) {
+            minFrameIntervalNs = 1_000_000_000L / targetFps;
+        } else {
+            minFrameIntervalNs = 0;
+        }
+    }
+
+    /**
+     * Get target NDI output frame rate.
+     */
+    public int getTargetFps() {
+        return targetFps;
+    }
+
+    /**
+     * Get count of forwarded (sent) frames.
+     */
+    public long getSentFrameCount() {
+        return sentFrameCount;
     }
 
     // helper for RGBA conversions

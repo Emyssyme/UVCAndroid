@@ -502,12 +502,20 @@ public class InternalCameraHelper {
                     new CameraCaptureSession.StateCallback() {
                         @Override
                         public void onConfigured(@NonNull CameraCaptureSession session) {
-                            if (mCameraDevice == null) return;
+                            if (mCameraDevice == null || mClosed) {
+                                Log.i(TAG, "onConfigured called after close - aborting");
+                                try {
+                                    session.close();
+                                } catch (Exception ex) {
+                                    Log.w(TAG, "Error closing session after late onConfigured", ex);
+                                }
+                                return;
+                            }
                             mCaptureSession = session;
                             try {
                                 session.setRepeatingRequest(
                                         previewBuilder.build(), null, mBackgroundHandler);
-                            } catch (CameraAccessException e) {
+                            } catch (CameraAccessException | IllegalStateException e) {
                                 Log.e(TAG, "setRepeatingRequest failed", e);
                             }
                         }

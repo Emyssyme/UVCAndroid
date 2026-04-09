@@ -79,6 +79,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Timer;
 import java.util.TimerTask;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -91,6 +93,11 @@ public class MainActivity extends AppCompatActivity {
     // in this app, but we track it so that we can recreate the forwarder when
     // renaming the sender).
     private String mNdiCameraFormat = "nv12";
+
+    // target frame rate for NDI forwarding (0 = passthrough all frames)
+    private int mNdiTargetFps = 0;
+    private long mNdiMinFrameIntervalNs = 0;
+    private long mLastEnqueueFrameTimeNs = 0;
 
     // cached stream name; defaults to saved preference or device name later
     private String mNdiSourceName;
@@ -144,10 +151,9 @@ public class MainActivity extends AppCompatActivity {
     private UvcNdiFrameForwarder mFrameForwarder;
     private long mNdiStartTime = 0;
 
-    // Single-slot latest-frame buffer + worker thread for NDI frame forwarding.
-    // Keeps latency tight under backpressure and reduces GC activity for 4K streams.
-    private final java.util.concurrent.atomic.AtomicReference<java.nio.ByteBuffer> mNdiLatestFrame
-            = new java.util.concurrent.atomic.AtomicReference<>();
+    // NDI frame queue + worker thread for NDI frame forwarding.
+    // Uses a larger queue in “high-latency, stable” mode to reduce drops.
+    private final ArrayBlockingQueue<java.nio.ByteBuffer> mNdiFrameQueue = new ArrayBlockingQueue<>(16);
     private final java.util.concurrent.atomic.AtomicReference<java.nio.ByteBuffer> mNdiReusableBuffer
             = new java.util.concurrent.atomic.AtomicReference<>();
 
@@ -555,6 +561,16 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void setNdiTargetFps(final int fps) {
+        // Enforce minimum 25 fps, even for 4K, to keep smooth output at a fixed bound.
+        mNdiTargetFps = Math.max(25, fps);
+        mNdiMinFrameIntervalNs = 1_000_000_000L / mNdiTargetFps;
+        if (mFrameForwarder != null) {
+            mFrameForwarder.setTargetFps(mNdiTargetFps);
+        }
+        Log.i(TAG, "NDI target FPS set to " + mNdiTargetFps);
+    }
+
     // PROMOTE incoming UVC frames to NDI and/or RTP
     // note: default format will be NV12 (low-latency) since mNdiHighQuality=false
     // frame callback for NDI only
@@ -794,6 +810,8 @@ public class MainActivity extends AppCompatActivity {
                     mNdiCameraFormat = "nv12";
                     mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
                     mFrameForwarder.setFrameDimensions(size.width, size.height);
+                    // Always target 25 fps for stable output (latency may grow, but fluidity is guaranteed).
+                    setNdiTargetFps(25);
                     // now apply quality mode (will register callback)
                     setNdiFormat(mNdiHighQuality);
                     startNdiForwardingThread();
@@ -2018,6 +2036,8 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
             mNdiCameraFormat = "nv12";
             mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
             mFrameForwarder.setFrameDimensions(previewSize.getWidth(), previewSize.getHeight());
+            setNdiTargetFps(25); // enforce 25 fps minimum for smooth 4K delivery
+            setNdiFormat(mNdiHighQuality); // ensure format mode is applied
             startNdiForwardingThread();
             Log.i(TAG, "NDI ready for internal camera: " + sourceName);
         } catch (Exception e) {
@@ -2055,19 +2075,16 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
         mNdiWorkerThread = new Thread(() -> {
             while (mNdiWorkerRunning && !Thread.currentThread().isInterrupted()) {
                 try {
-                    java.nio.ByteBuffer frame = mNdiLatestFrame.getAndSet(null);
+                    java.nio.ByteBuffer frame = mNdiFrameQueue.poll(40, TimeUnit.MILLISECONDS);
                     if (frame == null) {
-                        try {
-                            Thread.sleep(10);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                        }
                         continue;
                     }
                     if (mFrameForwarder != null) {
                         mFrameForwarder.onFrame(frame);
                     }
                     mNdiReusableBuffer.set(frame);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 } catch (Exception e) {
                     Log.w(TAG, "Error in NDI forwarding thread", e);
                 }
@@ -2088,7 +2105,7 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
             }
             mNdiWorkerThread = null;
         }
-        mNdiLatestFrame.set(null);
+        mNdiFrameQueue.clear();
         mNdiReusableBuffer.set(null);
     }
 
@@ -2097,20 +2114,34 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
             return;
         }
 
+        long nowNs = System.nanoTime();
+        if (mNdiTargetFps > 0 && mLastEnqueueFrameTimeNs > 0
+                && (nowNs - mLastEnqueueFrameTimeNs) < mNdiMinFrameIntervalNs) {
+            // Throttle incoming frames at the source to reduce queue thrashing
+            return;
+        }
+        mLastEnqueueFrameTimeNs = nowNs;
+
         java.nio.ByteBuffer frameCopy = copyFrameBuffer(frame);
         if (frameCopy == null) {
             return;
         }
 
-        java.nio.ByteBuffer old = mNdiLatestFrame.getAndSet(frameCopy);
-        if (old != null) {
-            long now = System.currentTimeMillis();
-            if (now - mLastQueueFullLog > QUEUE_FULL_LOG_INTERVAL_MS) {
-                Log.w(TAG, "NDI frame queue full: dropped oldest frame");
-                mLastQueueFullLog = now;
+        try {
+            if (!mNdiFrameQueue.offer(frameCopy, 160, TimeUnit.MILLISECONDS)) {
+                // queue is still full after wait; drop newest frame (rare fallback)
+                long now = System.currentTimeMillis();
+                if (now - mLastQueueFullLog > QUEUE_FULL_LOG_INTERVAL_MS) {
+                    Log.w(TAG, "NDI frame queue full after wait: dropped newest frame");
+                    mLastQueueFullLog = now;
+                }
+                mNdiReusableBuffer.set(frameCopy);
+                return;
             }
-            // Reclaim the dropped buffer.
-            mNdiReusableBuffer.set(old);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            mNdiReusableBuffer.set(frameCopy);
+            return;
         }
     }
 
