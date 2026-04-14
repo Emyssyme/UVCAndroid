@@ -1088,9 +1088,11 @@ public class InternalCameraHelper {
         ByteBuffer uBuf  = planes[1].getBuffer();
         ByteBuffer vBuf  = planes[2].getBuffer();
 
-        int yRowStride  = planes[0].getRowStride();
-        int uvRowStride = planes[1].getRowStride();
-        int uvPixStride = planes[1].getPixelStride();
+        int yRowStride   = planes[0].getRowStride();
+        int uRowStride   = planes[1].getRowStride();
+        int vRowStride   = planes[2].getRowStride();
+        int uPixelStride = planes[1].getPixelStride();
+        int vPixelStride = planes[2].getPixelStride();
 
         ByteBuffer nv12 = ByteBuffer.allocateDirect(width * height + (width * height / 2));
 
@@ -1128,25 +1130,26 @@ public class InternalCameraHelper {
         }
 
         // ── Interleaved U/V (NV12 = UVUV...) ────────────────────────────────
-        // Pixel stride == 2 means the U plane is already interleaved with V
-        // (common on Android: it is actually the UV plane directly).
-        if (uvPixStride == 2 && uvRowStride == width) {
-            // Both planes are packed and already interleaved — copy UV directly.
+        // Pixel stride == 2 and a full-width row stride means the U plane is
+        // already the packed UV plane.
+        if (uPixelStride == 2 && uRowStride == width) {
             ByteBuffer src = uBuf.duplicate();
             int uvBytes = Math.min(width * (height / 2), src.capacity());
             src.position(0).limit(uvBytes);
             nv12.put(src);
             for (int i = uvBytes; i < width * (height / 2); i++) nv12.put((byte) 128);
         } else {
-            // General case: build UV row by row
+            // General case: build UV row by row using separate U/V plane strides.
             ByteBuffer uSrc = uBuf.duplicate();
             ByteBuffer vSrc = vBuf.duplicate();
             for (int row = 0; row < height / 2; row++) {
-                int rowStart = row * uvRowStride;
+                int uRowStart = row * uRowStride;
+                int vRowStart = row * vRowStride;
                 for (int col = 0; col < width / 2; col++) {
-                    int offset = rowStart + col * uvPixStride;
-                    nv12.put(offset < uSrc.capacity() ? uSrc.get(offset) : (byte) 128);
-                    nv12.put(offset < vSrc.capacity() ? vSrc.get(offset) : (byte) 128);
+                    int uOffset = uRowStart + col * uPixelStride;
+                    int vOffset = vRowStart + col * vPixelStride;
+                    nv12.put(uOffset < uSrc.capacity() ? uSrc.get(uOffset) : (byte) 128);
+                    nv12.put(vOffset < vSrc.capacity() ? vSrc.get(vOffset) : (byte) 128);
                 }
             }
         }

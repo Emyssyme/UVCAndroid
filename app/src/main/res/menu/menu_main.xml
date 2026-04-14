@@ -70,6 +70,18 @@
         android:visible="false"
         app:showAsAction="never" />
 
+    <item
+        android:id="@+id/action_stream_protocol"
+        android:title="@string/action_stream_protocol_ndi"
+        android:visible="false"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_set_stream_destination"
+        android:title="@string/action_set_stream_destination"
+        android:visible="false"
+        app:showAsAction="never" />
+
     <!-- allow user to change the NDI source name -->
     <item
         android:id="@+id/action_set_ndi_name"

@@ -69,11 +69,21 @@ import android.widget.Toast;
 import android.graphics.Color;
 import android.os.Handler;
 
+import java.io.BufferedOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.io.File;
+import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketException;
+import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.text.DecimalFormat;
 import java.util.Arrays;
+import java.util.Enumeration;
 import java.util.Locale;
 import java.util.ArrayList;
 import java.util.List;
@@ -156,6 +166,8 @@ public class MainActivity extends AppCompatActivity {
     private final ArrayBlockingQueue<java.nio.ByteBuffer> mNdiFrameQueue = new ArrayBlockingQueue<>(16);
     private final java.util.concurrent.atomic.AtomicReference<java.nio.ByteBuffer> mNdiReusableBuffer
             = new java.util.concurrent.atomic.AtomicReference<>();
+    private final java.util.concurrent.atomic.AtomicReference<java.nio.ByteBuffer> mTcpReusableBuffer
+            = new java.util.concurrent.atomic.AtomicReference<>();
 
     private volatile boolean mNdiWorkerRunning = false;
     private Thread mNdiWorkerThread;
@@ -173,6 +185,85 @@ public class MainActivity extends AppCompatActivity {
     // start in efficient (NV12) mode instead of RGBA high‑quality; user can toggle later
     private boolean mNdiHighQuality = false;   // toggle state for NDI mode
     // RTP streaming removed per request; keep NDI only
+
+    private enum StreamProtocol { NDI, TCP_UDP }
+    private StreamProtocol mStreamProtocol = StreamProtocol.NDI;
+    private static final String PREF_STREAM_PROTOCOL = "pref_stream_protocol";
+    private static final String PREF_STREAM_HOST = "pref_stream_host";
+    private static final String PREF_STREAM_PORT = "pref_stream_port";
+    private static final String PREF_VIDEO_TARGET_FPS = "pref_video_target_fps";
+    private static final String PREF_VIDEO_QUALITY = "pref_video_quality";
+    private static final int DEFAULT_STREAM_PORT = 5600;
+    private static final int DISCOVERY_PORT = 8866;
+    private static final int TCP_TALLY_PORT = 8867;
+    private static final int DEFAULT_VIDEO_TARGET_FPS = 24;
+    private static final int DEFAULT_VIDEO_QUALITY = 60;
+
+    // H.265-over-TCP frame header constants (compatible with DroidCam OBS protocol)
+    private static final long H264_NO_PTS = 0xFFFFFFFFFFFFFFFFL; // config/SPS+PPS marker
+
+    private static class CustomUdpFrame {
+        final java.nio.ByteBuffer frame;
+        final int width;
+        final int height;
+        final long captureTimeNs;
+
+        CustomUdpFrame(java.nio.ByteBuffer frame, int width, int height, long captureTimeNs) {
+            this.frame = frame;
+            this.width = width;
+            this.height = height;
+            this.captureTimeNs = captureTimeNs;
+        }
+    }
+
+    private String mStreamHost;
+    private int mStreamPort = DEFAULT_STREAM_PORT;
+    private String mDeviceIp;
+    private int mVideoTargetFps = DEFAULT_VIDEO_TARGET_FPS;
+    private int mVideoQuality = DEFAULT_VIDEO_QUALITY;
+
+    // H.265 TCP server
+    private ServerSocket mH265ServerSocket;
+    private volatile OutputStream mH264OutputStream;
+    private MediaCodec mH264Encoder;
+    private volatile int mH264EncoderWidth = 0;
+    private volatile int mH264EncoderHeight = 0;
+    private volatile byte[] mH264SpsPps;
+    private final byte[] mH264FrameHeaderBuf = new byte[12];
+    private byte[] mH264EncodeBuffer;          // reused NV12 input — allocated once per resolution
+    private byte[] mH264OutputBuffer = new byte[2 * 1024 * 1024]; // reused encoded-packet buffer
+    private Thread mTcpUdpWorkerThread;
+    private volatile boolean mTcpUdpWorkerRunning = false;
+    private final java.util.concurrent.ArrayBlockingQueue<CustomUdpFrame> mTcpUdpFrameQueue = new java.util.concurrent.ArrayBlockingQueue<>(3);
+    private int mTcpUdpTargetFps = 30;
+    private long mTcpUdpMinFrameIntervalNs = 0;
+    private long mLastTcpUdpEnqueueTimeNs = 0;
+    private long mNextTcpUdpEnqueueTimeNs = 0;
+    private long mLastTcpFlushTimeNs = 0;
+    private static final long TCP_FLUSH_INTERVAL_NS = 8_000_000L;
+    private static final long TCP_DISCOVERY_INTERVAL_MS = 1000L;
+    private final java.util.concurrent.atomic.AtomicLong mTcpFramesCaptured = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mTcpFramesDropped = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mTcpFramesEncoded = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mTcpPacketsSent = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mTcpEncodeTimeNsSum = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mTcpEncodeSamples = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mTcpQueueDepthMax = new java.util.concurrent.atomic.AtomicLong();
+    private volatile long mTcpTelemetryLastUiNs = 0;
+    private volatile long mTcpTelemetryLastLogNs = 0;
+    private volatile long mTcpTelemetryPrevCaptured = 0;
+    private volatile long mTcpTelemetryPrevDropped = 0;
+    private volatile long mTcpTelemetryPrevEncoded = 0;
+    private volatile long mTcpTelemetryPrevSent = 0;
+    // TCP tally state is reported by OBS plugin over UDP backchannel.
+    private volatile boolean mTcpObsProgram = false;
+    private volatile boolean mTcpObsPreview = false;
+    private volatile long mTcpLastTallyUpdateNs = 0;
+    private static final long TCP_TALLY_STALE_TIMEOUT_MS = 1500;
+    private Thread mTcpDiscoveryThread;
+    private volatile boolean mTcpDiscoveryRunning = false;
+    private Thread mTcpTallyListenerThread;
+    private volatile boolean mTcpTallyListenerRunning = false;
 
     private CameraControlsDialogFragment mControlsDialog;
     private DeviceListDialogFragment mDeviceListDialog;
@@ -203,6 +294,7 @@ public class MainActivity extends AppCompatActivity {
     private final Runnable mTallyPoller = new Runnable() {
         @Override
         public void run() {
+            // Tally for NDI
             if (mNdiSender != null) {
                 NdiSender.Tally t = mNdiSender.getTally();
                 if (t != null && mTallyIndicator != null) {
@@ -211,7 +303,24 @@ public class MainActivity extends AppCompatActivity {
                     else                mTallyIndicator.setBackgroundColor(Color.GRAY);
                 }
             }
-            if (mNdiSender != null) {
+            // Tally for TCP/UDP: reflect OBS state sent by plugin (program/preview/none).
+            else if (mStreamProtocol == StreamProtocol.TCP_UDP && mTcpUdpWorkerRunning) {
+                long nowNs = System.nanoTime();
+                long staleMs = (nowNs - mTcpLastTallyUpdateNs) / 1_000_000;
+                int color = Color.GRAY;
+                if (staleMs < TCP_TALLY_STALE_TIMEOUT_MS) {
+                    if (mTcpObsProgram) {
+                        color = Color.RED;
+                    } else if (mTcpObsPreview) {
+                        color = Color.GREEN;
+                    }
+                }
+                if (mTallyIndicator != null) {
+                    mTallyIndicator.setBackgroundColor(color);
+                }
+            }
+            // Schedule next poll if any transport is active
+            if (mNdiSender != null || (mStreamProtocol == StreamProtocol.TCP_UDP && mTcpUdpWorkerRunning)) {
                 mHandler.postDelayed(this, 50);
             }
         }
@@ -241,6 +350,13 @@ public class MainActivity extends AppCompatActivity {
 
         // load previously saved NDI name (may be empty)
         mNdiSourceName = getSavedNdiName();
+        mStreamProtocol = getSavedStreamProtocol();
+        mStreamHost = getSavedStreamHost();
+        mStreamPort = getSavedStreamPort();
+        mVideoTargetFps = getSavedVideoTargetFps();
+        mVideoQuality = getSavedVideoQuality();
+        mDeviceIp = getLocalIpAddress();
+        updateStreamStatus();
 
         // Initialize NDI
         try {
@@ -375,6 +491,69 @@ public class MainActivity extends AppCompatActivity {
                     mPreviewFillEnabled ? getString(R.string.action_preview_mode_fill)
                             : getString(R.string.action_preview_mode_fit),
                     Toast.LENGTH_SHORT).show();
+        } else if (id == R.id.action_stream_protocol) {
+            final StreamProtocol nextProtocol = (mStreamProtocol == StreamProtocol.NDI)
+                    ? StreamProtocol.TCP_UDP
+                    : StreamProtocol.NDI;
+            if (nextProtocol == StreamProtocol.TCP_UDP && !hasCustomTransportDestination()) {
+                showSetStreamDestinationDialog();
+                return true;
+            }
+            setSavedStreamProtocol(nextProtocol);
+            invalidateOptionsMenu();
+            if (mIsCameraConnected) {
+                if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
+                    final Size size = mCameraHelper.getPreviewSize();
+                    if (size != null) {
+                        cleanupNdiAndStreaming();
+                        if (nextProtocol == StreamProtocol.NDI) {
+                            mNdiSourceName = getSavedNdiName();
+                            try {
+                                mNdiStartTime = SystemClock.elapsedRealtime();
+                                String sourceName = TextUtils.isEmpty(mNdiSourceName)
+                                        ? getDefaultNdiName(mUsbDevice)
+                                        : mNdiSourceName;
+                                if (TextUtils.isEmpty(mNdiSourceName)) {
+                                    setSavedNdiName(sourceName);
+                                }
+                                mNdiSender = new NdiSender(sourceName);
+                                mHandler.post(mTallyPoller);
+                                mNdiCameraFormat = "nv12";
+                                mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
+                                mFrameForwarder.setFrameDimensions(size.width, size.height);
+                                setNdiTargetFps(25);
+                                setNdiFormat(mNdiHighQuality);
+                                startNdiForwardingThread();
+                            } catch (Exception e) {
+                                Log.e(TAG, "❌ Failed to create NDI sender", e);
+                            }
+                        } else {
+                            setupTcpUdpForUsbCamera(mUsbDevice, size);
+                        }
+                    }
+                } else if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
+                    cleanupNdiAndStreaming();
+                    if (nextProtocol == StreamProtocol.NDI) {
+                        setupNdiForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                    } else {
+                        setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                    }
+                }
+                if (mCameraHelper != null && mMultiCallback != null) {
+                    try {
+                        mCameraHelper.setFrameCallback(mMultiCallback, UVCCamera.PIXEL_FORMAT_NV12);
+                    } catch (Exception e) {
+                        Log.e(TAG, "Failed to restore frame callback after protocol switch", e);
+                    }
+                }
+            }
+            Toast.makeText(this,
+                    nextProtocol == StreamProtocol.NDI
+                            ? getString(R.string.action_stream_protocol_ndi)
+                            : getString(R.string.action_stream_protocol_tcp_udp),
+                    Toast.LENGTH_SHORT).show();
+        } else if (id == R.id.action_set_stream_destination) {
+            showSetStreamDestinationDialog();
         } else if (id == R.id.action_ndimode) {
             // toggle NDI format
             setNdiFormat(!mNdiHighQuality);
@@ -412,7 +591,19 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_flip_horizontally).setVisible(true);
             menu.findItem(R.id.action_flip_vertically).setVisible(true);
             menu.findItem(R.id.action_preview_fill_toggle).setVisible(true);
-            menu.findItem(R.id.action_ndimode).setVisible(true);
+            menu.findItem(R.id.action_stream_protocol).setVisible(true);
+            menu.findItem(R.id.action_ndimode).setVisible(mStreamProtocol == StreamProtocol.NDI);
+        } else if (mIsCameraConnected && internalMode) {
+            menu.findItem(R.id.action_control).setVisible(true);
+            menu.findItem(R.id.action_safely_eject).setVisible(false);
+            menu.findItem(R.id.action_video_format).setVisible(false);
+            menu.findItem(R.id.action_rotate_90_CW).setVisible(false);
+            menu.findItem(R.id.action_rotate_90_CCW).setVisible(false);
+            menu.findItem(R.id.action_flip_horizontally).setVisible(false);
+            menu.findItem(R.id.action_flip_vertically).setVisible(false);
+            menu.findItem(R.id.action_preview_fill_toggle).setVisible(false);
+            menu.findItem(R.id.action_stream_protocol).setVisible(true);
+            menu.findItem(R.id.action_ndimode).setVisible(mStreamProtocol == StreamProtocol.NDI);
         } else {
             menu.findItem(R.id.action_safely_eject).setVisible(false);
             menu.findItem(R.id.action_video_format).setVisible(false);
@@ -421,11 +612,13 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_flip_horizontally).setVisible(false);
             menu.findItem(R.id.action_flip_vertically).setVisible(false);
             menu.findItem(R.id.action_preview_fill_toggle).setVisible(false);
+            menu.findItem(R.id.action_stream_protocol).setVisible(true);
             menu.findItem(R.id.action_ndimode).setVisible(false);
         }
 
         // internal and USB preview can use control UI toggle
         menu.findItem(R.id.action_control).setVisible(usbMode || internalMode);
+        menu.findItem(R.id.action_set_stream_destination).setVisible(isCustomTransportActive());
 
         // USB device icon — only in USB mode
         menu.findItem(R.id.action_device).setVisible(usbMode);
@@ -437,15 +630,27 @@ public class MainActivity extends AppCompatActivity {
                     ? R.string.action_preview_mode_fill
                     : R.string.action_preview_mode_fit);
         }
+        final MenuItem streamProtocolItem = menu.findItem(R.id.action_stream_protocol);
+        if (streamProtocolItem != null) {
+            streamProtocolItem.setTitle(mStreamProtocol == StreamProtocol.NDI
+                    ? R.string.action_stream_protocol_ndi
+                    : R.string.action_stream_protocol_tcp_udp);
+            streamProtocolItem.setVisible(true);
+        }
+        final MenuItem destinationItem = menu.findItem(R.id.action_set_stream_destination);
+        if (destinationItem != null) {
+            destinationItem.setVisible(true);
+        }
         final MenuItem ndiModeItem = menu.findItem(R.id.action_ndimode);
         if (ndiModeItem != null) {
             ndiModeItem.setTitle(mNdiHighQuality
                     ? R.string.action_ndimode_high
                     : R.string.action_ndimode_low);
+            ndiModeItem.setVisible(mIsCameraConnected && mStreamProtocol == StreamProtocol.NDI);
         }
         MenuItem nameItem = menu.findItem(R.id.action_set_ndi_name);
         if (nameItem != null) {
-            nameItem.setVisible(mIsCameraConnected);
+            nameItem.setVisible(mIsCameraConnected && mStreamProtocol == StreamProtocol.NDI);
         }
 
         // ── Internal camera items ────────────────────────────────────────────
@@ -571,13 +776,20 @@ public class MainActivity extends AppCompatActivity {
         Log.i(TAG, "NDI target FPS set to " + mNdiTargetFps);
     }
 
-    // PROMOTE incoming UVC frames to NDI and/or RTP
+    // PROMOTE incoming UVC frames to the selected transport.
     // note: default format will be NV12 (low-latency) since mNdiHighQuality=false
-    // frame callback for NDI only
     private class MultiFrameCallback implements com.serenegiant.usb.IFrameCallback {
         @Override
         public void onFrame(java.nio.ByteBuffer frame) {
-            enqueueNdiFrame(frame);
+            if (frame == null) {
+                Log.w(TAG, "MultiFrameCallback: null frame");
+                return;
+            }
+            if (mStreamProtocol == StreamProtocol.NDI) {
+                enqueueNdiFrame(frame);
+            } else {
+                enqueueTcpUdpFrame(frame, mPreviewWidth, mPreviewHeight);
+            }
         }
     }
 
@@ -787,38 +999,42 @@ public class MainActivity extends AppCompatActivity {
                 Log.w(TAG, "❌ Could not get camera preview size");
             }
             
-            // ✅ Step 2: Setup NDI sender and forwarder (format toggled via helper)
+            // ✅ Step 2: Setup the selected transport layer
             if (size != null) {
-                try {
-                    mNdiStartTime = SystemClock.elapsedRealtime();
-                    // choose stream name: preference first, otherwise derive it from
-                    // the USB device.  using getProductName()/getManufacturerName
-                    // usually yields the actual camera model rather than the generic
-                    // device path which can look like "/dev/bus/usb/...".
-                    String sourceName = mNdiSourceName;
-                    if (TextUtils.isEmpty(sourceName)) {
-                        sourceName = getDefaultNdiName(device);
-                        // remember this default so future streams reuse it
-                        setSavedNdiName(sourceName);
-                    }
-                    mNdiSender = new NdiSender(sourceName);
-                    Log.i(TAG, "✅ NDI sender created: " + sourceName);
-                    // start polling tally indicator
-                    mHandler.post(mTallyPoller);
+                if (mStreamProtocol == StreamProtocol.NDI) {
+                    try {
+                        mNdiStartTime = SystemClock.elapsedRealtime();
+                        // choose stream name: preference first, otherwise derive it from
+                        // the USB device.  using getProductName()/getManufacturerName
+                        // usually yields the actual camera model rather than the generic
+                        // device path which can look like "/dev/bus/usb/...".
+                        String sourceName = mNdiSourceName;
+                        if (TextUtils.isEmpty(sourceName)) {
+                            sourceName = getDefaultNdiName(device);
+                            // remember this default so future streams reuse it
+                            setSavedNdiName(sourceName);
+                        }
+                        mNdiSender = new NdiSender(sourceName);
+                        Log.i(TAG, "✅ NDI sender created: " + sourceName);
+                        // start polling tally indicator
+                        mHandler.post(mTallyPoller);
 
-                    // create forwarder with known camera format (assume NV12)
-                    mNdiCameraFormat = "nv12";
-                    mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
-                    mFrameForwarder.setFrameDimensions(size.width, size.height);
-                    // Always target 25 fps for stable output (latency may grow, but fluidity is guaranteed).
-                    setNdiTargetFps(25);
-                    // now apply quality mode (will register callback)
-                    setNdiFormat(mNdiHighQuality);
-                    startNdiForwardingThread();
-                } catch (Exception e) {
-                    Log.e(TAG, "❌ Failed to create NDI sender", e);
-                    mNdiSender = null;
-                    mFrameForwarder = null;
+                        // create forwarder with known camera format (assume NV12)
+                        mNdiCameraFormat = "nv12";
+                        mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
+                        mFrameForwarder.setFrameDimensions(size.width, size.height);
+                        // Always target 25 fps for stable output (latency may grow, but fluidity is guaranteed).
+                        setNdiTargetFps(25);
+                        // now apply quality mode (will register callback)
+                        setNdiFormat(mNdiHighQuality);
+                        startNdiForwardingThread();
+                    } catch (Exception e) {
+                        Log.e(TAG, "❌ Failed to create NDI sender", e);
+                        mNdiSender = null;
+                        mFrameForwarder = null;
+                    }
+                } else {
+                    setupTcpUdpForUsbCamera(device, size);
                 }
             }
             
@@ -1006,6 +1222,291 @@ public class MainActivity extends AppCompatActivity {
         return PreferenceManager
                 .getDefaultSharedPreferences(this)
                 .getString(PREF_NDI_NAME, "");
+    }
+
+    private StreamProtocol getSavedStreamProtocol() {
+        final String protocol = PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getString(PREF_STREAM_PROTOCOL, StreamProtocol.NDI.name());
+        try {
+            return StreamProtocol.valueOf(protocol);
+        } catch (IllegalArgumentException e) {
+            return StreamProtocol.NDI;
+        }
+    }
+
+    private void setSavedStreamProtocol(final StreamProtocol protocol) {
+        if (protocol == null) return;
+        PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .edit()
+                .putString(PREF_STREAM_PROTOCOL, protocol.name())
+                .apply();
+        mStreamProtocol = protocol;
+    }
+
+    private String getSavedStreamHost() {
+        return PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getString(PREF_STREAM_HOST, "");
+    }
+
+    private int getSavedStreamPort() {
+        return PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getInt(PREF_STREAM_PORT, DEFAULT_STREAM_PORT);
+    }
+
+    private int getSavedVideoTargetFps() {
+        int fps = PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getInt(PREF_VIDEO_TARGET_FPS, DEFAULT_VIDEO_TARGET_FPS);
+        return Math.max(24, Math.min(60, fps));
+    }
+
+    private int getSavedVideoQuality() {
+        return PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getInt(PREF_VIDEO_QUALITY, DEFAULT_VIDEO_QUALITY);
+    }
+
+    private void setSavedVideoTargetFps(int fps) {
+        fps = Math.max(24, Math.min(60, fps));
+        PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .edit()
+                .putInt(PREF_VIDEO_TARGET_FPS, fps)
+                .apply();
+        mVideoTargetFps = fps;
+    }
+
+    private void setSavedVideoQuality(int quality) {
+        PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .edit()
+                .putInt(PREF_VIDEO_QUALITY, quality)
+                .apply();
+        mVideoQuality = quality;
+    }
+
+    private String getLocalIpAddress() {
+        try {
+            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements(); ) {
+                NetworkInterface intf = en.nextElement();
+                if (!intf.isUp() || intf.isLoopback() || intf.isVirtual()) {
+                    continue;
+                }
+                for (Enumeration<InetAddress> enumIpAddr = intf.getInetAddresses(); enumIpAddr.hasMoreElements(); ) {
+                    InetAddress inetAddress = enumIpAddr.nextElement();
+                    if (!inetAddress.isLoopbackAddress() && inetAddress instanceof Inet4Address) {
+                        return inetAddress.getHostAddress();
+                    }
+                }
+            }
+        } catch (SocketException e) {
+            Log.w(TAG, "Failed to detect local IP address", e);
+        }
+        return "";
+    }
+
+    private void setSavedStreamDestination(final String host, final int port) {
+        if (port <= 0 || port > 65535) return;
+        PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .edit()
+                .putInt(PREF_STREAM_PORT, port)
+                .apply();
+        mStreamHost = mDeviceIp;
+        mStreamPort = port;
+        updateStreamStatus();
+    }
+
+    private boolean hasCustomTransportDestination() {
+        return mStreamPort > 0;
+    }
+
+    private void showSetStreamDestinationDialog() {
+        final android.widget.LinearLayout container = new android.widget.LinearLayout(this);
+        container.setOrientation(android.widget.LinearLayout.VERTICAL);
+        int padding = (int) (getResources().getDisplayMetrics().density * 16);
+        container.setPadding(padding, padding, padding, padding);
+
+        final EditText hostInput = new EditText(this);
+        hostInput.setHint(getString(R.string.stream_destination_host_hint));
+        hostInput.setText(mDeviceIp != null ? mDeviceIp : "");
+        hostInput.setEnabled(false);
+        hostInput.setFocusable(false);
+        hostInput.setFocusableInTouchMode(false);
+        container.addView(hostInput);
+
+        final EditText portInput = new EditText(this);
+        portInput.setHint(getString(R.string.stream_destination_port_hint));
+        portInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        portInput.setText(String.valueOf(mStreamPort));
+        container.addView(portInput);
+
+        final EditText fpsInput = new EditText(this);
+        fpsInput.setHint("Target FPS (24-60)");
+        fpsInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        fpsInput.setText(String.valueOf(mVideoTargetFps));
+        container.addView(fpsInput);
+
+        final EditText qualityInput = new EditText(this);
+        qualityInput.setHint("Quality 10-100");
+        qualityInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        qualityInput.setText(String.valueOf(mVideoQuality));
+        container.addView(qualityInput);
+
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.stream_destination_title)
+                .setView(container)
+                .setPositiveButton(R.string.stream_destination_set, (dialog, which) -> {
+                    String host = mDeviceIp != null ? mDeviceIp : "";
+                    int port = DEFAULT_STREAM_PORT;
+                    int targetFps = DEFAULT_VIDEO_TARGET_FPS;
+                    int quality = DEFAULT_VIDEO_QUALITY;
+                    try {
+                        port = Integer.parseInt(portInput.getText().toString().trim());
+                    } catch (NumberFormatException ignored) {
+                    }
+                    try {
+                        targetFps = Integer.parseInt(fpsInput.getText().toString().trim());
+                    } catch (NumberFormatException ignored) {
+                    }
+                    try {
+                        quality = Integer.parseInt(qualityInput.getText().toString().trim());
+                    } catch (NumberFormatException ignored) {
+                    }
+                    targetFps = Math.max(24, Math.min(60, targetFps));
+                    quality = Math.max(10, Math.min(100, quality));
+
+                    if (TextUtils.isEmpty(host) || port <= 0 || port > 65535) {
+                        Toast.makeText(this, R.string.stream_destination_error, Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+                    setSavedStreamDestination(host, port);
+                    setSavedVideoTargetFps(targetFps);
+                    setSavedVideoQuality(quality);
+                    Toast.makeText(this, String.format("%s:%d fps=%d quality=%d", host, port, targetFps, quality), Toast.LENGTH_SHORT).show();
+                    invalidateOptionsMenu();
+                    if (mStreamProtocol == StreamProtocol.TCP_UDP && mIsCameraConnected) {
+                        cleanupNdiAndStreaming();
+                        if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
+                            Size size = mCameraHelper.getPreviewSize();
+                            if (size != null) {
+                                setupTcpUdpForUsbCamera(mUsbDevice, size);
+                            }
+                        } else if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
+                            setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                        }
+                    }
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void updateStreamStatus() {
+        if (mBinding == null || mBinding.tvStreamStatus == null) {
+            return;
+        }
+        if (mStreamProtocol == StreamProtocol.NDI) {
+            mBinding.tvStreamStatus.setText(R.string.stream_status_ndi);
+        } else if (mStreamProtocol == StreamProtocol.TCP_UDP) {
+            if (hasCustomTransportDestination()) {
+                String base = "H.265 TCP server: 0.0.0.0:" + mStreamPort
+                        + " @ " + mVideoTargetFps + " fps"
+                        + " q=" + mVideoQuality;
+                mBinding.tvStreamStatus.setText(base + "\n" + getTcpTelemetryOverlay());
+            } else {
+                mBinding.tvStreamStatus.setText(R.string.stream_status_no_destination);
+            }
+        } else {
+            mBinding.tvStreamStatus.setText(R.string.stream_status_inactive);
+        }
+    }
+
+    private boolean isCustomTransportActive() {
+        return mStreamProtocol == StreamProtocol.TCP_UDP;
+    }
+
+    private String getTcpTelemetryOverlay() {
+        long captured = mTcpFramesCaptured.get();
+        long dropped = mTcpFramesDropped.get();
+        long encoded = mTcpFramesEncoded.get();
+        long sent = mTcpPacketsSent.get();
+        long maxQ = mTcpQueueDepthMax.get();
+        long samples = mTcpEncodeSamples.get();
+        double avgEncMs = samples > 0
+                ? (mTcpEncodeTimeNsSum.get() / 1_000_000.0) / (double) samples
+                : 0.0;
+        return String.format(Locale.US,
+                "cap=%d drop=%d enc=%d sent=%d q=%d/%d encAvg=%.2fms",
+                captured,
+                dropped,
+                encoded,
+                sent,
+                mTcpUdpFrameQueue.size(),
+                Math.max(maxQ, 1),
+                avgEncMs);
+    }
+
+    private void resetTcpTelemetry() {
+        mTcpFramesCaptured.set(0);
+        mTcpFramesDropped.set(0);
+        mTcpFramesEncoded.set(0);
+        mTcpPacketsSent.set(0);
+        mTcpEncodeTimeNsSum.set(0);
+        mTcpEncodeSamples.set(0);
+        mTcpQueueDepthMax.set(0);
+        mTcpTelemetryLastUiNs = 0;
+        mTcpTelemetryLastLogNs = 0;
+        mTcpTelemetryPrevCaptured = 0;
+        mTcpTelemetryPrevDropped = 0;
+        mTcpTelemetryPrevEncoded = 0;
+        mTcpTelemetryPrevSent = 0;
+    }
+
+    private void noteTcpQueueDepth() {
+        long depth = mTcpUdpFrameQueue.size();
+        while (true) {
+            long cur = mTcpQueueDepthMax.get();
+            if (depth <= cur || mTcpQueueDepthMax.compareAndSet(cur, depth)) {
+                break;
+            }
+        }
+    }
+
+    private void maybePublishTcpTelemetry(boolean forceUi) {
+        long nowNs = System.nanoTime();
+        if (forceUi || nowNs - mTcpTelemetryLastUiNs >= 500_000_000L) {
+            mTcpTelemetryLastUiNs = nowNs;
+            runOnUiThread(this::updateStreamStatus);
+        }
+        if (nowNs - mTcpTelemetryLastLogNs >= 1_000_000_000L) {
+            mTcpTelemetryLastLogNs = nowNs;
+            long c = mTcpFramesCaptured.get();
+            long d = mTcpFramesDropped.get();
+            long e = mTcpFramesEncoded.get();
+            long s = mTcpPacketsSent.get();
+            long dc = c - mTcpTelemetryPrevCaptured;
+            long dd = d - mTcpTelemetryPrevDropped;
+            long de = e - mTcpTelemetryPrevEncoded;
+            long ds = s - mTcpTelemetryPrevSent;
+            mTcpTelemetryPrevCaptured = c;
+            mTcpTelemetryPrevDropped = d;
+            mTcpTelemetryPrevEncoded = e;
+            mTcpTelemetryPrevSent = s;
+            Log.i(TAG, "TCP telemetry/s cap=" + dc
+                    + " drop=" + dd
+                    + " enc=" + de
+                    + " sent=" + ds
+                    + " q=" + mTcpUdpFrameQueue.size()
+                    + " maxQ=" + mTcpQueueDepthMax.get()
+                    + " avgEncMs=" + String.format(Locale.US, "%.2f",
+                    mTcpEncodeSamples.get() > 0
+                            ? (mTcpEncodeTimeNsSum.get() / 1_000_000.0) / (double) mTcpEncodeSamples.get()
+                            : 0.0));
+        }
     }
 
     /**
@@ -1822,16 +2323,42 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
             mInternalCameraHelper.setStateCallback(new InternalCameraStateCallback());
         }
 
-        // Wire up frame delivery for NDI (set before openCamera so the reader is
-        // included in the initial capture session)
-        mInternalCameraHelper.setFrameListener((nv12Frame, width, height) -> {
-            enqueueNdiFrame(nv12Frame);
-        });
+        // Wire up frame delivery for the currently selected transport.
+        // Must be set before openCamera so the reader is included in the initial
+        // capture session and frames can be delivered immediately.
+        updateInternalCameraFrameListener();
 
         XXPermissions.with(this)
                 .permission(Manifest.permission.CAMERA)
                 .request((permissions, all) ->
                         mInternalCameraHelper.openCamera(cameraInfo, previewSize));
+    }
+
+    private void updateInternalCameraFrameListener() {
+        if (mInternalCameraHelper == null) {
+            return;
+        }
+
+        if (mStreamProtocol == StreamProtocol.NDI) {
+            mInternalCameraHelper.setFrameListener((nv12Frame, width, height) -> {
+                if (nv12Frame == null) {
+                    return;
+                }
+                enqueueNdiFrame(nv12Frame);
+            });
+            Log.i(TAG, "Internal camera transport set to NDI");
+        } else {
+            mInternalCameraHelper.setFrameListener((nv12Frame, width, height) -> {
+                if (nv12Frame == null) {
+                    return;
+                }
+
+                mPreviewWidth = width;
+                mPreviewHeight = height;
+                enqueueTcpUdpFrame(nv12Frame, width, height);
+            });
+            Log.i(TAG, "Internal camera transport set to TCP/UDP");
+        }
     }
 
     /**
@@ -1965,8 +2492,12 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
                 mInternalCameraHelper.startPreview(st);
             }
 
-            // Set up NDI streaming
-            setupNdiForInternalCamera(cameraInfo, previewSize);
+            // Set up the selected transport
+            if (mStreamProtocol == StreamProtocol.NDI) {
+                setupNdiForInternalCamera(cameraInfo, previewSize);
+            } else {
+                setupTcpUdpForInternalCamera(cameraInfo, previewSize);
+            }
 
             startKeepAliveService();
             mIsCameraConnected = true;
@@ -2038,6 +2569,7 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
             mFrameForwarder.setFrameDimensions(previewSize.getWidth(), previewSize.getHeight());
             setNdiTargetFps(25); // enforce 25 fps minimum for smooth 4K delivery
             setNdiFormat(mNdiHighQuality); // ensure format mode is applied
+            updateInternalCameraFrameListener();
             startNdiForwardingThread();
             Log.i(TAG, "NDI ready for internal camera: " + sourceName);
         } catch (Exception e) {
@@ -2047,12 +2579,48 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
         }
     }
 
+    private void setupTcpUdpForUsbCamera(final UsbDevice device, final Size previewSize) {
+        Log.i(TAG, "✅ H.265 TCP stream mode selected for USB camera.");
+        stopNdiForwardingThread();
+        cleanupNdiAndStreaming();
+        new Thread(() -> {
+            if (!hasCustomTransportDestination()) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "Port not configured — tap the stream protocol button to set a port",
+                        Toast.LENGTH_SHORT).show());
+                return;
+            }
+            startTcpUdpForwardingThread();
+        }, "CustomTransportInit").start();
+    }
+
+    private void setupTcpUdpForInternalCamera(final InternalCameraInfo cameraInfo,
+                                              final android.util.Size previewSize) {
+        Log.i(TAG, "✅ H.265 TCP stream mode selected for internal camera.");
+        stopNdiForwardingThread();
+        cleanupNdiAndStreaming();
+        new Thread(() -> {
+            if (!hasCustomTransportDestination()) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "Port not configured — tap the stream protocol button to set a port",
+                        Toast.LENGTH_SHORT).show());
+                return;
+            }
+            updateInternalCameraFrameListener();
+            startTcpUdpForwardingThread();
+        }, "CustomTransportInit").start();
+    }
+
     /** Tears down NDI sender and frame forwarder — used by both camera paths. */
     private void cleanupNdiAndStreaming() {
         try {
             if (mCameraHelper != null) {
                 mCameraHelper.setFrameCallback(null, 0);
             }
+            if (mInternalCameraHelper != null) {
+                mInternalCameraHelper.setFrameListener(null);
+            }
+            stopNdiForwardingThread();
             if (mFrameForwarder != null) {
                 mFrameForwarder = null;
             }
@@ -2061,7 +2629,7 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
                 mNdiSender.close();
                 mNdiSender = null;
             }
-            stopNdiForwardingThread();
+            stopTcpUdpForwardingThread();
         } catch (Exception e) {
             Log.e(TAG, "Error stopping NDI", e);
         }
@@ -2109,6 +2677,572 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
         mNdiReusableBuffer.set(null);
     }
 
+    private void stopTcpUdpForwardingThread() {
+        mTcpUdpWorkerRunning = false;
+        stopTcpDiscoveryBeaconThread();
+        stopTcpTallyListenerThread();
+        if (mNdiSender == null) {
+            stopTallyPolling();
+        }
+        // Close the server socket so accept() unblocks immediately
+        ServerSocket ss = mH265ServerSocket;
+        if (ss != null) {
+            try { ss.close(); } catch (Exception ignored) {}
+        }
+        // Close any active output stream
+        OutputStream out = mH264OutputStream;
+        mH264OutputStream = null;
+        if (out != null) {
+            try { out.close(); } catch (Exception ignored) {}
+        }
+        if (mTcpUdpWorkerThread != null) {
+            mTcpUdpWorkerThread.interrupt();
+            try {
+                mTcpUdpWorkerThread.join(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            mTcpUdpWorkerThread = null;
+        }
+        clearTcpUdpFrameQueue();
+        runOnUiThread(this::updateStreamStatus);
+    }
+
+    // ── H.265 encoder lifecycle ──────────────────────────────────────────────
+
+    private void startH264Encoder(int width, int height) {
+        stopH264Encoder();
+        try {
+            int pixels = width * height;
+            boolean is4K = (long) pixels > 1920L * 1080L;
+            int targetFps = Math.max(24, Math.min(60, mVideoTargetFps));
+            if (is4K) {
+                targetFps = Math.min(targetFps, 30);
+            }
+            int quality = Math.max(10, Math.min(100, mVideoQuality));
+            // H.265 needs ~50% the bitrate of H.264; scale but cap aggressively for TCP stability
+            long baseBitrate = 3_000_000L + (17_000_000L * quality / 100L);
+            long scaledBitrate = baseBitrate * pixels / (1920 * 1080);
+            long maxBitrate = is4K ? 25_000_000L : 20_000_000L;
+            long bitrate = Math.min(maxBitrate, Math.max(2_000_000L, scaledBitrate));
+            MediaCodec enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC);
+            MediaFormat fmt = MediaFormat.createVideoFormat(
+                    MediaFormat.MIMETYPE_VIDEO_HEVC, width, height);
+            fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar);
+            fmt.setInteger(MediaFormat.KEY_BIT_RATE, (int) bitrate);
+            fmt.setInteger(MediaFormat.KEY_FRAME_RATE, targetFps);
+            // Longer I-frame interval → fewer expensive keyframes → smoother TCP delivery
+            fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, is4K ? 5 : 2);
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                // CBR for predictable TCP frame sizes (reduces buffering jitter)
+                fmt.setInteger(MediaFormat.KEY_BITRATE_MODE,
+                        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
+                // Minimum complexity = fastest possible encoding (less variant encode time)
+                fmt.setInteger(MediaFormat.KEY_COMPLEXITY, 0);
+            }
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                // Tell encoder to emit output as soon as each frame is encoded
+                fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
+            }
+            enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            enc.start();
+            mH264Encoder = enc;
+            mH264EncoderWidth = width;
+            mH264EncoderHeight = height;
+            mH264SpsPps = null;
+            mTcpUdpTargetFps = targetFps;
+            mTcpUdpMinFrameIntervalNs = 1_000_000_000L / mTcpUdpTargetFps;
+            mNextTcpUdpEnqueueTimeNs = 0;
+            Log.i(TAG, "H.265 encoder started " + width + "x" + height + " @ " + bitrate / 1_000_000 + " Mbps @ " + targetFps + " fps");
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to start H.265 encoder", e);
+            mH264Encoder = null;
+        }
+    }
+
+    private void stopH264Encoder() {
+        MediaCodec enc = mH264Encoder;
+        mH264Encoder = null;
+        mH264EncoderWidth = 0;
+        mH264EncoderHeight = 0;
+        if (enc != null) {
+            try { enc.stop(); } catch (Exception ignored) {}
+            try { enc.release(); } catch (Exception ignored) {}
+        }
+    }
+
+    private void reconfigureH264Encoder(int width, int height) {
+        stopH264Encoder();
+        startH264Encoder(width, height);
+    }
+
+    /**
+     * Feed one NV12 frame to the H.265 encoder and drain all output packets to TCP.
+     * Throws IOException if the TCP stream is broken.
+     */
+    private void feedFrameToH264Encoder(CustomUdpFrame frame) throws IOException {
+        MediaCodec enc = mH264Encoder;
+        if (enc == null) return;
+        long encodeStartNs = System.nanoTime();
+
+        // Feed NV12 frame directly into encoder input buffer — avoids intermediate byte[] copy
+        int yuvSize = frame.width * frame.height * 3 / 2;
+        int actualYuvSize = Math.min(yuvSize, frame.frame.remaining());
+
+        // Phase 1 — drain any already-ready output BEFORE requesting an input buffer.
+        // This prevents a deadlock: encoder holds all input slots until its output is consumed.
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        drainEncoderOutput(enc, info, 0);
+
+        // Phase 2 — submit the new frame (short timeout: skip rather than block the pipeline)
+        int inputIndex = enc.dequeueInputBuffer(5_000 /* µs */);
+        int enqueuedSize = 0;
+        if (inputIndex >= 0) {
+            java.nio.ByteBuffer inputBuf = enc.getInputBuffer(inputIndex);
+            if (inputBuf != null) {
+                inputBuf.clear();
+                java.nio.ByteBuffer src = frame.frame.duplicate();
+                src.limit(src.position() + Math.min(actualYuvSize, inputBuf.remaining()));
+                enqueuedSize = src.remaining();
+                inputBuf.put(src);
+            }
+            long ptsUs = frame.captureTimeNs > 0 ? (frame.captureTimeNs / 1000L) : (System.nanoTime() / 1000L);
+            enc.queueInputBuffer(inputIndex, 0, enqueuedSize, ptsUs, 0);
+        } else {
+            mTcpFramesDropped.incrementAndGet();
+            maybePublishTcpTelemetry(false);
+            return;
+        }
+
+        // Phase 3 — drain output again, short wait to avoid blocking the forwarding loop
+        drainEncoderOutput(enc, info, 10_000);
+        mTcpEncodeTimeNsSum.addAndGet(System.nanoTime() - encodeStartNs);
+        mTcpEncodeSamples.incrementAndGet();
+    }
+
+    /** Drain all available encoder output packets and forward them to the TCP stream. */
+    private void drainEncoderOutput(MediaCodec enc, MediaCodec.BufferInfo info, long firstTimeoutUs)
+            throws IOException {
+        long timeoutUs = firstTimeoutUs;
+        while (true) {
+            int outIndex = enc.dequeueOutputBuffer(info, timeoutUs);
+            timeoutUs = 0; // subsequent polls: non-blocking
+            if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) break;
+            if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                // Extract SPS+PPS from the new format
+                MediaFormat newFmt = enc.getOutputFormat();
+                java.nio.ByteBuffer spsB = newFmt.getByteBuffer("csd-0");
+                java.nio.ByteBuffer ppsB = newFmt.getByteBuffer("csd-1");
+                int spsLen = spsB != null ? spsB.remaining() : 0;
+                int ppsLen = ppsB != null ? ppsB.remaining() : 0;
+                byte[] spsPps = new byte[spsLen + ppsLen];
+                if (spsB != null) spsB.get(spsPps, 0, spsLen);
+                if (ppsB != null) ppsB.get(spsPps, spsLen, ppsLen);
+                mH264SpsPps = spsPps;
+                // Send SPS+PPS as config packet
+                OutputStream out = mH264OutputStream;
+                if (out != null) {
+                    sendH264Packet(H264_NO_PTS, spsPps, 0, spsPps.length);
+                    out.flush();
+                }
+                continue;
+            }
+            if (outIndex < 0) break;
+            java.nio.ByteBuffer outBuf = enc.getOutputBuffer(outIndex);
+            if (outBuf != null && info.size > 0) {
+                boolean isConfig = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+                if (mH264OutputBuffer == null || mH264OutputBuffer.length < info.size) {
+                    mH264OutputBuffer = new byte[info.size * 2];
+                }
+                byte[] data = mH264OutputBuffer;
+                outBuf.position(info.offset);
+                outBuf.get(data, 0, info.size);
+                long pts = isConfig ? H264_NO_PTS : (info.presentationTimeUs);
+                OutputStream out = mH264OutputStream;
+                if (out != null) {
+                    sendH264Packet(pts, data, 0, info.size);
+                    if (!isConfig) {
+                        mTcpFramesEncoded.incrementAndGet();
+                    }
+                }
+                if (isConfig) {
+                    mH264SpsPps = java.util.Arrays.copyOf(data, info.size);
+                }
+            }
+            enc.releaseOutputBuffer(outIndex, false);
+            if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
+        }
+    }
+
+    /**
+     * Write a DroidCam-style H.264 packet: 8-byte PTS (BE) + 4-byte length (BE) + payload.
+     * Throws IOException if the TCP stream is broken.
+     */
+    private void sendH264Packet(long pts, byte[] data, int offset, int length) throws IOException {
+        OutputStream out = mH264OutputStream;
+        if (out == null) return;
+        byte[] hdr = mH264FrameHeaderBuf;
+        // PTS — 8 bytes big-endian
+        hdr[0] = (byte) (pts >>> 56);
+        hdr[1] = (byte) (pts >>> 48);
+        hdr[2] = (byte) (pts >>> 40);
+        hdr[3] = (byte) (pts >>> 32);
+        hdr[4] = (byte) (pts >>> 24);
+        hdr[5] = (byte) (pts >>> 16);
+        hdr[6] = (byte) (pts >>>  8);
+        hdr[7] = (byte) (pts);
+        // Length — 4 bytes big-endian
+        hdr[8]  = (byte) (length >>> 24);
+        hdr[9]  = (byte) (length >>> 16);
+        hdr[10] = (byte) (length >>>  8);
+        hdr[11] = (byte) (length);
+        out.write(hdr, 0, 12);
+        out.write(data, offset, length);
+        if (pts != H264_NO_PTS) {
+            mTcpPacketsSent.incrementAndGet();
+        }
+    }
+
+    private void recycleFrameBuffer(java.nio.ByteBuffer frame) {
+        if (frame == null) {
+            return;
+        }
+        frame.clear();
+        // Try TCP pool first, then NDI pool — two pooled buffers avoids allocateDirect at 4K
+        if (!mTcpReusableBuffer.compareAndSet(null, frame)) {
+            mNdiReusableBuffer.compareAndSet(null, frame);
+        }
+    }
+
+    private void clearTcpUdpFrameQueue() {
+        CustomUdpFrame pendingFrame;
+        while ((pendingFrame = mTcpUdpFrameQueue.poll()) != null) {
+            recycleFrameBuffer(pendingFrame.frame);
+        }
+    }
+
+    private void startTcpDiscoveryBeaconThread() {
+        if (mTcpDiscoveryRunning) {
+            return;
+        }
+        mTcpDiscoveryRunning = true;
+        mTcpDiscoveryThread = new Thread(() -> {
+            while (mTcpDiscoveryRunning) {
+                try {
+                    sendTcpDiscoveryBeacon();
+                } catch (Exception e) {
+                    if (mTcpDiscoveryRunning) {
+                        Log.w(TAG, "Failed to send TCP discovery beacon", e);
+                    }
+                }
+                try {
+                    Thread.sleep(TCP_DISCOVERY_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }, "TcpDiscoveryBeacon");
+        mTcpDiscoveryThread.setPriority(Thread.NORM_PRIORITY);
+        mTcpDiscoveryThread.start();
+    }
+
+    private void stopTcpDiscoveryBeaconThread() {
+        mTcpDiscoveryRunning = false;
+        if (mTcpDiscoveryThread != null) {
+            mTcpDiscoveryThread.interrupt();
+            try {
+                mTcpDiscoveryThread.join(300);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            mTcpDiscoveryThread = null;
+        }
+    }
+
+    private void sendTcpDiscoveryBeacon() {
+        int port = mStreamPort > 0 ? mStreamPort : DEFAULT_STREAM_PORT;
+        String payload = "UVCAPP;port=" + port;
+        byte[] data = payload.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+
+        java.net.DatagramSocket socket = null;
+        try {
+            socket = new java.net.DatagramSocket();
+            socket.setBroadcast(true);
+
+            // Broadcast to global address.
+            java.net.DatagramPacket globalPacket = new java.net.DatagramPacket(
+                    data, data.length,
+                    java.net.InetAddress.getByName("255.255.255.255"),
+                    DISCOVERY_PORT);
+            socket.send(globalPacket);
+
+            // Broadcast on each interface-specific subnet address as well.
+            java.util.Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                NetworkInterface nif = interfaces.nextElement();
+                if (!nif.isUp() || nif.isLoopback()) {
+                    continue;
+                }
+                for (java.net.InterfaceAddress ia : nif.getInterfaceAddresses()) {
+                    java.net.InetAddress broadcast = ia.getBroadcast();
+                    if (broadcast == null) {
+                        continue;
+                    }
+                    java.net.DatagramPacket packet = new java.net.DatagramPacket(
+                            data, data.length, broadcast, DISCOVERY_PORT);
+                    socket.send(packet);
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "TCP discovery beacon error", e);
+        } finally {
+            if (socket != null) {
+                socket.close();
+            }
+        }
+    }
+
+    private void startTcpTallyListenerThread() {
+        if (mTcpTallyListenerRunning) {
+            return;
+        }
+        mTcpTallyListenerRunning = true;
+        mTcpTallyListenerThread = new Thread(() -> {
+            java.net.DatagramSocket socket = null;
+            try {
+                socket = new java.net.DatagramSocket(TCP_TALLY_PORT);
+                socket.setReuseAddress(true);
+                socket.setSoTimeout(500);
+                byte[] buf = new byte[256];
+                while (mTcpTallyListenerRunning) {
+                    java.net.DatagramPacket packet = new java.net.DatagramPacket(buf, buf.length);
+                    try {
+                        socket.receive(packet);
+                    } catch (java.net.SocketTimeoutException ignored) {
+                        continue;
+                    }
+                    String msg = new String(packet.getData(), 0, packet.getLength(), java.nio.charset.StandardCharsets.UTF_8);
+                    boolean program = msg.contains("program=1");
+                    boolean preview = msg.contains("preview=1");
+                    mTcpObsProgram = program;
+                    mTcpObsPreview = preview;
+                    mTcpLastTallyUpdateNs = System.nanoTime();
+                }
+            } catch (Exception e) {
+                if (mTcpTallyListenerRunning) {
+                    Log.w(TAG, "TCP tally listener error", e);
+                }
+            } finally {
+                if (socket != null) {
+                    socket.close();
+                }
+            }
+        }, "TcpTallyListener");
+        mTcpTallyListenerThread.setPriority(Thread.NORM_PRIORITY);
+        mTcpTallyListenerThread.start();
+    }
+
+    private void stopTcpTallyListenerThread() {
+        mTcpTallyListenerRunning = false;
+        if (mTcpTallyListenerThread != null) {
+            mTcpTallyListenerThread.interrupt();
+            try {
+                mTcpTallyListenerThread.join(300);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            mTcpTallyListenerThread = null;
+        }
+        mTcpObsProgram = false;
+        mTcpObsPreview = false;
+        mTcpLastTallyUpdateNs = 0;
+    }
+
+    private void enqueueTcpUdpFrame(java.nio.ByteBuffer frame, int width, int height) {
+        if (frame == null) {
+            return;
+        }
+        if (width <= 0 || height <= 0) {
+            Log.w(TAG, "TCP/UDP enqueue: invalid frame dimensions " + width + "x" + height);
+            return;
+        }
+        mTcpFramesCaptured.incrementAndGet();
+        long nowNs = System.nanoTime();
+        if (mTcpUdpTargetFps > 0 && mTcpUdpMinFrameIntervalNs > 0) {
+            long nextNs = mNextTcpUdpEnqueueTimeNs;
+            if (nextNs <= 0) {
+                nextNs = nowNs;
+            }
+            // Small early-accept window keeps cadence stable despite callback jitter.
+            if (nowNs + (mTcpUdpMinFrameIntervalNs / 3) < nextNs) {
+                mTcpFramesDropped.incrementAndGet();
+                maybePublishTcpTelemetry(false);
+                return;
+            }
+            while (nowNs > nextNs + mTcpUdpMinFrameIntervalNs) {
+                nextNs += mTcpUdpMinFrameIntervalNs;
+            }
+            mNextTcpUdpEnqueueTimeNs = nextNs + mTcpUdpMinFrameIntervalNs;
+        }
+        mLastTcpUdpEnqueueTimeNs = nowNs;
+
+        java.nio.ByteBuffer frameCopy = copyFrameBuffer(frame);
+        if (frameCopy == null) {
+            Log.w(TAG, "TCP/UDP enqueue: failed to copy frame");
+            mTcpFramesDropped.incrementAndGet();
+            maybePublishTcpTelemetry(false);
+            return;
+        }
+        try {
+            CustomUdpFrame packet = new CustomUdpFrame(frameCopy, width, height, nowNs);
+            // Keep up to 2 frames queued for jitter absorption; only drop oldest if full
+            if (!mTcpUdpFrameQueue.offer(packet)) {
+                CustomUdpFrame stale = mTcpUdpFrameQueue.poll();
+                if (stale != null) {
+                    recycleFrameBuffer(stale.frame);
+                    mTcpFramesDropped.incrementAndGet();
+                }
+                if (!mTcpUdpFrameQueue.offer(packet)) {
+                    recycleFrameBuffer(frameCopy);
+                    mTcpFramesDropped.incrementAndGet();
+                }
+            }
+            noteTcpQueueDepth();
+            maybePublishTcpTelemetry(false);
+        } catch (Exception e) {
+            recycleFrameBuffer(frameCopy);
+            Log.w(TAG, "TCP/UDP enqueue: unexpected error", e);
+            mTcpFramesDropped.incrementAndGet();
+            maybePublishTcpTelemetry(false);
+        }
+    }
+
+    private void startTcpUdpForwardingThread() {
+        if (mTcpUdpWorkerRunning) {
+            return;
+        }
+        resetTcpTelemetry();
+        mTcpObsProgram = false;
+        mTcpObsPreview = false;
+        mTcpLastTallyUpdateNs = 0;
+        mHandler.removeCallbacks(mTallyPoller);
+        mHandler.post(mTallyPoller);
+        startTcpDiscoveryBeaconThread();
+        startTcpTallyListenerThread();
+        mTcpUdpWorkerRunning = true;
+        mTcpUdpWorkerThread = new Thread(() -> {
+            Log.i(TAG, "H.265 TCP forwarding thread started, port=" + mStreamPort);
+
+            // Open server socket once for this thread's lifetime
+            try {
+                mH265ServerSocket = new ServerSocket();
+                mH265ServerSocket.setReuseAddress(true);
+                mH265ServerSocket.setSoTimeout(500);
+                mH265ServerSocket.bind(new java.net.InetSocketAddress(mStreamPort));
+                Log.i(TAG, "H.265 TCP server listening on port " + mStreamPort);
+            } catch (IOException e) {
+                Log.e(TAG, "Failed to open H.265 TCP server socket", e);
+                mTcpUdpWorkerRunning = false;
+                return;
+            }
+
+            // Outer loop: accept/reconnect
+            while (mTcpUdpWorkerRunning) {
+                Socket client = null;
+                // Accept loop — retries on SO_TIMEOUT until stopped
+                while (mTcpUdpWorkerRunning && client == null) {
+                    try {
+                        client = mH265ServerSocket.accept();
+                        client.setTcpNoDelay(true);
+                        try { client.setKeepAlive(true); } catch (Exception ignored) {}
+                        try { client.setSendBufferSize(1024 * 1024); } catch (Exception ignored) {}
+                        try { client.setTrafficClass(0x10); } catch (Exception ignored) {}
+                        mH264OutputStream = new BufferedOutputStream(
+                                client.getOutputStream(), 256 * 1024);
+                        mLastTcpFlushTimeNs = 0;
+                        Log.i(TAG, "OBS connected from " + client.getInetAddress().getHostAddress());
+                    } catch (java.net.SocketTimeoutException ignored) {
+                        // no client yet — keep waiting
+                    } catch (IOException e) {
+                        if (mTcpUdpWorkerRunning) {
+                            Log.w(TAG, "Error accepting H.265 TCP connection", e);
+                        }
+                        break;
+                    }
+                }
+                if (!mTcpUdpWorkerRunning || client == null) break;
+
+                // Send cached SPS+PPS so OBS can decode immediately
+                try {
+                    byte[] sps = mH264SpsPps;
+                    if (sps != null) {
+                        sendH264Packet(H264_NO_PTS, sps, 0, sps.length);
+                        mH264OutputStream.flush();
+                    }
+                } catch (IOException e) {
+                    Log.w(TAG, "Failed to send SPS/PPS to OBS", e);
+                    mH264OutputStream = null;
+                    try { client.close(); } catch (Exception ignored) {}
+                    continue;
+                }
+
+                // Frame streaming loop — runs until client disconnects or we stop
+                boolean clientActive = true;
+                while (mTcpUdpWorkerRunning && clientActive) {
+                    try {
+                        CustomUdpFrame frame = mTcpUdpFrameQueue.poll(
+                                5, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (frame == null) continue;
+                        try {
+                            if (mH264Encoder == null
+                                    || frame.width != mH264EncoderWidth
+                                    || frame.height != mH264EncoderHeight) {
+                                reconfigureH264Encoder(frame.width, frame.height);
+                            }
+                            feedFrameToH264Encoder(frame);
+                            // Micro-batched flush reduces syscall jitter while preserving low latency.
+                            OutputStream flushOut = mH264OutputStream;
+                            if (flushOut != null) {
+                                long nowFlushNs = System.nanoTime();
+                                if (mLastTcpFlushTimeNs <= 0
+                                        || (nowFlushNs - mLastTcpFlushTimeNs) >= TCP_FLUSH_INTERVAL_NS
+                                        || mTcpUdpFrameQueue.isEmpty()) {
+                                    flushOut.flush();
+                                    mLastTcpFlushTimeNs = nowFlushNs;
+                                }
+                            }
+                            maybePublishTcpTelemetry(false);
+                        } finally {
+                            recycleFrameBuffer(frame.frame);
+                        }
+                    } catch (IOException e) {
+                        Log.i(TAG, "OBS disconnected: " + e.getMessage());
+                        clientActive = false;
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        clientActive = false;
+                    } catch (Exception e) {
+                        Log.w(TAG, "Error in H.265 TCP forwarding thread", e);
+                    }
+                }
+
+                mH264OutputStream = null;
+                try { client.close(); } catch (Exception ignored) {}
+            }
+
+            stopH264Encoder();
+            ServerSocket ss = mH265ServerSocket;
+            mH265ServerSocket = null;
+            if (ss != null) try { ss.close(); } catch (Exception ignored) {}
+            Log.i(TAG, "H.265 TCP forwarding thread exiting");
+            maybePublishTcpTelemetry(true);
+        }, "H265TcpForwarder");
+        mTcpUdpWorkerThread.setPriority(Thread.MAX_PRIORITY);
+        mTcpUdpWorkerThread.start();
+    }
+
     private void enqueueNdiFrame(java.nio.ByteBuffer frame) {
         if (frame == null || mFrameForwarder == null) {
             return;
@@ -2151,7 +3285,11 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
         }
 
         int needed = src.remaining();
-        java.nio.ByteBuffer dest = mNdiReusableBuffer.getAndSet(null);
+        // Try both buffer pools before falling back to expensive allocateDirect
+        java.nio.ByteBuffer dest = mTcpReusableBuffer.getAndSet(null);
+        if (dest == null || dest.capacity() < needed) {
+            dest = mNdiReusableBuffer.getAndSet(null);
+        }
         if (dest == null || dest.capacity() < needed) {
             dest = java.nio.ByteBuffer.allocateDirect(needed);
         }

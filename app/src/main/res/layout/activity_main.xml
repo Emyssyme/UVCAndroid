@@ -106,6 +106,19 @@
             android:textSize="20dp" />
 
         <TextView
+            android:id="@+id/tvStreamStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_alignParentTop="true"
+            android:layout_alignParentStart="true"
+            android:layout_margin="8dp"
+            android:text="@string/stream_status_inactive"
+            android:textColor="@color/white"
+            android:textSize="12sp"
+            android:background="#55000000"
+            android:padding="6dp" />
+
+        <TextView
             android:id="@+id/tvVideoRecordTime"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
