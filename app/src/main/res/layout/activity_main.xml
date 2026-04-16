@@ -259,6 +259,32 @@
                 android:layout_marginTop="8dp">
 
                 <Button
+                    android:id="@+id/btnInternalExposureLock"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:text="Exposure Lock"
+                    android:textColor="@color/white"
+                    android:backgroundTint="#AA000000" />
+
+                <Button
+                    android:id="@+id/btnInternalFocusLock"
+                    android:layout_width="0dp"
+                    android:layout_weight="1"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="1dp"
+                    android:text="Focus Lock"
+                    android:textColor="@color/white"
+                    android:backgroundTint="#AA000000" />
+            </LinearLayout>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginTop="8dp">
+
+                <Button
                     android:id="@+id/btnInternalAeToggle"
                     android:layout_width="0dp"
                     android:layout_weight="1"
@@ -272,7 +298,7 @@
                     android:layout_width="0dp"
                     android:layout_weight="1"
                     android:layout_height="wrap_content"
-                    android:layout_marginStart="4dp"
+                    android:layout_marginStart="1dp"
                     android:text="AWB Auto"
                     android:textColor="@color/white"
                     android:backgroundTint="#AA000000" />
@@ -287,6 +313,115 @@
                     android:textColor="@color/white"
                     android:backgroundTint="#AA000000" />
             </LinearLayout>
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/internal_camera_bottom_bar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_alignParentBottom="true"
+            android:layout_margin="8dp"
+            android:background="#66000000"
+            android:orientation="horizontal"
+            android:padding="4dp"
+            android:visibility="gone">
+
+            <Button
+                android:id="@+id/btnBottomSelectCamera"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:layout_marginEnd="4dp"
+                android:text="CAM"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:includeFontPadding="false"
+                android:backgroundTint="#55000000"
+                android:minHeight="0dp"
+                android:minWidth="0dp"
+                android:padding="4dp" />
+
+            <Button
+                android:id="@+id/btnBottomExposure"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:layout_marginEnd="4dp"
+                android:text="EV"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:includeFontPadding="false"
+                android:backgroundTint="#55000000"
+                android:minHeight="0dp"
+                android:minWidth="0dp"
+                android:padding="4dp" />
+
+            <Button
+                android:id="@+id/btnBottomExposureLock"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:layout_marginEnd="4dp"
+                android:text="EV-L"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:includeFontPadding="false"
+                android:backgroundTint="#55000000"
+                android:minHeight="0dp"
+                android:minWidth="0dp"
+                android:padding="4dp" />
+
+            <Button
+                android:id="@+id/btnBottomAfMode"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:layout_marginEnd="4dp"
+                android:text="AF"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:includeFontPadding="false"
+                android:backgroundTint="#55000000"
+                android:minHeight="0dp"
+                android:minWidth="0dp"
+                android:padding="4dp" />
+
+            <Button
+                android:id="@+id/btnBottomFocusLock"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:layout_marginEnd="4dp"
+                android:text="AF-L"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:includeFontPadding="false"
+                android:backgroundTint="#55000000"
+                android:minHeight="0dp"
+                android:minWidth="0dp"
+                android:padding="4dp" />
+
+            <Button
+                android:id="@+id/btnBottomFlash"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:layout_marginEnd="4dp"
+                android:text="FL"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:includeFontPadding="false"
+                android:backgroundTint="#55000000"
+                android:minHeight="0dp"
+                android:minWidth="0dp"
+                android:padding="4dp" />
+
+            <Button
+                android:id="@+id/btnBottomWhiteBalance"
+                android:layout_width="wrap_content"
+                android:layout_height="40dp"
+                android:text="WB"
+                android:textColor="@color/white"
+                android:textSize="12sp"
+                android:includeFontPadding="false"
+                android:backgroundTint="#55000000"
+                android:minHeight="0dp"
+                android:minWidth="0dp"
+                android:padding="4dp" />
         </LinearLayout>
 
         <com.google.android.material.floatingactionbutton.FloatingActionButton

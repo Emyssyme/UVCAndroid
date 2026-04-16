@@ -8,8 +8,8 @@ It also listens for Android discovery beacons on UDP port `8866` to auto-detect 
 1. Install Visual Studio 2022/2019 with C++ desktop development.
 2. Install CMake and Git.
 3. Clone the OBS Studio source tree or use a developer build install that includes `include/` and `lib/` directories. The runtime-only OBS installer does not contain the headers and import libraries needed to build plugins.
-4. This plugin can also be built as part of the OBS source tree. Place this folder under `obs-studio-master/plugins/uvc-custom-network` and add the line `add_subdirectory(uvc-custom-network)` to `obs-studio-master/plugins/CMakeLists.txt`.
-5. If you are using an OBS source checkout outside the OBS tree, point `OBS_DIR` at the source root or the source root containing a built `build/` or `output/` tree.
+4. This plugin can also be built as part of the OBS source tree. Place this folder under `obs-studio-master/plugins/uvc-custom-network` or add it using `add_subdirectory()` from the OBS `plugins` CMake tree.
+5. If you are using an OBS source checkout, point `OBS_DIR` at the source root or the source root containing a built `build/` or `output/` tree.
 6. Run from this folder:
 
 ```powershell

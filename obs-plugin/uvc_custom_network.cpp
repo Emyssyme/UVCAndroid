@@ -36,6 +36,7 @@ extern "C" {
 static const char *RESOLUTIONS[] = {"640x360", "1280x720", "1920x1080", "3840x2160"};
 static const uint32_t RESOLUTION_VALUES[][2] = {{640, 360}, {1280, 720}, {1920, 1080}, {3840, 2160}};
 static const int CUSTOM_DISCOVERY_PORT = 8866;
+static const int CUSTOM_TALLY_PORT = 8867;
 
 /* H.265-over-TCP frame header constants (same as DroidCam protocol) */
 static const uint64_t H264_NO_PTS   = 0xFFFFFFFFFFFFFFFFULL; /* config/SPS+PPS marker */
@@ -81,10 +82,23 @@ static void uvc_custom_network_start_receiver(uvc_custom_network *context);
 static void uvc_custom_network_receiver_stop(uvc_custom_network *context);
 static void uvc_custom_network_set_status(uvc_custom_network *context, const char *format, ...);
 static bool uvc_custom_network_activate_button(obs_properties_t *props, obs_property_t *property, void *data);
-static bool uvc_custom_network_disconnect_button(obs_properties_t *props, obs_property_t *property, void *data);
 static bool uvc_custom_network_refresh_button(obs_properties_t *props, obs_property_t *property, void *data);
 static void uvc_custom_network_discovery_callback(const char *host, int port, void *userdata);
+static void uvc_custom_network_send_control(uvc_custom_network *context);
 static void *uvc_custom_network_receiver_thread(void *data);
+static void *uvc_custom_network_control_state_thread(void *data);
+static void uvc_custom_network_control_state_start(uvc_custom_network *context);
+static void uvc_custom_network_control_state_stop(uvc_custom_network *context);
+static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *context, const char *msg);
+static void uvc_custom_network_video_tick(void *data, float seconds);
+static void uvc_custom_network_send_tally(uvc_custom_network *context,
+#ifdef _WIN32
+                                          SOCKET tally_socket,
+#else
+                                          int tally_socket,
+#endif
+                                          const struct sockaddr_in *tally_addr,
+                                          bool force_send);
 
 static void uvc_custom_network_clear_discovered_devices(uvc_custom_network *context)
 {
@@ -143,14 +157,6 @@ static bool uvc_custom_network_activate_button(obs_properties_t *props, obs_prop
         return false;
     }
 
-    if (context->receiver_running) {
-        /* Connect button is idempotent: do not apply settings/restart when already running. */
-        uvc_custom_network_set_status(context, "✓ Already connected to %s:%d", context->host ? context->host : "", context->port);
-        blog(LOG_INFO, "UVC H265 TCP: connect requested while already running (%s:%d)",
-             context->host ? context->host : "", context->port);
-        return true;
-    }
-
     if (context->source) {
         obs_data_t *settings = obs_source_get_settings(context->source);
         if (settings) {
@@ -160,39 +166,22 @@ static bool uvc_custom_network_activate_button(obs_properties_t *props, obs_prop
         }
     }
 
+    bool was_running = context->receiver_running;
     bool has_target = (context->port > 0) && (context->host && context->host[0] != '\0');
 
+    if (was_running) {
+        uvc_custom_network_receiver_stop(context);
+        uvc_custom_network_set_status(context, "Stopped");
+        return true;
+    }
+
     if (!has_target) {
-        uvc_custom_network_set_status(context, "⚠ Set Phone IP and Stream Port first");
-        blog(LOG_WARNING, "UVC H265 TCP: activation attempted without phone IP/port configured");
+        uvc_custom_network_set_status(context, "Enter Phone IP and port first");
         return true;
     }
 
     uvc_custom_network_start_receiver(context);
-    uvc_custom_network_set_status(context, "↻ Connecting to %s:%d...", context->host, context->port);
-    blog(LOG_INFO, "UVC H265 TCP: manual activation — connecting to %s:%d", context->host, context->port);
-    return true;
-}
-
-static bool uvc_custom_network_disconnect_button(obs_properties_t *props, obs_property_t *property,
-                                                 void *data)
-{
-    UNUSED_PARAMETER(props);
-    UNUSED_PARAMETER(property);
-
-    uvc_custom_network *context = (uvc_custom_network *)data;
-    if (!context) {
-        return false;
-    }
-
-    if (!context->receiver_running) {
-        uvc_custom_network_set_status(context, "ℹ Already disconnected");
-        return true;
-    }
-
-    uvc_custom_network_receiver_stop(context);
-    uvc_custom_network_set_status(context, "✓ Stream disconnected");
-    blog(LOG_INFO, "UVC H265 TCP: stream manually disconnected");
+    uvc_custom_network_set_status(context, "Connecting to %s:%d (H.265 TCP)", context->host, context->port);
     return true;
 }
 
@@ -226,9 +215,9 @@ static bool uvc_custom_network_refresh_button(obs_properties_t *props, obs_prope
         context->discovery = network_discovery_create("uvc_custom_network", CUSTOM_DISCOVERY_PORT,
                                                     uvc_custom_network_discovery_callback, context);
         network_discovery_start(context->discovery);
-        uvc_custom_network_set_status(context, "Discovery refreshed, waiting for Android beacons...");
+        uvc_custom_network_set_status(context, "Discovery refreshed");
     } else {
-        uvc_custom_network_set_status(context, "Discovery is disabled. Enable Auto-Discovery first.");
+        uvc_custom_network_set_status(context, "Discovery refresh skipped (disabled)");
     }
     pthread_mutex_unlock(&context->lock);
 
@@ -251,11 +240,352 @@ static void uvc_custom_network_set_status(uvc_custom_network *context, const cha
     context->discovery_status = bstrdup(temp);
 }
 
+static void uvc_custom_network_send_tally(uvc_custom_network *context,
+#ifdef _WIN32
+                                          SOCKET tally_socket,
+#else
+                                          int tally_socket,
+#endif
+                                          const struct sockaddr_in *tally_addr,
+                                          bool force_send)
+{
+    if (!context || !tally_addr) {
+        return;
+    }
+#ifdef _WIN32
+    if (tally_socket == INVALID_SOCKET) {
+#else
+    if (tally_socket < 0) {
+#endif
+        return;
+    }
+
+    bool program = obs_source_active(context->source);
+    bool showing = obs_source_showing(context->source);
+    bool preview = showing && !program;
+
+    uint64_t now_ns = os_gettime_ns();
+    bool changed = (program != context->tally_program) || (preview != context->tally_preview);
+    bool stale = (now_ns - context->last_tally_send_ns) >= 1000000000ULL;
+    if (!force_send && !changed && !stale) {
+        return;
+    }
+
+    char payload[64];
+    snprintf(payload, sizeof(payload), "TALLY;program=%d;preview=%d", program ? 1 : 0, preview ? 1 : 0);
+
+#ifdef _WIN32
+    sendto(tally_socket, payload, (int)strlen(payload), 0,
+           (const struct sockaddr *)tally_addr, sizeof(*tally_addr));
+#else
+    sendto(tally_socket, payload, strlen(payload), 0,
+           (const struct sockaddr *)tally_addr, sizeof(*tally_addr));
+#endif
+
+    context->tally_program = program;
+    context->tally_preview = preview;
+    context->last_tally_send_ns = now_ns;
+}
+
+static void uvc_custom_network_send_control(uvc_custom_network *context)
+{
+    if (!context || !context->host || context->host[0] == '\0') {
+        return;
+    }
+
+#ifdef _WIN32
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) {
+#else
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+#endif
+        return;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)CUSTOM_TALLY_PORT);
+    if (inet_pton(AF_INET, context->host, &addr.sin_addr) <= 0) {
+#ifdef _WIN32
+        closesocket(sock);
+#else
+        close(sock);
+#endif
+        return;
+    }
+
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+             "CONTROL;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d",
+             context->control_exposure_lock ? 1 : 0,
+             context->control_focus_lock ? 1 : 0,
+             context->control_exposure_compensation,
+             context->control_af_mode,
+             context->control_af_lock ? 1 : 0,
+             context->control_flash_mode,
+             context->control_wb_mode,
+             context->control_wb_kelvin);
+
+#ifdef _WIN32
+    sendto(sock, payload, (int)strlen(payload), 0,
+           (const struct sockaddr *)&addr, sizeof(addr));
+    closesocket(sock);
+#else
+    sendto(sock, payload, strlen(payload), 0,
+           (const struct sockaddr *)&addr, sizeof(addr));
+    close(sock);
+#endif
+}
+
+static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *context, const char *msg)
+{
+    if (!context || !msg || strncmp(msg, "CONTROL_STATE;", 14) != 0) {
+        return;
+    }
+
+    int exposure_lock = 0;
+    int focus_lock = 0;
+    int exposure_compensation = 0;
+    int af_mode = 2;
+    int af_lock = 0;
+    int flash_mode = 2;
+    int wb_mode = 0;
+    int wb_kelvin = 4500;
+
+    int matched = sscanf(msg,
+                         "CONTROL_STATE;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d",
+                         &exposure_lock,
+                         &focus_lock,
+                         &exposure_compensation,
+                         &af_mode,
+                         &af_lock,
+                         &flash_mode,
+                         &wb_mode,
+                         &wb_kelvin);
+    if (matched != 8) {
+        return;
+    }
+
+    /* Ignore noisy EV drift when AE lock is off to avoid sync churn/freeze loops. */
+    if (exposure_lock == 0) {
+        pthread_mutex_lock(&context->lock);
+        exposure_compensation = context->control_exposure_compensation;
+        pthread_mutex_unlock(&context->lock);
+    }
+
+    bool changed = false;
+    pthread_mutex_lock(&context->lock);
+    if (context->control_exposure_lock != (exposure_lock != 0)
+        || context->control_focus_lock != (focus_lock != 0)
+        || context->control_exposure_compensation != exposure_compensation
+        || context->control_af_mode != af_mode
+        || context->control_af_lock != (af_lock != 0)
+        || context->control_flash_mode != flash_mode
+        || context->control_wb_mode != wb_mode
+        || context->control_wb_kelvin != wb_kelvin
+        || !context->pending_remote_control_state
+        || context->pending_exposure_lock != (exposure_lock != 0)
+        || context->pending_focus_lock != (focus_lock != 0)
+        || context->pending_exposure_compensation != exposure_compensation
+        || context->pending_af_mode != af_mode
+        || context->pending_af_lock != (af_lock != 0)
+        || context->pending_flash_mode != flash_mode
+        || context->pending_wb_mode != wb_mode
+        || context->pending_wb_kelvin != wb_kelvin) {
+        context->pending_remote_control_state = true;
+        context->pending_exposure_lock = (exposure_lock != 0);
+        context->pending_focus_lock = (focus_lock != 0);
+        context->pending_exposure_compensation = exposure_compensation;
+        context->pending_af_mode = af_mode;
+        context->pending_af_lock = (af_lock != 0);
+        context->pending_flash_mode = flash_mode;
+        context->pending_wb_mode = wb_mode;
+        context->pending_wb_kelvin = wb_kelvin;
+        changed = true;
+    }
+    pthread_mutex_unlock(&context->lock);
+    UNUSED_PARAMETER(changed);
+}
+
+static void uvc_custom_network_video_tick(void *data, float seconds)
+{
+    UNUSED_PARAMETER(seconds);
+    uvc_custom_network *context = (uvc_custom_network *)data;
+    if (!context) {
+        return;
+    }
+
+    pthread_mutex_lock(&context->lock);
+    if (!context->pending_remote_control_state) {
+        pthread_mutex_unlock(&context->lock);
+        return;
+    }
+
+    /* Apply Android state directly into control fields.
+     * We deliberately do NOT call obs_source_update() or obs_source_update_properties()
+     * here — doing so causes the OBS properties panel to rebuild every second
+     * (making it unusable) and overwrites any in-flight user edits before update()
+     * can detect them and send CONTROL to Android. */
+    context->control_exposure_lock        = context->pending_exposure_lock;
+    context->control_focus_lock           = context->pending_focus_lock;
+    context->control_exposure_compensation = context->pending_exposure_compensation;
+    context->control_af_mode              = context->pending_af_mode;
+    context->control_af_lock              = context->pending_af_lock;
+    context->control_flash_mode           = context->pending_flash_mode;
+    context->control_wb_mode              = context->pending_wb_mode;
+    context->control_wb_kelvin            = context->pending_wb_kelvin;
+    context->pending_remote_control_state = false;
+    pthread_mutex_unlock(&context->lock);
+}
+
+static void *uvc_custom_network_control_state_thread(void *data)
+{
+    uvc_custom_network *context = (uvc_custom_network *)data;
+    if (!context) {
+        return NULL;
+    }
+
+#ifdef _WIN32
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) {
+        context->control_state_running = false;
+        return NULL;
+    }
+    context->control_state_socket = sock;
+    BOOL reuse = TRUE;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof(reuse));
+    DWORD timeout_ms = 500;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout_ms, sizeof(timeout_ms));
+#else
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        context->control_state_running = false;
+        return NULL;
+    }
+    context->control_state_socket = sock;
+    int reuse = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 500000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_port = htons((uint16_t)CUSTOM_TALLY_PORT);
+    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(sock, (const struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+#ifdef _WIN32
+        closesocket(sock);
+        context->control_state_socket = INVALID_SOCKET;
+#else
+        close(sock);
+        context->control_state_socket = -1;
+#endif
+        context->control_state_running = false;
+        return NULL;
+    }
+
+    while (context->control_state_running) {
+        char buf[256];
+        struct sockaddr_in from_addr;
+#ifdef _WIN32
+        int from_len = (int)sizeof(from_addr);
+        int got = recvfrom(sock, buf, (int)sizeof(buf) - 1, 0,
+                           (struct sockaddr *)&from_addr, &from_len);
+#else
+        socklen_t from_len = (socklen_t)sizeof(from_addr);
+        ssize_t got = recvfrom(sock, buf, sizeof(buf) - 1, 0,
+                               (struct sockaddr *)&from_addr, &from_len);
+#endif
+        if (got <= 0) {
+            continue;
+        }
+
+        buf[got] = '\0';
+        if (strncmp(buf, "CONTROL_STATE;", 14) != 0) {
+            continue;
+        }
+
+        char host_expected[64] = {0};
+        pthread_mutex_lock(&context->lock);
+        if (context->host && context->host[0] != '\0') {
+            strncpy(host_expected, context->host, sizeof(host_expected) - 1);
+        }
+        pthread_mutex_unlock(&context->lock);
+        if (host_expected[0] != '\0') {
+            char from_ip[64] = {0};
+            const char *src = inet_ntop(AF_INET, &from_addr.sin_addr, from_ip, sizeof(from_ip));
+            if (!src || strcmp(from_ip, host_expected) != 0) {
+                continue;
+            }
+        }
+
+        uvc_custom_network_apply_remote_control_state(context, buf);
+    }
+
+#ifdef _WIN32
+    if (context->control_state_socket != INVALID_SOCKET) {
+        closesocket(context->control_state_socket);
+        context->control_state_socket = INVALID_SOCKET;
+    }
+#else
+    if (context->control_state_socket >= 0) {
+        close(context->control_state_socket);
+        context->control_state_socket = -1;
+    }
+#endif
+
+    return NULL;
+}
+
+static void uvc_custom_network_control_state_start(uvc_custom_network *context)
+{
+    if (!context || context->control_state_running) {
+        return;
+    }
+    context->control_state_running = true;
+#ifdef _WIN32
+    context->control_state_socket = INVALID_SOCKET;
+#else
+    context->control_state_socket = -1;
+#endif
+    pthread_create(&context->control_state_thread, NULL, uvc_custom_network_control_state_thread, context);
+}
+
+static void uvc_custom_network_control_state_stop(uvc_custom_network *context)
+{
+    if (!context || !context->control_state_running) {
+        return;
+    }
+
+    context->control_state_running = false;
+#ifdef _WIN32
+    if (context->control_state_socket != INVALID_SOCKET) {
+        closesocket(context->control_state_socket);
+        context->control_state_socket = INVALID_SOCKET;
+    }
+#else
+    if (context->control_state_socket >= 0) {
+        close(context->control_state_socket);
+        context->control_state_socket = -1;
+    }
+#endif
+
+    pthread_join(context->control_state_thread, NULL);
+}
+
 static void uvc_custom_network_receiver_stop(uvc_custom_network *context)
 {
     if (!context || !context->receiver_running) {
         return;
     }
+
+    uvc_custom_network_control_state_stop(context);
 
     context->receiver_running = false;
 
@@ -286,7 +616,7 @@ static void *uvc_custom_network_receiver_thread(void *data)
     pthread_mutex_unlock(&context->lock);
 
     if (!host || host[0] == '\0') {
-        blog(LOG_WARNING, "UVC H265 TCP: Phone IP is not set — enter it in the source Properties");
+        blog(LOG_WARNING, "UVC H265 TCP: Phone IP is not set — enter it in the source properties");
         bfree(host);
         context->receiver_running = false;
         return NULL;
@@ -295,8 +625,7 @@ static void *uvc_custom_network_receiver_thread(void *data)
     /* ----- initialise avcodec H.265 decoder ----- */
     const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
     if (!codec) {
-        blog(LOG_ERROR, "UVC H265 TCP: H.265 (HEVC) decoder not found — ensure FFmpeg is installed with H.265 support");
-        uvc_custom_network_set_status(context, "❌ H.265 decoder not found");
+        blog(LOG_ERROR, "UVC H265 TCP: avcodec H.265 decoder not found");
         bfree(host);
         context->receiver_running = false;
         return NULL;
@@ -307,8 +636,7 @@ static void *uvc_custom_network_receiver_thread(void *data)
     AVCodecContext *decoder = NULL;
 
     if (!pkt || !frame) {
-        blog(LOG_ERROR, "UVC H265 TCP: failed to allocate FFmpeg structures");
-        uvc_custom_network_set_status(context, "❌ FFmpeg memory allocation failed");
+        blog(LOG_ERROR, "UVC H265 TCP: failed to allocate avcodec packet/frame");
         av_packet_free(&pkt);
         av_frame_free(&frame);
         bfree(host);
@@ -316,15 +644,17 @@ static void *uvc_custom_network_receiver_thread(void *data)
         return NULL;
     }
 
-    blog(LOG_INFO, "UVC H265 TCP: attempting to connect to Android at %s:%d...", host, port);
+    blog(LOG_INFO, "UVC H265 TCP: connecting to Android at %s:%d", host, port);
 
     /* outer loop: reconnect on disconnect */
     while (context->receiver_running) {
 #ifdef _WIN32
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        SOCKET tally_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (sock == INVALID_SOCKET) {
 #else
         int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        int tally_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (sock < 0) {
 #endif
             blog(LOG_WARNING, "UVC H265 TCP: socket() failed");
@@ -340,25 +670,33 @@ static void *uvc_custom_network_receiver_thread(void *data)
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         addr.sin_port   = htons((uint16_t)port);
-        if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
-            blog(LOG_WARNING, "UVC H265 TCP: invalid phone IP '%s' — check source settings and ensure it's a valid IPv4 address", host);
-            uvc_custom_network_set_status(context, "❌ Invalid phone IP address");
+
+        struct sockaddr_in tally_addr;
+        memset(&tally_addr, 0, sizeof(tally_addr));
+        tally_addr.sin_family = AF_INET;
+        tally_addr.sin_port = htons((uint16_t)CUSTOM_TALLY_PORT);
+
+        if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0 || inet_pton(AF_INET, host, &tally_addr.sin_addr) <= 0) {
+            blog(LOG_WARNING, "UVC H265 TCP: invalid phone IP '%s' — check source settings", host);
 #ifdef _WIN32
             closesocket(sock);
+            if (tally_sock != INVALID_SOCKET) closesocket(tally_sock);
 #else
             close(sock);
+            if (tally_sock >= 0) close(tally_sock);
 #endif
             for (int i = 0; i < 40 && context->receiver_running; i++) os_sleep_ms(50);
             continue;
         }
 
         if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            blog(LOG_INFO, "UVC H265 TCP: connect to %s:%d failed — phone may not be running the app or firewall may be blocking (retrying...)", host, port);
-            uvc_custom_network_set_status(context, "⚠ Cannot connect to %s:%d — check phone IP/port", host, port);
+            blog(LOG_INFO, "UVC H265 TCP: connect to %s:%d failed, retrying...", host, port);
 #ifdef _WIN32
             closesocket(sock);
+            if (tally_sock != INVALID_SOCKET) closesocket(tally_sock);
 #else
             close(sock);
+            if (tally_sock >= 0) close(tally_sock);
 #endif
             for (int i = 0; i < 40 && context->receiver_running; i++) os_sleep_ms(50);
             continue;
@@ -368,9 +706,9 @@ static void *uvc_custom_network_receiver_thread(void *data)
         int nodelay = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&nodelay, sizeof(nodelay));
 
+
         context->receiver_socket = sock;
-        blog(LOG_INFO, "UVC H265 TCP: ✓ successfully connected to Android at %s:%d — waiting for video stream...", host, port);
-        uvc_custom_network_set_status(context, "✓ Connected to %s:%d — waiting for video...", host, port);
+        blog(LOG_INFO, "UVC H265 TCP: connected to Android %s:%d", host, port);
 
         /* fresh H.265 decoder for each connection */
         if (decoder) { avcodec_free_context(&decoder); decoder = NULL; }
@@ -384,9 +722,11 @@ static void *uvc_custom_network_receiver_thread(void *data)
 #ifdef _WIN32
             closesocket(sock);
             context->receiver_socket = INVALID_SOCKET;
+            if (tally_sock != INVALID_SOCKET) closesocket(tally_sock);
 #else
             close(sock);
             context->receiver_socket = -1;
+            if (tally_sock >= 0) close(tally_sock);
 #endif
             for (int i = 0; i < 40 && context->receiver_running; i++) os_sleep_ms(50);
             continue;
@@ -398,6 +738,8 @@ static void *uvc_custom_network_receiver_thread(void *data)
 
         /* inner receive/decode loop */
         while (context->receiver_running) {
+            uvc_custom_network_send_tally(context, tally_sock, &tally_addr, false);
+
             uint8_t header[12];
             if (!tcp_recv_all(sock, header, 12)) {
                 if (context->receiver_running)
@@ -513,16 +855,27 @@ static void *uvc_custom_network_receiver_thread(void *data)
             }
         } /* inner loop */
 
+        /* force send neutral tally on disconnect */
+        context->tally_program = true;
+        context->tally_preview = true;
+        uvc_custom_network_send_tally(context, tally_sock, &tally_addr, true);
+
         /* close the socket — guard against double-close with receiver_stop */
 #ifdef _WIN32
         if (context->receiver_socket != INVALID_SOCKET) {
             closesocket(sock);
             context->receiver_socket = INVALID_SOCKET;
         }
+        if (tally_sock != INVALID_SOCKET) {
+            closesocket(tally_sock);
+        }
 #else
         if (context->receiver_socket >= 0) {
             close(sock);
             context->receiver_socket = -1;
+        }
+        if (tally_sock >= 0) {
+            close(tally_sock);
         }
 #endif
 
@@ -547,11 +900,6 @@ static void uvc_custom_network_discovery_callback(const char *host, int port, vo
         return;
     }
 
-    bool should_sync_settings = false;
-    int selected_index_for_sync = -1;
-    char *host_for_sync = NULL;
-    int port_for_sync = 0;
-
     pthread_mutex_lock(&context->lock);
     bool added = uvc_custom_network_add_discovered_device(context, host, port);
     int count = context->discovered_device_count;
@@ -568,39 +916,16 @@ static void uvc_custom_network_discovery_callback(const char *host, int port, vo
     if (added) {
         blog(LOG_INFO, "UVC Custom Network: discovered device %s:%d", host, port);
         if (count == 1) {
-            uvc_custom_network_set_status(context, "Found 1 device: %s:%d (selected automatically)", host, port);
+            uvc_custom_network_set_status(context, "Discovered 1 device: %s:%d", host, port);
         } else {
-            uvc_custom_network_set_status(context, "Found %d devices, latest: %s:%d", count, host, port);
+            uvc_custom_network_set_status(context, "Discovered %d devices", count);
         }
-
-        if (context->source && context->selected_device_index >= 0
-                && context->selected_device_index < context->discovered_device_count) {
-            should_sync_settings = true;
-            selected_index_for_sync = context->selected_device_index;
-            host_for_sync = bstrdup(context->host ? context->host : "");
-            port_for_sync = context->port;
-        }
-
         if (!context->receiver_running && context->port > 0 && context->host && context->host[0] != '\0') {
-            blog(LOG_INFO, "UVC H265 TCP: auto-starting receiver for discovered device %s:%d", host, port);
             uvc_custom_network_start_receiver(context);
         }
     }
 
     pthread_mutex_unlock(&context->lock);
-
-    /* Keep OBS source settings in sync so each source remembers its selected target. */
-    if (should_sync_settings && context->source) {
-        obs_data_t *settings = obs_source_get_settings(context->source);
-        if (settings) {
-            obs_data_set_string(settings, "host", host_for_sync ? host_for_sync : "");
-            obs_data_set_int(settings, "port", port_for_sync);
-            obs_data_set_int(settings, "selected_device_index", selected_index_for_sync);
-            obs_source_update(context->source, settings);
-            obs_data_release(settings);
-        }
-    }
-    bfree(host_for_sync);
 }
 
 static void uvc_custom_network_start_receiver(uvc_custom_network *context)
@@ -618,6 +943,7 @@ static void uvc_custom_network_start_receiver(uvc_custom_network *context)
     context->receiver_socket = -1;
 #endif
     pthread_create(&context->receiver_thread, NULL, uvc_custom_network_receiver_thread, context);
+    uvc_custom_network_control_state_start(context);
 }
 
 static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *source)
@@ -633,24 +959,46 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
     context->fps = (int)obs_data_get_int(settings, "fps");
     context->quality = (int)obs_data_get_int(settings, "quality");
     context->discovery_enabled = obs_data_get_bool(settings, "discovery_enabled");
+    context->control_exposure_lock = obs_data_get_bool(settings, "exposure_lock");
+    context->control_focus_lock = obs_data_get_bool(settings, "focus_lock");
+    context->control_exposure_compensation = (int)obs_data_get_int(settings, "exposure_compensation");
+    context->control_af_mode = (int)obs_data_get_int(settings, "af_mode");
+    context->control_af_lock = obs_data_get_bool(settings, "af_lock");
+    context->control_flash_mode = (int)obs_data_get_int(settings, "flash_mode");
+    context->control_wb_mode = (int)obs_data_get_int(settings, "wb_mode");
+    context->control_wb_kelvin = (int)obs_data_get_int(settings, "wb_kelvin");
+    context->suppress_next_control_send = false;
+    context->pending_remote_control_state = false;
+    context->pending_exposure_lock = context->control_exposure_lock;
+    context->pending_focus_lock = context->control_focus_lock;
+    context->pending_exposure_compensation = context->control_exposure_compensation;
+    context->pending_af_mode = context->control_af_mode;
+    context->pending_af_lock = context->control_af_lock;
+    context->pending_flash_mode = context->control_flash_mode;
+    context->pending_wb_mode = context->control_wb_mode;
+    context->pending_wb_kelvin = context->control_wb_kelvin;
     context->discovery = NULL;
 #ifdef _WIN32
     context->receiver_socket = INVALID_SOCKET;
+    context->control_state_socket = INVALID_SOCKET;
 #else
     context->receiver_socket = -1;
+    context->control_state_socket = -1;
 #endif
     context->receiver_running = false;
+    context->control_state_running = false;
     context->width = 0;
     context->height = 0;
+    context->tally_program = false;
+    context->tally_preview = false;
+    context->last_tally_send_ns = 0;
+    context->last_remote_apply_ns = 0;
     context->discovery_status = bstrdup("Idle");
 
     if (context->discovery_enabled) {
         context->discovery = network_discovery_create("uvc_custom_network", CUSTOM_DISCOVERY_PORT,
                                                     uvc_custom_network_discovery_callback, context);
         network_discovery_start(context->discovery);
-        uvc_custom_network_set_status(context, "🔍 Discovery listening on port 8866...");
-    } else {
-        uvc_custom_network_set_status(context, "ℹ Discovery disabled (enable in Properties)");
     }
 
     // Auto-start receiver if phone IP and port are already configured
@@ -658,7 +1006,6 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
         blog(LOG_INFO, "UVC H265 TCP: auto-starting receiver (connecting to %s:%d)",
              context->host, context->port);
         uvc_custom_network_start_receiver(context);
-        uvc_custom_network_set_status(context, "↻ Connecting to %s:%d...", context->host, context->port);
     }
 
     return context;
@@ -687,78 +1034,71 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
     obs_properties_t *props = obs_properties_create();
     obs_property_t *p;
 
-    // Discovery section
-    p = obs_properties_add_bool(props, "discovery_enabled", "Enable Auto-Discovery");
-    obs_property_set_long_description(p, 
-        "When enabled, OBS will automatically discover your Android device on the network. "
-        "Ensure 'Enable Network Discovery' is also enabled in the Android app settings.");
-    UNUSED_PARAMETER(p);
-
-    p = obs_properties_add_text(props, "discovery_status", "Discovery Status", OBS_TEXT_INFO);
-    obs_property_set_long_description(p, "Shows the current auto-discovery status and any devices found.");
-    UNUSED_PARAMETER(p);
-
-    p = obs_properties_add_button(props, "refresh_discovery", "🔄 Refresh Discovery", 
-                                  (obs_property_clicked_t)uvc_custom_network_refresh_button);
-    obs_property_set_long_description(p, "Manually scan for Android devices broadcasting on the network.");
-    UNUSED_PARAMETER(p);
-
-    // Device selection
     p = obs_properties_add_list(props, "selected_device_index", "Discovered Device", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     if (p) {
         if (context->discovered_device_count == 0) {
-            obs_property_list_add_int(p, "(Enable Discovery and click Refresh)", -1);
-            obs_property_set_long_description(p,
-                "No discovered devices yet. Enable discovery in Android app and click Refresh Discovery.");
+            obs_property_list_add_int(p, "No devices discovered", -1);
+            obs_property_set_enabled(p, false);
         } else {
             for (int i = 0; i < context->discovered_device_count; i++) {
                 obs_property_list_add_int(p, context->discovered_devices[i].label, i);
             }
-            obs_property_set_long_description(p,
-                "Select a discovered device to auto-fill IP/port and reconnect.");
         }
     }
 
-    // Manual connection (advanced)
-    obs_properties_add_text(props, "host", "📱 Phone IP Address", OBS_TEXT_DEFAULT);
-    obs_properties_add_int(props, "port", "Stream Port", 1024, 65535, 1);
-
-    // Connection control
-    p = obs_properties_add_button(props, "activate", "📡 Connect", 
-                                  (obs_property_clicked_t)uvc_custom_network_activate_button);
-    obs_property_set_long_description(p, 
-        "Manually connect to the Android device. "
-        "This button will not disconnect if already connected.");
+    p = obs_properties_add_text(props, "host", "Phone IP", OBS_TEXT_DEFAULT);
+    UNUSED_PARAMETER(p);
+    p = obs_properties_add_int(props, "port", "Stream Port", 1024, 65535, 1);
     UNUSED_PARAMETER(p);
 
-    p = obs_properties_add_button(props, "disconnect", "⏹ Disconnect",
-                                  (obs_property_clicked_t)uvc_custom_network_disconnect_button);
-    obs_property_set_long_description(p,
-        "Manually stop and disconnect the current stream connection.");
+    p = obs_properties_add_text(props, "discovery_status", "Discovery Status", OBS_TEXT_INFO);
     UNUSED_PARAMETER(p);
 
-    // Stream settings
-    p = obs_properties_add_list(props, "resolution_index", "Expected Resolution", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    p = obs_properties_add_button(props, "activate", "Activate", (obs_property_clicked_t)uvc_custom_network_activate_button);
+    UNUSED_PARAMETER(p);
+
+    p = obs_properties_add_button(props, "refresh_discovery", "Refresh Discovery", (obs_property_clicked_t)uvc_custom_network_refresh_button);
+    UNUSED_PARAMETER(p);
+
+    p = obs_properties_add_list(props, "resolution_index", "Resolution", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     for (int i = 0; i < (int)(sizeof(RESOLUTIONS) / sizeof(RESOLUTIONS[0])); i++) {
         obs_property_list_add_int(p, RESOLUTIONS[i], i);
     }
-    obs_property_set_long_description(p, 
-        "Select the expected video resolution from the Android device. "
-        "This is used before the first frame arrives. "
-        "The source will auto-adjust when actual frames are received.");
-    UNUSED_PARAMETER(p);
 
-    p = obs_properties_add_int(props, "fps", "Expected FPS", 15, 60, 1);
-    obs_property_set_long_description(p, 
-        "Expected frame rate from the Android device (informational only). "
-        "Actual FPS is determined by the Android device settings.");
-    UNUSED_PARAMETER(p);
-
-    p = obs_properties_add_int(props, "quality", "Encoder Quality (1-100)", 1, 100, 1);
-    obs_property_set_long_description(p, 
-        "Quality hint for the Android encoder (0-100). Higher = better quality but larger file size. "
-        "This is a guide; actual bitrate is adaptive based on network conditions.");
-    UNUSED_PARAMETER(p);
+    obs_properties_add_int(props, "fps", "FPS", 15, 60, 1);
+    obs_properties_add_int(props, "quality", "Quality", 1, 100, 1);
+    obs_properties_add_bool(props, "exposure_lock", "Exposure Lock");
+    obs_properties_add_int(props, "exposure_compensation", "Exposure Compensation", -10, 10, 1);
+    obs_properties_add_bool(props, "focus_lock", "Focus Lock");
+    p = obs_properties_add_list(props, "af_mode", "Autofocus Mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    if (p) {
+        obs_property_list_add_int(p, "Off", 0);
+        obs_property_list_add_int(p, "Auto", 1);
+        obs_property_list_add_int(p, "Continuous", 2);
+        obs_property_list_add_int(p, "Tap", 3);
+        obs_property_list_add_int(p, "Infinity", 4);
+        obs_property_list_add_int(p, "Macro", 5);
+    }
+    obs_properties_add_bool(props, "af_lock", "AF Lock");
+    p = obs_properties_add_list(props, "flash_mode", "Flash Mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    if (p) {
+        obs_property_list_add_int(p, "Auto", 0);
+        obs_property_list_add_int(p, "On", 1);
+        obs_property_list_add_int(p, "Off", 2);
+        obs_property_list_add_int(p, "Torch", 3);
+    }
+    p = obs_properties_add_list(props, "wb_mode", "White Balance", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    if (p) {
+        obs_property_list_add_int(p, "Auto", 0);
+        obs_property_list_add_int(p, "Incandescent", 1);
+        obs_property_list_add_int(p, "Fluorescent", 2);
+        obs_property_list_add_int(p, "Daylight", 3);
+        obs_property_list_add_int(p, "Cloudy", 4);
+        obs_property_list_add_int(p, "Shade", 5);
+        obs_property_list_add_int(p, "Kelvin", 6);
+    }
+    obs_properties_add_int(props, "wb_kelvin", "White Balance Kelvin", 1000, 10000, 100);
+    obs_properties_add_bool(props, "discovery_enabled", "Enable Network Discovery");
 
     return props;
 }
@@ -769,8 +1109,6 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     network_discovery_t *old_discovery = NULL;
     bool need_discovery_start = false;
     bool need_receiver_restart = false;
-    bool need_receiver_start = false;
-    bool need_receiver_stop = false;
 
     pthread_mutex_lock(&context->lock);
 
@@ -806,6 +1144,30 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     context->resolution_index = (int)obs_data_get_int(settings, "resolution_index");
     context->fps = (int)obs_data_get_int(settings, "fps");
     context->quality = (int)obs_data_get_int(settings, "quality");
+    bool exposure_lock = obs_data_get_bool(settings, "exposure_lock");
+    bool focus_lock = obs_data_get_bool(settings, "focus_lock");
+    int exposure_compensation = (int)obs_data_get_int(settings, "exposure_compensation");
+    int af_mode = (int)obs_data_get_int(settings, "af_mode");
+    bool af_lock = obs_data_get_bool(settings, "af_lock");
+    int flash_mode = (int)obs_data_get_int(settings, "flash_mode");
+    int wb_mode = (int)obs_data_get_int(settings, "wb_mode");
+    int wb_kelvin = (int)obs_data_get_int(settings, "wb_kelvin");
+
+    bool send_control = false;
+    if (exposure_lock != context->control_exposure_lock || focus_lock != context->control_focus_lock || exposure_compensation != context->control_exposure_compensation
+            || af_mode != context->control_af_mode || af_lock != context->control_af_lock || flash_mode != context->control_flash_mode
+            || wb_mode != context->control_wb_mode || wb_kelvin != context->control_wb_kelvin) {
+        context->control_exposure_lock = exposure_lock;
+        context->control_focus_lock = focus_lock;
+        context->control_exposure_compensation = exposure_compensation;
+        context->control_af_mode = af_mode;
+        context->control_af_lock = af_lock;
+        context->control_flash_mode = flash_mode;
+        context->control_wb_mode = wb_mode;
+        context->control_wb_kelvin = wb_kelvin;
+        send_control = true;
+    }
+
     bool discovery_enabled = obs_data_get_bool(settings, "discovery_enabled");
 
     if (discovery_enabled && !context->discovery) {
@@ -815,19 +1177,8 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
         context->discovery = NULL;
     }
 
-    bool has_target = context->port > 0 && context->host && context->host[0] != '\0';
-
-    if (port_changed || host_changed) {
-        if (context->receiver_running) {
-            need_receiver_restart = true;
-        } else if (has_target) {
-            /* Reconnect even if a previous thread exited after a bad IP/port. */
-            need_receiver_start = true;
-        }
-    }
-
-    if (!has_target && context->receiver_running) {
-        need_receiver_stop = true;
+    if ((port_changed || host_changed) && context->receiver_running) {
+        need_receiver_restart = true;
     }
 
     pthread_mutex_unlock(&context->lock);
@@ -837,28 +1188,11 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
         network_discovery_destroy(old_discovery);
     }
 
-    if (need_receiver_stop) {
-        uvc_custom_network_receiver_stop(context);
-        pthread_mutex_lock(&context->lock);
-        uvc_custom_network_set_status(context, "Stream stopped (missing host/port)");
-        pthread_mutex_unlock(&context->lock);
-    }
-
     if (need_receiver_restart) {
         uvc_custom_network_receiver_stop(context);
         pthread_mutex_lock(&context->lock);
-        if (context->port > 0 && context->host && context->host[0] != '\0') {
+        if (context->port > 0) {
             uvc_custom_network_start_receiver(context);
-            uvc_custom_network_set_status(context, "Reconnecting to %s:%d...", context->host, context->port);
-        }
-        pthread_mutex_unlock(&context->lock);
-    }
-
-    if (need_receiver_start) {
-        pthread_mutex_lock(&context->lock);
-        if (!context->receiver_running && context->port > 0 && context->host && context->host[0] != '\0') {
-            uvc_custom_network_start_receiver(context);
-            uvc_custom_network_set_status(context, "Connecting to %s:%d...", context->host, context->port);
         }
         pthread_mutex_unlock(&context->lock);
     }
@@ -868,8 +1202,11 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
         context->discovery = network_discovery_create("uvc_custom_network", CUSTOM_DISCOVERY_PORT,
                                                     uvc_custom_network_discovery_callback, context);
         network_discovery_start(context->discovery);
-        uvc_custom_network_set_status(context, "Discovery enabled, waiting for Android beacons...");
         pthread_mutex_unlock(&context->lock);
+    }
+
+    if (send_control && context->host && context->host[0] != '\0') {
+        uvc_custom_network_send_control(context);
     }
 
     UNUSED_PARAMETER(host_changed);
@@ -910,6 +1247,14 @@ static uint32_t uvc_custom_network_get_height(void *data)
 static void uvc_custom_network_defaults(obs_data_t *settings)
 {
     obs_data_set_default_bool(settings, "discovery_enabled", true);
+    obs_data_set_default_bool(settings, "exposure_lock", false);
+    obs_data_set_default_bool(settings, "focus_lock", false);
+    obs_data_set_default_int(settings, "exposure_compensation", 0);
+    obs_data_set_default_int(settings, "af_mode", 2);
+    obs_data_set_default_bool(settings, "af_lock", false);
+    obs_data_set_default_int(settings, "flash_mode", 2);
+    obs_data_set_default_int(settings, "wb_mode", 0);
+    obs_data_set_default_int(settings, "wb_kelvin", 4500);
     obs_data_set_default_int(settings, "port", 5600);
     obs_data_set_default_int(settings, "fps", 30);
     obs_data_set_default_int(settings, "quality", 50);
@@ -931,6 +1276,7 @@ extern "C" bool obs_module_load(void)
     uvc_custom_network_info.get_defaults = uvc_custom_network_defaults;
     uvc_custom_network_info.get_properties = uvc_custom_network_properties;
     uvc_custom_network_info.update = uvc_custom_network_update;
+    uvc_custom_network_info.video_tick = uvc_custom_network_video_tick;
 
     obs_register_source(&uvc_custom_network_info);
     blog(LOG_INFO, "Loaded UVC Custom Network OBS plugin");

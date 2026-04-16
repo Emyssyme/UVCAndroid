@@ -29,6 +29,26 @@ struct uvc_custom_network {
     int quality;
     bool discovery_enabled;
 
+    bool control_exposure_lock;
+    bool control_focus_lock;
+    int control_exposure_compensation;
+    int control_af_mode;
+    bool control_af_lock;
+    int control_flash_mode;
+    int control_wb_mode;
+    int control_wb_kelvin;
+    bool suppress_next_control_send;
+
+    bool pending_remote_control_state;
+    bool pending_exposure_lock;
+    bool pending_focus_lock;
+    int pending_exposure_compensation;
+    int pending_af_mode;
+    bool pending_af_lock;
+    int pending_flash_mode;
+    int pending_wb_mode;
+    int pending_wb_kelvin;
+
     char *discovery_status;
     network_discovery_t *discovery;
 
@@ -36,13 +56,23 @@ struct uvc_custom_network {
     pthread_t receiver_thread;
 #ifdef _WIN32
     SOCKET receiver_socket;
+    SOCKET control_state_socket;
 #else
     int receiver_socket;
+    int control_state_socket;
 #endif
+    bool control_state_running;
+    pthread_t control_state_thread;
 
     // last known frame dimensions (updated on each received frame)
     uint32_t width;
     uint32_t height;
+
+    // last sent tally state (OBS -> Android UDP backchannel)
+    bool tally_program;
+    bool tally_preview;
+    uint64_t last_tally_send_ns;
+    uint64_t last_remote_apply_ns;
 };
 
 obs_source_info *get_uvc_custom_network_info();

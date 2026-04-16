@@ -18,12 +18,15 @@ import android.view.Menu;
 import android.view.MenuItem;
 import android.view.Surface;
 import android.widget.EditText;
+import android.widget.LinearLayout;
 import android.widget.SeekBar;
+import android.widget.TextView;
 import android.util.Range;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
+import com.google.android.material.bottomsheet.BottomSheetDialog;
 
 import com.google.gson.Gson;
 import com.herohan.uvcapp.ImageCapture;
@@ -229,12 +232,13 @@ public class MainActivity extends AppCompatActivity {
     private volatile int mH264EncoderWidth = 0;
     private volatile int mH264EncoderHeight = 0;
     private volatile byte[] mH264SpsPps;
+    private volatile boolean mH264SyncFrameRequested = false;
     private final byte[] mH264FrameHeaderBuf = new byte[12];
     private byte[] mH264EncodeBuffer;          // reused NV12 input — allocated once per resolution
     private byte[] mH264OutputBuffer = new byte[2 * 1024 * 1024]; // reused encoded-packet buffer
     private Thread mTcpUdpWorkerThread;
     private volatile boolean mTcpUdpWorkerRunning = false;
-    private final java.util.concurrent.ArrayBlockingQueue<CustomUdpFrame> mTcpUdpFrameQueue = new java.util.concurrent.ArrayBlockingQueue<>(3);
+    private final java.util.concurrent.ArrayBlockingQueue<CustomUdpFrame> mTcpUdpFrameQueue = new java.util.concurrent.ArrayBlockingQueue<>(6);
     private int mTcpUdpTargetFps = 30;
     private long mTcpUdpMinFrameIntervalNs = 0;
     private long mLastTcpUdpEnqueueTimeNs = 0;
@@ -259,6 +263,11 @@ public class MainActivity extends AppCompatActivity {
     private volatile boolean mTcpObsProgram = false;
     private volatile boolean mTcpObsPreview = false;
     private volatile long mTcpLastTallyUpdateNs = 0;
+    private volatile String mTcpTallyRemoteHost = null;
+    private volatile String mLastSentControlStatePayload = "";
+    private volatile long mLastSentControlStateNs = 0;
+    private volatile String mLastProcessedTcpControlPayload = "";
+    private volatile long mLastProcessedTcpControlNs = 0;
     private static final long TCP_TALLY_STALE_TIMEOUT_MS = 1500;
     private Thread mTcpDiscoveryThread;
     private volatile boolean mTcpDiscoveryRunning = false;
@@ -280,6 +289,19 @@ public class MainActivity extends AppCompatActivity {
     // from onClosed() instead of racing with the close.
     private InternalCameraInfo   mPendingOpenCamera;
     private android.util.Size    mPendingOpenSize;
+
+    private boolean mInternalExposureLock = false;
+    private boolean mInternalAeLock = false;
+    private boolean mInternalFocusLock = false;
+    private int mInternalFocusLockPreviousAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+    private boolean mInternalFocusLockPreviousTapToFocus = false;
+    private int mInternalAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+    private boolean mInternalAfLock = false;
+    private int mInternalAfLockPreviousAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+    private boolean mInternalAfLockPreviousTapToFocus = false;
+    private int mInternalFlashMode = CaptureRequest.FLASH_MODE_OFF;
+    private int mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO;
+    private int mInternalWbKelvin = 4500;
 
     private InternalCameraListDialogFragment       mInternalCameraListDialog;
     private InternalCameraResolutionDialogFragment mInternalResolutionDialog;
@@ -1695,8 +1717,9 @@ public class MainActivity extends AppCompatActivity {
                 mBinding.tvVideoRecordTime.setVisibility(View.GONE);
             }
 
-mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.GONE);
-            mBinding.internalCameraQuickButtons.setVisibility(internalShown ? View.VISIBLE : View.GONE);
+            mBinding.internalCameraControls.setVisibility(View.GONE);
+            mBinding.internalCameraQuickButtons.setVisibility(View.GONE);
+            mBinding.internalCameraBottomBar.setVisibility(internalShown ? View.VISIBLE : View.GONE);
             if (internalShown) {
                 updateInternalCameraControlPanel();
             }
@@ -1809,6 +1832,7 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
             if (mInternalCameraHelper == null) return;
             boolean awbAuto = !mInternalCameraHelper.isAwbAuto();
             mInternalCameraHelper.setAwbAuto(awbAuto);
+            mInternalWbMode = awbAuto ? CaptureRequest.CONTROL_AWB_MODE_AUTO : CaptureRequest.CONTROL_AWB_MODE_OFF;
             mBinding.btnInternalAwbToggle.setText(awbAuto ? getString(R.string.internal_camera_awb_auto) : getString(R.string.internal_camera_awb_off));
             mBinding.btnQuickAwb.setText(awbAuto ? "AWB Auto" : "AWB Manual");
             mBinding.tvInternalKelvinValue.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
@@ -1819,6 +1843,7 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
             if (mInternalCameraHelper == null) return;
             boolean awbAuto = !mInternalCameraHelper.isAwbAuto();
             mInternalCameraHelper.setAwbAuto(awbAuto);
+            mInternalWbMode = awbAuto ? CaptureRequest.CONTROL_AWB_MODE_AUTO : CaptureRequest.CONTROL_AWB_MODE_OFF;
             mBinding.btnInternalAwbToggle.setText(awbAuto ? getString(R.string.internal_camera_awb_auto) : getString(R.string.internal_camera_awb_off));
             mBinding.btnQuickAwb.setText(awbAuto ? "AWB Auto" : "AWB Manual");
             mBinding.tvInternalKelvinValue.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
@@ -1830,13 +1855,16 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
             if (mInternalCameraHelper.isTapToFocusMode()) {
                 mInternalCameraHelper.setTapToFocusMode(false);
                 mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+                mInternalAfMode = 0;
                 mBinding.btnInternalAfToggle.setText("AF: Off");
             } else if (mInternalCameraHelper.getAfMode() == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
                 mInternalCameraHelper.setTapToFocusMode(true);
+                mInternalAfMode = 3;
                 mBinding.btnInternalAfToggle.setText("AF: Tap");
             } else {
                 mInternalCameraHelper.setTapToFocusMode(false);
                 mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+                mInternalAfMode = 2;
                 mBinding.btnInternalAfToggle.setText("AF: Auto");
             }
             mBinding.btnQuickAf.setText(mInternalCameraHelper.isTapToFocusMode() ? "AF Tap" :
@@ -1848,19 +1876,45 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
             if (mInternalCameraHelper.isTapToFocusMode()) {
                 mInternalCameraHelper.setTapToFocusMode(false);
                 mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+                mInternalAfMode = 0;
                 mBinding.btnQuickAf.setText("AF Off");
                 mBinding.btnInternalAfToggle.setText("AF: Off");
             } else if (mInternalCameraHelper.getAfMode() == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
                 mInternalCameraHelper.setTapToFocusMode(true);
+                mInternalAfMode = 3;
                 mBinding.btnQuickAf.setText("AF Tap");
                 mBinding.btnInternalAfToggle.setText("AF: Tap");
             } else {
                 mInternalCameraHelper.setTapToFocusMode(false);
                 mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+                mInternalAfMode = 2;
                 mBinding.btnQuickAf.setText("AF Auto");
                 mBinding.btnInternalAfToggle.setText("AF: Auto");
             }
         });
+
+        mBinding.btnBottomSelectCamera.setOnClickListener(v -> showInternalCameraListDialog());
+        mBinding.btnBottomExposure.setOnClickListener(v -> showExposureDialog());
+        mBinding.btnBottomExposureLock.setOnClickListener(v -> {
+            mInternalExposureLock = !mInternalExposureLock;
+            if (mInternalCameraHelper != null && mCameraMode == CameraMode.INTERNAL) {
+                if (mInternalExposureLock) {
+                    if (!mInternalCameraHelper.isAeAuto()) {
+                        mInternalCameraHelper.setAeAuto(true);
+                    }
+                    int currentCompensation = mInternalCameraHelper.getCurrentExposureCompensation();
+                    mInternalCameraHelper.setExposureCompensation(currentCompensation);
+                    mInternalCameraHelper.setAeLock(true);
+                } else {
+                    mInternalCameraHelper.setAeLock(false);
+                }
+            }
+            updateInternalCameraControlPanel();
+        });
+        mBinding.btnBottomAfMode.setOnClickListener(v -> showAfModeDialog());
+        mBinding.btnBottomFocusLock.setOnClickListener(v -> setInternalFocusLock(!mInternalFocusLock));
+        mBinding.btnBottomFlash.setOnClickListener(v -> showFlashDialog());
+        mBinding.btnBottomWhiteBalance.setOnClickListener(v -> showWhiteBalanceDialog());
     }
 
     private void updateInternalCameraControlPanel() {
@@ -1912,6 +1966,7 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
         boolean awbAuto = mInternalCameraHelper.isAwbAuto();
         mBinding.btnInternalAwbToggle.setText(awbAuto ? getString(R.string.internal_camera_awb_auto) : getString(R.string.internal_camera_awb_off));
         mBinding.btnQuickAwb.setText(awbAuto ? "AWB Auto" : "AWB Manual");
+        mBinding.btnBottomWhiteBalance.setText("WB");
         mBinding.tvInternalKelvinValue.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
         mBinding.seekbarInternalKelvin.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
         if (!awbAuto) {
@@ -1920,15 +1975,494 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
             mBinding.seekbarInternalKelvin.setProgress((kelvin - 2000) * 100 / 8000);
         }
 
+        int afMode = mInternalCameraHelper.getAfMode();
         if (mInternalCameraHelper.isTapToFocusMode()) {
             mBinding.btnInternalAfToggle.setText("AF: Tap");
             mBinding.btnQuickAf.setText("AF Tap");
-        } else if (mInternalCameraHelper.getAfMode() == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
+            mBinding.btnBottomAfMode.setText(mInternalAfLock ? "AF Locked" : "AF Tap");
+        } else if (afMode == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
             mBinding.btnInternalAfToggle.setText("AF: Auto");
             mBinding.btnQuickAf.setText("AF Auto");
+            mBinding.btnBottomAfMode.setText(mInternalAfLock ? "AF Locked" : "AF Auto");
         } else {
             mBinding.btnInternalAfToggle.setText("AF: Off");
             mBinding.btnQuickAf.setText("AF Off");
+            mBinding.btnBottomAfMode.setText(mInternalAfLock ? "AF Locked" : "AF Off");
+        }
+
+        mBinding.btnBottomExposure.setText("EV");
+        mBinding.btnBottomExposureLock.setText("EV-L");
+        mBinding.btnBottomAfMode.setText("AF");
+        mBinding.btnBottomFocusLock.setText("AF-L");
+        mBinding.btnBottomWhiteBalance.setText("WB");
+        mBinding.btnBottomFlash.setText("FL");
+        mBinding.btnBottomExposureLock.setSelected(mInternalExposureLock);
+        mBinding.btnBottomFocusLock.setSelected(mInternalFocusLock);
+        mBinding.btnBottomExposure.setEnabled(!mInternalExposureLock);
+        mBinding.btnBottomAfMode.setEnabled(!mInternalAfLock);
+        int activeColor = Color.parseColor("#FFD54F");
+        int inactiveColor = Color.parseColor("#FFFFFF");
+        int activeBackground = Color.parseColor("#88FFC107");
+        int inactiveBackground = Color.parseColor("#55000000");
+        mBinding.btnBottomExposureLock.setTextColor(mInternalExposureLock ? activeColor : inactiveColor);
+        mBinding.btnBottomFocusLock.setTextColor(mInternalFocusLock ? activeColor : inactiveColor);
+        mBinding.btnBottomExposureLock.setBackgroundTintList(android.content.res.ColorStateList.valueOf(mInternalExposureLock ? activeBackground : inactiveBackground));
+        mBinding.btnBottomFocusLock.setBackgroundTintList(android.content.res.ColorStateList.valueOf(mInternalFocusLock ? activeBackground : inactiveBackground));
+    }
+
+    private void showExposureDialog() {
+        if (mInternalCameraHelper == null) return;
+
+        Range<Integer> aeRange = mInternalCameraHelper.getAeCompensationRange();
+        if (aeRange == null) return;
+
+        int current = mInternalCameraHelper.getCurrentExposureCompensation();
+        int min = aeRange.getLower();
+        int max = aeRange.getUpper();
+
+        BottomSheetDialog dialog = new BottomSheetDialog(this);
+        dialog.setCancelable(true);
+        dialog.setCanceledOnTouchOutside(true);
+
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(16, 12, 16, 12);
+        layout.setGravity(android.view.Gravity.START);
+        layout.setLayoutParams(new android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        TextView label = new TextView(this);
+        label.setText(getString(R.string.internal_camera_exposure_label, current));
+        label.setTextColor(getResources().getColor(R.color.white));
+        label.setLayoutParams(new android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+        layout.addView(label);
+
+        SeekBar seekBar = new SeekBar(this);
+        seekBar.setMax(max - min);
+        seekBar.setProgress(current - min);
+        seekBar.setLayoutParams(new android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
+        layout.addView(seekBar);
+
+        seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                int value = min + progress;
+                label.setText(getString(R.string.internal_camera_exposure_label, value));
+                if (fromUser && mInternalCameraHelper != null) {
+                    mInternalCameraHelper.setExposureCompensation(value);
+                    updateInternalCameraControlPanel();
+                }
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+
+        dialog.setContentView(layout);
+        dialog.setOnShowListener(dialogInterface -> {
+            android.view.Window window = ((BottomSheetDialog)dialogInterface).getWindow();
+            if (window != null) {
+                window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND);
+            }
+        });
+        dialog.show();
+    }
+
+    private void showAfModeDialog() {
+        if (mInternalCameraHelper == null) return;
+
+        String[] labels = {"Off", "Auto", "Continuous", "Tap", "Infinity", "Macro"};
+        int[] modes = {
+            CaptureRequest.CONTROL_AF_MODE_OFF,
+            CaptureRequest.CONTROL_AF_MODE_AUTO,
+            CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO,
+            100,
+            101,
+            102
+        };
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Autofocus Mode");
+        builder.setItems(labels, (dialog, which) -> {
+            if (which == 3) {
+                mInternalCameraHelper.setTapToFocusMode(true);
+                mInternalAfMode = 3;
+            } else if (which == 4) {
+                mInternalCameraHelper.setTapToFocusMode(false);
+                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+                mInternalCameraHelper.setFocusDistance(0f);
+                mInternalAfMode = 4;
+            } else if (which == 5) {
+                mInternalCameraHelper.setTapToFocusMode(false);
+                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+                mInternalCameraHelper.setFocusDistance(mInternalCameraHelper.getMinFocusDistance());
+                mInternalAfMode = 5;
+            } else {
+                mInternalCameraHelper.setTapToFocusMode(false);
+                mInternalCameraHelper.setAfMode(modes[which]);
+                mInternalAfMode = which;
+            }
+            updateInternalCameraControlPanel();
+        });
+        builder.show();
+    }
+
+    private void showFlashDialog() {
+        String[] labels = {"Auto", "On", "Off", "Torch"};
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Flash Mode");
+        builder.setItems(labels, (dialog, which) -> {
+            switch (which) {
+                case 0:
+                    mInternalCameraHelper.setAeAuto(true);
+                    mInternalCameraHelper.setFlashMode(CaptureRequest.FLASH_MODE_OFF);
+                    mInternalFlashMode = CaptureRequest.FLASH_MODE_OFF;
+                    break;
+                case 1:
+                    mInternalCameraHelper.setAeAuto(true);
+                    mInternalCameraHelper.setFlashMode(CaptureRequest.FLASH_MODE_SINGLE);
+                    mInternalFlashMode = CaptureRequest.FLASH_MODE_SINGLE;
+                    break;
+                case 2:
+                    mInternalCameraHelper.setAeAuto(true);
+                    mInternalCameraHelper.setFlashMode(CaptureRequest.FLASH_MODE_OFF);
+                    mInternalFlashMode = CaptureRequest.FLASH_MODE_OFF;
+                    break;
+                case 3:
+                    mInternalCameraHelper.setAeAuto(true);
+                    mInternalCameraHelper.setFlashMode(CaptureRequest.FLASH_MODE_TORCH);
+                    mInternalFlashMode = CaptureRequest.FLASH_MODE_TORCH;
+                    break;
+            }
+            updateInternalCameraControlPanel();
+        });
+        builder.show();
+    }
+
+    private void showWhiteBalanceDialog() {
+        String[] labels = {"Auto", "Incandescent", "Fluorescent", "Daylight", "Cloudy", "Shade", "Kelvin"};
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("White Balance");
+        builder.setItems(labels, (dialog, which) -> {
+            switch (which) {
+                case 0:
+                    mInternalCameraHelper.setAwbAuto(true);
+                    mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO;
+                    break;
+                case 1:
+                    mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_INCANDESCENT);
+                    mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_INCANDESCENT;
+                    break;
+                case 2:
+                    mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_FLUORESCENT);
+                    mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_FLUORESCENT;
+                    break;
+                case 3:
+                    mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_DAYLIGHT);
+                    mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_DAYLIGHT;
+                    break;
+                case 4:
+                    mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT);
+                    mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT;
+                    break;
+                case 5:
+                    mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_SHADE);
+                    mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_SHADE;
+                    break;
+                case 6:
+                    mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_OFF;
+                    mInternalCameraHelper.setAwbAuto(false);
+                    mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_OFF);
+                    showWhiteBalanceKelvinDialog();
+                    return;
+            }
+            updateInternalCameraControlPanel();
+        });
+        builder.show();
+    }
+
+    private void showWhiteBalanceKelvinDialog() {
+        if (mInternalCameraHelper == null) return;
+
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("White Balance Kelvin");
+
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        layout.setPadding(32, 24, 32, 0);
+
+        TextView label = new TextView(this);
+        label.setText("Kelvin: " + mInternalWbKelvin + "K");
+        label.setTextColor(getResources().getColor(R.color.white));
+        layout.addView(label);
+
+        SeekBar seekBar = new SeekBar(this);
+        seekBar.setMax(9000);
+        seekBar.setProgress(mInternalWbKelvin - 1000);
+        layout.addView(seekBar);
+
+        seekBar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                int kelvin = 1000 + progress;
+                label.setText("Kelvin: " + kelvin + "K");
+                if (fromUser && mInternalCameraHelper != null) {
+                    mInternalWbKelvin = kelvin;
+                    mInternalCameraHelper.setAwbTemperatureKelvin(mInternalWbKelvin);
+                    updateInternalCameraControlPanel();
+                }
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+
+        builder.setView(layout);
+        builder.setNegativeButton("Cancel", null);
+        builder.show();
+    }
+
+    private void processTcpControlMessage(String msg) {
+        long nowNs = System.nanoTime();
+        if (msg != null && msg.equals(mLastProcessedTcpControlPayload)
+                && (nowNs - mLastProcessedTcpControlNs) < 1_000_000_000L) {
+            return;
+        }
+        mLastProcessedTcpControlPayload = msg != null ? msg : "";
+        mLastProcessedTcpControlNs = nowNs;
+
+        boolean exposureLock = msg.contains("exposure_lock=1");
+        boolean focusLock = msg.contains("focus_lock=1");
+        boolean afLock = msg.contains("af_lock=1");
+        int parsedExposureCompensation = 0;
+        int parsedAfMode = -1;
+        int parsedFlashMode = -1;
+        int parsedWbMode = -1;
+        int parsedWbKelvin = mInternalWbKelvin;
+
+        String[] parts = msg.split(";");
+        for (String part : parts) {
+            if (part.startsWith("exposure_compensation=")) {
+                try {
+                    parsedExposureCompensation = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                } catch (NumberFormatException ignored) {
+                }
+            } else if (part.startsWith("af_mode=")) {
+                try {
+                    parsedAfMode = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                } catch (NumberFormatException ignored) {
+                }
+            } else if (part.startsWith("flash_mode=")) {
+                try {
+                    parsedFlashMode = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                } catch (NumberFormatException ignored) {
+                }
+            } else if (part.startsWith("wb_mode=")) {
+                try {
+                    parsedWbMode = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                } catch (NumberFormatException ignored) {
+                }
+            } else if (part.startsWith("wb_kelvin=")) {
+                try {
+                    parsedWbKelvin = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                } catch (NumberFormatException ignored) {
+                }
+            }
+        }
+
+        final int exposureCompensation = parsedExposureCompensation;
+        final int afMode = parsedAfMode;
+        final int flashMode = parsedFlashMode;
+        final int wbMode = parsedWbMode;
+        final int wbKelvin = parsedWbKelvin;
+
+        runOnUiThread(() -> {
+            mInternalExposureLock = exposureLock;
+            mInternalFocusLock = focusLock;
+            mInternalAfLock = afLock;
+            if (mInternalCameraHelper != null && mCameraMode == CameraMode.INTERNAL) {
+                mInternalCameraHelper.setPreviewUpdatesSuspended(true);
+                try {
+                    if (mInternalExposureLock) {
+                        if (!mInternalCameraHelper.isAeAuto()) {
+                            mInternalCameraHelper.setAeAuto(true);
+                        }
+                        if (mInternalCameraHelper.isAeAuto()) {
+                            mInternalCameraHelper.setExposureCompensation(exposureCompensation);
+                        }
+                        mInternalCameraHelper.setAeLock(true);
+                    } else {
+                        mInternalCameraHelper.setAeLock(false);
+                    }
+                    if (afMode >= 0) {
+                        if (afMode == 3) { // Tap
+                            mInternalCameraHelper.setTapToFocusMode(true);
+                        } else if (afMode == 4) { // Infinity
+                            mInternalCameraHelper.setTapToFocusMode(false);
+                            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+                            mInternalCameraHelper.setFocusDistance(0f);
+                        } else if (afMode == 5) { // Macro
+                            mInternalCameraHelper.setTapToFocusMode(false);
+                            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+                            mInternalCameraHelper.setFocusDistance(mInternalCameraHelper.getMinFocusDistance());
+                        } else if (afMode == 2) { // Continuous — OBS index 2 → Camera2 CONTINUOUS_VIDEO=3
+                            mInternalCameraHelper.setTapToFocusMode(false);
+                            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+                        } else { // 0=Off, 1=Auto — Camera2 OFF=0, AUTO=1
+                            mInternalCameraHelper.setTapToFocusMode(false);
+                            mInternalCameraHelper.setAfMode(afMode);
+                        }
+                        mInternalAfMode = afMode;
+                    }
+                    if (flashMode >= 0) {
+                        // OBS plugin: 0=Auto, 1=On, 2=Off, 3=Torch
+                        // Camera2 FLASH_MODE: 0=OFF, 1=SINGLE, 2=TORCH
+                        final int camera2FlashMode;
+                        switch (flashMode) {
+                            case 1:  camera2FlashMode = CaptureRequest.FLASH_MODE_SINGLE; break; // On
+                            case 3:  camera2FlashMode = CaptureRequest.FLASH_MODE_TORCH;  break; // Torch
+                            default: camera2FlashMode = CaptureRequest.FLASH_MODE_OFF;    break; // Auto or Off
+                        }
+                        mInternalFlashMode = camera2FlashMode;
+                        mInternalCameraHelper.setFlashMode(camera2FlashMode);
+                    }
+                    if (wbMode >= 0) {
+                        // OBS plugin wb_mode: 0=Auto,1=Incandescent,2=Fluorescent,3=Daylight,4=Cloudy,5=Shade,6=Kelvin
+                        // Camera2 CONTROL_AWB_MODE: AUTO=1,INCANDESCENT=2,FLUORESCENT=3,DAYLIGHT=5,CLOUDY_DAYLIGHT=6,SHADE=8
+                        switch (wbMode) {
+                            case 0: // Auto
+                                mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO;
+                                mInternalCameraHelper.setAwbAuto(true);
+                                break;
+                            case 1: // Incandescent
+                                mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_INCANDESCENT;
+                                mInternalCameraHelper.setAwbAuto(false);
+                                mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_INCANDESCENT);
+                                break;
+                            case 2: // Fluorescent
+                                mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_FLUORESCENT;
+                                mInternalCameraHelper.setAwbAuto(false);
+                                mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_FLUORESCENT);
+                                break;
+                            case 3: // Daylight
+                                mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_DAYLIGHT;
+                                mInternalCameraHelper.setAwbAuto(false);
+                                mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_DAYLIGHT);
+                                break;
+                            case 4: // Cloudy
+                                mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT;
+                                mInternalCameraHelper.setAwbAuto(false);
+                                mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT);
+                                break;
+                            case 5: // Shade
+                                mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_SHADE;
+                                mInternalCameraHelper.setAwbAuto(false);
+                                mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_SHADE);
+                                break;
+                            case 6: // Kelvin (custom temperature)
+                                mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_OFF;
+                                mInternalCameraHelper.setAwbAuto(false);
+                                mInternalCameraHelper.setAwbMode(CaptureRequest.CONTROL_AWB_MODE_OFF);
+                                mInternalCameraHelper.setAwbTemperatureKelvin(wbKelvin);
+                                mInternalWbKelvin = wbKelvin;
+                                break;
+                        }
+                    }
+                    if (mInternalFocusLock) {
+                        setInternalFocusLock(true);
+                    } else {
+                        setInternalFocusLock(false);
+                    }
+                    if (mInternalAfLock) {
+                        setInternalAfLock(true);
+                    } else {
+                        setInternalAfLock(false);
+                    }
+                } finally {
+                    mInternalCameraHelper.setPreviewUpdatesSuspended(false);
+                    clearTcpUdpFrameQueue();
+                    requestH264SyncFrameAsync();
+                }
+            }
+        });
+    }
+
+    private void setInternalFocusLock(boolean locked) {
+        if (mInternalCameraHelper == null) {
+            mInternalFocusLock = locked;
+            updateInternalCameraControlPanel();
+            return;
+        }
+
+        if (locked) {
+            if (!mInternalFocusLock) {
+                mInternalFocusLockPreviousAfMode = mInternalCameraHelper.getAfMode();
+                mInternalFocusLockPreviousTapToFocus = mInternalCameraHelper.isTapToFocusMode();
+            }
+            mInternalFocusLock = true;
+            mInternalCameraHelper.setTapToFocusMode(false);
+            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+        } else {
+            mInternalFocusLock = false;
+            if (mInternalFocusLockPreviousTapToFocus) {
+                mInternalCameraHelper.setTapToFocusMode(true);
+            } else {
+                mInternalCameraHelper.setTapToFocusMode(false);
+                mInternalCameraHelper.setAfMode(mInternalFocusLockPreviousAfMode);
+            }
+        }
+        updateInternalCameraControlPanel();
+    }
+
+    private void setInternalAfLock(boolean locked) {
+        if (mInternalCameraHelper == null) {
+            mInternalAfLock = locked;
+            updateInternalCameraControlPanel();
+            return;
+        }
+
+        if (locked) {
+            if (!mInternalAfLock) {
+                mInternalAfLockPreviousAfMode = mInternalCameraHelper.getAfMode();
+                mInternalAfLockPreviousTapToFocus = mInternalCameraHelper.isTapToFocusMode();
+            }
+            mInternalAfLock = true;
+            mInternalCameraHelper.setTapToFocusMode(false);
+            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+        } else {
+            mInternalAfLock = false;
+            if (mInternalAfLockPreviousTapToFocus) {
+                mInternalCameraHelper.setTapToFocusMode(true);
+            } else {
+                mInternalCameraHelper.setTapToFocusMode(false);
+                mInternalCameraHelper.setAfMode(mInternalAfLockPreviousAfMode);
+            }
+        }
+        updateInternalCameraControlPanel();
+    }
+
+    private String getFlashModeLabel(int flashMode) {
+        switch (flashMode) {
+            case CaptureRequest.FLASH_MODE_SINGLE:
+                return "Flash On";
+            case CaptureRequest.FLASH_MODE_TORCH:
+                return "Torch";
+            default:
+                return "Flash Off";
+        }
+    }
+
+    private String getWbModeLabel(int wbMode) {
+        switch (wbMode) {
+            case CaptureRequest.CONTROL_AWB_MODE_INCANDESCENT:
+                return "Incandescent";
+            case CaptureRequest.CONTROL_AWB_MODE_FLUORESCENT:
+                return "Fluorescent";
+            case CaptureRequest.CONTROL_AWB_MODE_DAYLIGHT:
+                return "Daylight";
+            case CaptureRequest.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT:
+                return "Cloudy";
+            case CaptureRequest.CONTROL_AWB_MODE_SHADE:
+                return "Shade";
+            case CaptureRequest.CONTROL_AWB_MODE_OFF:
+                return "Kelvin";
+            default:
+                return "WB Auto";
         }
     }
 
@@ -2904,6 +3438,23 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
         }
     }
 
+    private void requestH264SyncFrameAsync() {
+        mH264SyncFrameRequested = true;
+    }
+
+    private void requestH264SyncFrame() {
+        if (mH264Encoder == null) {
+            return;
+        }
+        try {
+            android.os.Bundle params = new android.os.Bundle();
+            params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
+            mH264Encoder.setParameters(params);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to request H.265 sync frame", e);
+        }
+    }
+
     private void recycleFrameBuffer(java.nio.ByteBuffer frame) {
         if (frame == null) {
             return;
@@ -3021,13 +3572,19 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
                     try {
                         socket.receive(packet);
                     } catch (java.net.SocketTimeoutException ignored) {
+                        maybeSendTcpControlStateToObs();
                         continue;
                     }
+                    mTcpTallyRemoteHost = packet.getAddress() != null ? packet.getAddress().getHostAddress() : null;
                     String msg = new String(packet.getData(), 0, packet.getLength(), java.nio.charset.StandardCharsets.UTF_8);
                     boolean program = msg.contains("program=1");
                     boolean preview = msg.contains("preview=1");
                     mTcpObsProgram = program;
                     mTcpObsPreview = preview;
+                    if (msg.startsWith("CONTROL;")) {
+                        processTcpControlMessage(msg);
+                    }
+                    maybeSendTcpControlStateToObs();
                     mTcpLastTallyUpdateNs = System.nanoTime();
                 }
             } catch (Exception e) {
@@ -3057,7 +3614,82 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
         }
         mTcpObsProgram = false;
         mTcpObsPreview = false;
+        mTcpTallyRemoteHost = null;
+        mLastSentControlStatePayload = "";
+        mLastSentControlStateNs = 0;
+        mLastProcessedTcpControlPayload = "";
+        mLastProcessedTcpControlNs = 0;
         mTcpLastTallyUpdateNs = 0;
+    }
+
+    private int mapInternalWbModeToObsWbMode() {
+        if (mInternalWbMode == CaptureRequest.CONTROL_AWB_MODE_AUTO) return 0;
+        if (mInternalWbMode == CaptureRequest.CONTROL_AWB_MODE_INCANDESCENT) return 1;
+        if (mInternalWbMode == CaptureRequest.CONTROL_AWB_MODE_FLUORESCENT) return 2;
+        if (mInternalWbMode == CaptureRequest.CONTROL_AWB_MODE_DAYLIGHT) return 3;
+        if (mInternalWbMode == CaptureRequest.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT) return 4;
+        if (mInternalWbMode == CaptureRequest.CONTROL_AWB_MODE_SHADE) return 5;
+        if (mInternalWbMode == CaptureRequest.CONTROL_AWB_MODE_OFF) return 6;
+        return 0;
+    }
+
+    private int mapInternalFlashModeToObsFlashMode() {
+        if (mInternalFlashMode == CaptureRequest.FLASH_MODE_SINGLE) return 1;
+        if (mInternalFlashMode == CaptureRequest.FLASH_MODE_TORCH) return 3;
+        return 2;
+    }
+
+    private String buildTcpControlStatePayload() {
+        int exposureCompensation = 0;
+        if (mInternalCameraHelper != null) {
+            exposureCompensation = mInternalCameraHelper.getCurrentExposureCompensation();
+        }
+        return String.format(java.util.Locale.US,
+                "CONTROL_STATE;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d",
+                mInternalExposureLock ? 1 : 0,
+                mInternalFocusLock ? 1 : 0,
+                exposureCompensation,
+                mInternalAfMode,
+                mInternalAfLock ? 1 : 0,
+                mapInternalFlashModeToObsFlashMode(),
+                mapInternalWbModeToObsWbMode(),
+                mInternalWbKelvin);
+    }
+
+    private void maybeSendTcpControlStateToObs() {
+        if (!mTcpTallyListenerRunning || mCameraMode != CameraMode.INTERNAL) {
+            return;
+        }
+        final String remoteHost = mTcpTallyRemoteHost;
+        if (remoteHost == null || remoteHost.isEmpty()) {
+            return;
+        }
+        final String payload = buildTcpControlStatePayload();
+        final long nowNs = System.nanoTime();
+        if (payload.equals(mLastSentControlStatePayload)
+                && (nowNs - mLastSentControlStateNs) < 1_000_000_000L) {
+            return;
+        }
+
+        byte[] data = payload.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        java.net.DatagramSocket outSocket = null;
+        try {
+            outSocket = new java.net.DatagramSocket();
+            java.net.DatagramPacket packet = new java.net.DatagramPacket(
+                    data,
+                    data.length,
+                    java.net.InetAddress.getByName(remoteHost),
+                    TCP_TALLY_PORT);
+            outSocket.send(packet);
+            mLastSentControlStatePayload = payload;
+            mLastSentControlStateNs = nowNs;
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to send CONTROL_STATE to OBS", e);
+        } finally {
+            if (outSocket != null) {
+                outSocket.close();
+            }
+        }
     }
 
     private void enqueueTcpUdpFrame(java.nio.ByteBuffer frame, int width, int height) {
@@ -3174,6 +3806,10 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
                 }
                 if (!mTcpUdpWorkerRunning || client == null) break;
 
+                // Clear any stale queued frames before starting a new connection.
+                clearTcpUdpFrameQueue();
+                requestH264SyncFrame();
+
                 // Send cached SPS+PPS so OBS can decode immediately
                 try {
                     byte[] sps = mH264SpsPps;
@@ -3200,6 +3836,10 @@ mBinding.internalCameraControls.setVisibility(internalShown ? View.GONE : View.G
                                     || frame.width != mH264EncoderWidth
                                     || frame.height != mH264EncoderHeight) {
                                 reconfigureH264Encoder(frame.width, frame.height);
+                            }
+                            if (mH264SyncFrameRequested) {
+                                mH264SyncFrameRequested = false;
+                                requestH264SyncFrame();
                             }
                             feedFrameToH264Encoder(frame);
                             // Micro-batched flush reduces syscall jitter while preserving low latency.
