@@ -78,13 +78,39 @@ static inline uint32_t read_u32be(const uint8_t *b)
            ((uint32_t)b[2] <<  8) |  (uint32_t)b[3];
 }
 
+static bool parse_message_int(const char *msg, const char *key, int *value)
+{
+    if (!msg || !key || !value) {
+        return false;
+    }
+
+    const char *pos = strstr(msg, key);
+    if (!pos) {
+        return false;
+    }
+
+    pos += strlen(key);
+    char *end = NULL;
+    long parsed = strtol(pos, &end, 10);
+    if (end == pos) {
+        return false;
+    }
+
+    *value = (int)parsed;
+    return true;
+}
+
 static void uvc_custom_network_start_receiver(uvc_custom_network *context);
 static void uvc_custom_network_receiver_stop(uvc_custom_network *context);
 static void uvc_custom_network_set_status(uvc_custom_network *context, const char *format, ...);
 static bool uvc_custom_network_activate_button(obs_properties_t *props, obs_property_t *property, void *data);
 static bool uvc_custom_network_refresh_button(obs_properties_t *props, obs_property_t *property, void *data);
 static void uvc_custom_network_discovery_callback(const char *host, int port, void *userdata);
-static void uvc_custom_network_send_control(uvc_custom_network *context);
+static void uvc_custom_network_send_control(uvc_custom_network *context,
+                                            bool exposure_lock, bool focus_lock,
+                                            int exposure_compensation, int af_mode, bool af_lock,
+                                            int flash_mode, int wb_mode, int wb_kelvin,
+                                            int resolution_index, int fps, int quality);
 static void *uvc_custom_network_receiver_thread(void *data);
 static void *uvc_custom_network_control_state_thread(void *data);
 static void uvc_custom_network_control_state_start(uvc_custom_network *context);
@@ -287,11 +313,24 @@ static void uvc_custom_network_send_tally(uvc_custom_network *context,
     context->last_tally_send_ns = now_ns;
 }
 
-static void uvc_custom_network_send_control(uvc_custom_network *context)
+/* Values are passed by the caller (captured inside the mutex in update()) so
+ * that video_tick cannot race-overwrite context->control_* between the diff
+ * detection and the actual sendto(). */
+static void uvc_custom_network_send_control(uvc_custom_network *context,
+                                            bool exposure_lock, bool focus_lock,
+                                            int exposure_compensation, int af_mode, bool af_lock,
+                                            int flash_mode, int wb_mode, int wb_kelvin,
+                                            int resolution_index, int fps, int quality)
 {
     if (!context || !context->host || context->host[0] == '\0') {
         return;
     }
+
+    /* Snapshot the host string before releasing any locks (caller already
+     * holds no lock here, but host only changes under the lock in update()). */
+    char host_copy[64];
+    strncpy(host_copy, context->host, sizeof(host_copy) - 1);
+    host_copy[sizeof(host_copy) - 1] = '\0';
 
 #ifdef _WIN32
     SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -307,7 +346,7 @@ static void uvc_custom_network_send_control(uvc_custom_network *context)
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)CUSTOM_TALLY_PORT);
-    if (inet_pton(AF_INET, context->host, &addr.sin_addr) <= 0) {
+    if (inet_pton(AF_INET, host_copy, &addr.sin_addr) <= 0) {
 #ifdef _WIN32
         closesocket(sock);
 #else
@@ -316,17 +355,22 @@ static void uvc_custom_network_send_control(uvc_custom_network *context)
         return;
     }
 
-    char payload[256];
+    char payload[320];
     snprintf(payload, sizeof(payload),
-             "CONTROL;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d",
-             context->control_exposure_lock ? 1 : 0,
-             context->control_focus_lock ? 1 : 0,
-             context->control_exposure_compensation,
-             context->control_af_mode,
-             context->control_af_lock ? 1 : 0,
-             context->control_flash_mode,
-             context->control_wb_mode,
-             context->control_wb_kelvin);
+             "CONTROL;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d",
+             exposure_lock ? 1 : 0,
+             focus_lock ? 1 : 0,
+             exposure_compensation,
+             af_mode,
+             af_lock ? 1 : 0,
+             flash_mode,
+             wb_mode,
+             wb_kelvin,
+             resolution_index,
+             fps,
+             quality);
+
+    blog(LOG_INFO, "UVC CONTROL -> Android: %s", payload);
 
 #ifdef _WIN32
     sendto(sock, payload, (int)strlen(payload), 0,
@@ -353,6 +397,15 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
     int flash_mode = 2;
     int wb_mode = 0;
     int wb_kelvin = 4500;
+    int resolution_index = 1;
+    int fps = 30;
+    int quality = 50;
+
+    pthread_mutex_lock(&context->lock);
+    resolution_index = context->resolution_index;
+    fps = context->fps;
+    quality = context->quality;
+    pthread_mutex_unlock(&context->lock);
 
     int matched = sscanf(msg,
                          "CONTROL_STATE;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d",
@@ -368,15 +421,17 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
         return;
     }
 
-    /* Ignore noisy EV drift when AE lock is off to avoid sync churn/freeze loops. */
-    if (exposure_lock == 0) {
-        pthread_mutex_lock(&context->lock);
-        exposure_compensation = context->control_exposure_compensation;
-        pthread_mutex_unlock(&context->lock);
-    }
+    parse_message_int(msg, "resolution_index=", &resolution_index);
+    parse_message_int(msg, "fps=", &fps);
+    parse_message_int(msg, "quality=", &quality);
 
     bool changed = false;
     pthread_mutex_lock(&context->lock);
+    /* Only queue the Android state if it actually differs from what OBS already
+     * has in control_*.  This is the echo-suppression mechanism: after OBS
+     * sends CONTROL, it updates control_* to the new value.  If Android echoes
+     * back the same value it received, the diff is zero and nothing is queued,
+     * so OBS's change is not overwritten. */
     if (context->control_exposure_lock != (exposure_lock != 0)
         || context->control_focus_lock != (focus_lock != 0)
         || context->control_exposure_compensation != exposure_compensation
@@ -385,15 +440,9 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
         || context->control_flash_mode != flash_mode
         || context->control_wb_mode != wb_mode
         || context->control_wb_kelvin != wb_kelvin
-        || !context->pending_remote_control_state
-        || context->pending_exposure_lock != (exposure_lock != 0)
-        || context->pending_focus_lock != (focus_lock != 0)
-        || context->pending_exposure_compensation != exposure_compensation
-        || context->pending_af_mode != af_mode
-        || context->pending_af_lock != (af_lock != 0)
-        || context->pending_flash_mode != flash_mode
-        || context->pending_wb_mode != wb_mode
-        || context->pending_wb_kelvin != wb_kelvin) {
+        || context->resolution_index != resolution_index
+        || context->fps != fps
+        || context->quality != quality) {
         context->pending_remote_control_state = true;
         context->pending_exposure_lock = (exposure_lock != 0);
         context->pending_focus_lock = (focus_lock != 0);
@@ -403,31 +452,90 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
         context->pending_flash_mode = flash_mode;
         context->pending_wb_mode = wb_mode;
         context->pending_wb_kelvin = wb_kelvin;
+        context->pending_resolution_index = resolution_index;
+        context->pending_fps = fps;
+        context->pending_quality = quality;
         changed = true;
     }
     pthread_mutex_unlock(&context->lock);
     UNUSED_PARAMETER(changed);
 }
 
+static void uvc_custom_network_apply_pending_state_to_source(uvc_custom_network *context)
+{
+    if (!context || !context->source || context->destroying) {
+        return;
+    }
+
+    /* Write the current control_* values into the source's stored settings so
+     * they are persisted to the scene collection file and the Properties dialog
+     * shows the latest values when reopened.
+     *
+     * We deliberately do NOT call obs_source_update() -- that would re-enter
+     * update() from the video tick thread and restart the receiver. */
+    obs_data_t *settings = obs_source_get_settings(context->source);
+    if (!settings) {
+        return;
+    }
+
+    obs_data_set_bool(settings, "exposure_lock", context->control_exposure_lock);
+    obs_data_set_bool(settings, "focus_lock", context->control_focus_lock);
+    obs_data_set_int(settings, "exposure_compensation", context->control_exposure_compensation);
+    obs_data_set_int(settings, "af_mode", context->control_af_mode);
+    obs_data_set_bool(settings, "af_lock", context->control_af_lock);
+    obs_data_set_int(settings, "flash_mode", context->control_flash_mode);
+    obs_data_set_int(settings, "wb_mode", context->control_wb_mode);
+    obs_data_set_int(settings, "wb_kelvin", context->control_wb_kelvin);
+    obs_data_set_int(settings, "resolution_index", context->resolution_index);
+    obs_data_set_int(settings, "fps", context->fps);
+    obs_data_set_int(settings, "quality", context->quality);
+    obs_data_release(settings);
+
+    /* Refresh the open Properties dialog so the user sees the latest Android
+     * state.  Rate-limited to once per second to avoid rebuilding the dialog
+     * while the user is interacting with it.  Only called after the authority
+     * window has expired (video_tick already checked that), so OBS-initiated
+     * edits are never disrupted by echo-state refreshes. */
+    uint64_t now_props = os_gettime_ns();
+    if (now_props - context->last_props_refresh_ns >= 1000000000ULL) {
+        obs_source_update_properties(context->source);
+        context->last_props_refresh_ns = now_props;
+    }
+}
+
 static void uvc_custom_network_video_tick(void *data, float seconds)
 {
     UNUSED_PARAMETER(seconds);
     uvc_custom_network *context = (uvc_custom_network *)data;
-    if (!context) {
+    if (!context || context->destroying) {
         return;
     }
 
+    uint64_t now_ns = os_gettime_ns();
     pthread_mutex_lock(&context->lock);
     if (!context->pending_remote_control_state) {
         pthread_mutex_unlock(&context->lock);
         return;
     }
+    if (context->last_remote_apply_ns > 0 && (now_ns - context->last_remote_apply_ns) < 250000000ULL) {
+        pthread_mutex_unlock(&context->lock);
+        return;
+    }
 
-    /* Apply Android state directly into control fields.
-     * We deliberately do NOT call obs_source_update() or obs_source_update_properties()
-     * here — doing so causes the OBS properties panel to rebuild every second
-     * (making it unusable) and overwrites any in-flight user edits before update()
-     * can detect them and send CONTROL to Android. */
+    /* If OBS sent a CONTROL to Android recently, ignore any Android reply for
+     * the authority window.  Android sends back its PRE-CHANGE state immediately
+     * on receiving the packet (before runOnUiThread processes it), so we need
+     * to suppress that stale echo.  1.5 s covers the initial stale reply plus
+     * one full 500 ms Android send cycle with margin. */
+#define OBS_CONTROL_AUTHORITY_NS 1500000000ULL  /* 1.5 seconds */
+    if (context->last_obs_control_send_ns > 0 &&
+        (now_ns - context->last_obs_control_send_ns) < OBS_CONTROL_AUTHORITY_NS) {
+        context->pending_remote_control_state = false;  /* consume, don't apply */
+        pthread_mutex_unlock(&context->lock);
+        return;
+    }
+
+    /* Apply Android state directly into control fields. */
     context->control_exposure_lock        = context->pending_exposure_lock;
     context->control_focus_lock           = context->pending_focus_lock;
     context->control_exposure_compensation = context->pending_exposure_compensation;
@@ -436,9 +544,16 @@ static void uvc_custom_network_video_tick(void *data, float seconds)
     context->control_flash_mode           = context->pending_flash_mode;
     context->control_wb_mode              = context->pending_wb_mode;
     context->control_wb_kelvin            = context->pending_wb_kelvin;
+    context->resolution_index             = context->pending_resolution_index;
+    context->fps                          = context->pending_fps;
+    context->quality                      = context->pending_quality;
     context->pending_remote_control_state = false;
     pthread_mutex_unlock(&context->lock);
+
+    uvc_custom_network_apply_pending_state_to_source(context);
+    context->last_remote_apply_ns = now_ns;
 }
+
 
 static void *uvc_custom_network_control_state_thread(void *data)
 {
@@ -735,6 +850,7 @@ static void *uvc_custom_network_receiver_thread(void *data)
         bool logged_first = false;
         uint64_t pts_epoch_ns = 0;   /* anchor: OBS time when first PTS arrived */
         int64_t  pts_epoch_us = 0;   /* anchor: first PTS value (microseconds) */
+        uint64_t last_output_timestamp_ns = 0;
 
         /* inner receive/decode loop */
         while (context->receiver_running) {
@@ -792,15 +908,51 @@ static void *uvc_custom_network_receiver_thread(void *data)
                  * derive all subsequent timestamps from the PTS delta.
                  * This smooths out TCP delivery jitter. */
                 if (frame->pts != AV_NOPTS_VALUE && frame->pts > 0) {
+                    uint64_t now_frame_ns = os_gettime_ns();
                     if (pts_epoch_us == 0) {
                         pts_epoch_us = frame->pts;
-                        pts_epoch_ns = os_gettime_ns();
+                        pts_epoch_ns = now_frame_ns;
                     }
                     int64_t delta_us = frame->pts - pts_epoch_us;
-                    obs_frame.timestamp = pts_epoch_ns + (uint64_t)(delta_us * 1000);
+                    if (delta_us < 0) {
+                        /* PTS went backward (e.g. Android camera settings caused
+                         * an encoder reset).  Re-anchor the epoch to avoid a
+                         * negative cast to uint64_t that would produce an
+                         * astronomically large timestamp and stall OBS frames. */
+                        pts_epoch_us = frame->pts;
+                        pts_epoch_ns = now_frame_ns;
+                        delta_us = 0;
+                    }
+                    uint64_t candidate_ts = pts_epoch_ns + (uint64_t)(delta_us * 1000);
+
+                    /* Camera-control changes can momentarily stall the Android
+                     * camera/encoder pipeline and the next frame may arrive with
+                     * a capture timestamp far in the future.  If we pass that
+                     * through directly, OBS waits until that future timestamp and
+                     * the preview appears frozen.  Re-anchor when the timestamp
+                     * drifts too far from the local wall clock or regresses too
+                     * far behind the last frame. */
+                    if (candidate_ts > now_frame_ns + 250000000ULL
+                            || (last_output_timestamp_ns > 0
+                                && candidate_ts + 250000000ULL < last_output_timestamp_ns)) {
+                        pts_epoch_us = frame->pts;
+                        pts_epoch_ns = now_frame_ns;
+                        candidate_ts = now_frame_ns;
+                    }
+
+                    if (last_output_timestamp_ns > 0 && candidate_ts <= last_output_timestamp_ns) {
+                        candidate_ts = last_output_timestamp_ns + 1000ULL;
+                    }
+
+                    obs_frame.timestamp = candidate_ts;
                 } else {
-                    obs_frame.timestamp = os_gettime_ns();
+                    uint64_t now_frame_ns = os_gettime_ns();
+                    if (last_output_timestamp_ns > 0 && now_frame_ns <= last_output_timestamp_ns) {
+                        now_frame_ns = last_output_timestamp_ns + 1000ULL;
+                    }
+                    obs_frame.timestamp = now_frame_ns;
                 }
+                last_output_timestamp_ns = obs_frame.timestamp;
                 obs_frame.trc       = VIDEO_TRC_DEFAULT;
 
                 bool format_ok = true;
@@ -977,6 +1129,9 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
     context->pending_flash_mode = context->control_flash_mode;
     context->pending_wb_mode = context->control_wb_mode;
     context->pending_wb_kelvin = context->control_wb_kelvin;
+    context->pending_resolution_index = context->resolution_index;
+    context->pending_fps = context->fps;
+    context->pending_quality = context->quality;
     context->discovery = NULL;
 #ifdef _WIN32
     context->receiver_socket = INVALID_SOCKET;
@@ -993,6 +1148,9 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
     context->tally_preview = false;
     context->last_tally_send_ns = 0;
     context->last_remote_apply_ns = 0;
+    context->last_obs_control_send_ns = 0;
+    context->last_props_refresh_ns = 0;
+    context->destroying = false;
     context->discovery_status = bstrdup("Idle");
 
     if (context->discovery_enabled) {
@@ -1015,6 +1173,9 @@ static void uvc_custom_network_destroy(void *data)
 {
     uvc_custom_network *context = (uvc_custom_network *)data;
     if (!context) return;
+
+    /* Signal video_tick to stop making OBS API calls before we free anything. */
+    context->destroying = true;
 
     if (context->discovery) {
         network_discovery_destroy(context->discovery);
@@ -1109,13 +1270,28 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     network_discovery_t *old_discovery = NULL;
     bool need_discovery_start = false;
     bool need_receiver_restart = false;
+    char previous_host[64] = {0};
+    int previous_port = 0;
 
     pthread_mutex_lock(&context->lock);
+
+    if (context->host && context->host[0] != '\0') {
+        strncpy(previous_host, context->host, sizeof(previous_host) - 1);
+    }
+    previous_port = context->port;
 
     const char *new_host = obs_data_get_string(settings, "host");
     bool host_changed = false;
     if (!new_host) {
         new_host = "";
+    }
+    if (context->receiver_running && new_host[0] == '\0' && previous_host[0] != '\0') {
+        /* When OBS rebuilds/reloads the properties view, transient blank host
+         * values can be submitted with unrelated control changes.  Preserve the
+         * active target so a checkbox toggle cannot silently clear the host and
+         * restart the receiver. */
+        obs_data_set_string(settings, "host", previous_host);
+        new_host = previous_host;
     }
     if (!context->host || strcmp(context->host, new_host) != 0) {
         bfree(context->host);
@@ -1124,6 +1300,10 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     }
 
     int new_port = (int)obs_data_get_int(settings, "port");
+    if (context->receiver_running && new_port <= 0 && previous_port > 0) {
+        obs_data_set_int(settings, "port", previous_port);
+        new_port = previous_port;
+    }
     bool port_changed = new_port != context->port;
     context->port = new_port;
 
@@ -1141,9 +1321,15 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
         }
     }
 
-    context->resolution_index = (int)obs_data_get_int(settings, "resolution_index");
-    context->fps = (int)obs_data_get_int(settings, "fps");
-    context->quality = (int)obs_data_get_int(settings, "quality");
+    int resolution_index = (int)obs_data_get_int(settings, "resolution_index");
+    int fps = (int)obs_data_get_int(settings, "fps");
+    int quality = (int)obs_data_get_int(settings, "quality");
+    bool stream_settings_changed = resolution_index != context->resolution_index
+        || fps != context->fps
+        || quality != context->quality;
+    context->resolution_index = resolution_index;
+    context->fps = fps;
+    context->quality = quality;
     bool exposure_lock = obs_data_get_bool(settings, "exposure_lock");
     bool focus_lock = obs_data_get_bool(settings, "focus_lock");
     int exposure_compensation = (int)obs_data_get_int(settings, "exposure_compensation");
@@ -1154,7 +1340,12 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     int wb_kelvin = (int)obs_data_get_int(settings, "wb_kelvin");
 
     bool send_control = false;
-    if (exposure_lock != context->control_exposure_lock || focus_lock != context->control_focus_lock || exposure_compensation != context->control_exposure_compensation
+    bool suppress_control_send = context->suppress_next_control_send;
+    if (suppress_control_send) {
+        context->suppress_next_control_send = false;
+    }
+        if (stream_settings_changed
+            || exposure_lock != context->control_exposure_lock || focus_lock != context->control_focus_lock || exposure_compensation != context->control_exposure_compensation
             || af_mode != context->control_af_mode || af_lock != context->control_af_lock || flash_mode != context->control_flash_mode
             || wb_mode != context->control_wb_mode || wb_kelvin != context->control_wb_kelvin) {
         context->control_exposure_lock = exposure_lock;
@@ -1166,6 +1357,9 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
         context->control_wb_mode = wb_mode;
         context->control_wb_kelvin = wb_kelvin;
         send_control = true;
+        /* Record the OBS-authority timestamp so video_tick suppresses Android
+         * echo-state for OBS_CONTROL_AUTHORITY_NS after this send. */
+        context->last_obs_control_send_ns = os_gettime_ns();
     }
 
     bool discovery_enabled = obs_data_get_bool(settings, "discovery_enabled");
@@ -1182,6 +1376,19 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     }
 
     pthread_mutex_unlock(&context->lock);
+
+    blog(LOG_INFO,
+         "UVC update: prev_target=%s:%d new_target=%s:%d host_changed=%d port_changed=%d stream_changed=%d send_control=%d suppress=%d restart=%d",
+         previous_host[0] != '\0' ? previous_host : "(none)",
+         previous_port,
+         context->host && context->host[0] != '\0' ? context->host : "(none)",
+         context->port,
+         host_changed ? 1 : 0,
+         port_changed ? 1 : 0,
+         stream_settings_changed ? 1 : 0,
+         send_control ? 1 : 0,
+         suppress_control_send ? 1 : 0,
+         need_receiver_restart ? 1 : 0);
 
     // Do blocking operations OUTSIDE the lock to avoid deadlock with callback threads
     if (old_discovery) {
@@ -1205,8 +1412,18 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
         pthread_mutex_unlock(&context->lock);
     }
 
-    if (send_control && context->host && context->host[0] != '\0') {
-        uvc_custom_network_send_control(context);
+    if (send_control && !suppress_control_send && context->host && context->host[0] != '\0') {
+        /* Pass captured local values -- avoids race where video_tick could
+         * overwrite context->control_* between here and send_control() reading them. */
+        uvc_custom_network_send_control(context,
+                                        exposure_lock, focus_lock,
+                                        exposure_compensation, af_mode, af_lock,
+                                        flash_mode, wb_mode, wb_kelvin,
+                                        resolution_index, fps, quality);
+    } else if (send_control && suppress_control_send) {
+        blog(LOG_INFO, "UVC CONTROL skipped because suppress_next_control_send was set");
+    } else if (send_control) {
+        blog(LOG_WARNING, "UVC CONTROL skipped because target host is empty");
     }
 
     UNUSED_PARAMETER(host_changed);

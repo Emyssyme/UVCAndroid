@@ -48,6 +48,9 @@ struct uvc_custom_network {
     int pending_flash_mode;
     int pending_wb_mode;
     int pending_wb_kelvin;
+    int pending_resolution_index;
+    int pending_fps;
+    int pending_quality;
 
     char *discovery_status;
     network_discovery_t *discovery;
@@ -73,6 +76,18 @@ struct uvc_custom_network {
     bool tally_preview;
     uint64_t last_tally_send_ns;
     uint64_t last_remote_apply_ns;
+
+    /* Timestamp of the last CONTROL packet sent from OBS to Android.
+     * While within OBS_CONTROL_AUTHORITY_NS of this timestamp, incoming
+     * Android CONTROL_STATE echoes are suppressed so they do not overwrite
+     * the user's intended change before Android has a chance to apply it. */
+    uint64_t last_obs_control_send_ns;
+
+    /* Rate-limits obs_source_update_properties() calls from the video tick. */
+    uint64_t last_props_refresh_ns;
+
+    /* Set to true at the top of destroy() so video_tick skips unsafe OBS API calls. */
+    volatile bool destroying;
 };
 
 obs_source_info *get_uvc_custom_network_info();

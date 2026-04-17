@@ -293,11 +293,11 @@ public class MainActivity extends AppCompatActivity {
     private boolean mInternalExposureLock = false;
     private boolean mInternalAeLock = false;
     private boolean mInternalFocusLock = false;
-    private int mInternalFocusLockPreviousAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+    private int mInternalFocusLockPreviousAfMode = 2;
     private boolean mInternalFocusLockPreviousTapToFocus = false;
-    private int mInternalAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+    private int mInternalAfMode = 2;
     private boolean mInternalAfLock = false;
-    private int mInternalAfLockPreviousAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+    private int mInternalAfLockPreviousAfMode = 2;
     private boolean mInternalAfLockPreviousTapToFocus = false;
     private int mInternalFlashMode = CaptureRequest.FLASH_MODE_OFF;
     private int mInternalWbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO;
@@ -1435,7 +1435,12 @@ public class MainActivity extends AppCompatActivity {
             mBinding.tvStreamStatus.setText(R.string.stream_status_ndi);
         } else if (mStreamProtocol == StreamProtocol.TCP_UDP) {
             if (hasCustomTransportDestination()) {
+                String resolutionLabel = "";
+                if (mInternalPreviewSize != null) {
+                    resolutionLabel = " res=" + mInternalPreviewSize.getWidth() + "x" + mInternalPreviewSize.getHeight();
+                }
                 String base = "H.265 TCP server: 0.0.0.0:" + mStreamPort
+                        + resolutionLabel
                         + " @ " + mVideoTargetFps + " fps"
                         + " q=" + mVideoQuality;
                 mBinding.tvStreamStatus.setText(base + "\n" + getTcpTelemetryOverlay());
@@ -1852,45 +1857,28 @@ public class MainActivity extends AppCompatActivity {
 
         mBinding.btnInternalAfToggle.setOnClickListener(v -> {
             if (mInternalCameraHelper == null) return;
-            if (mInternalCameraHelper.isTapToFocusMode()) {
-                mInternalCameraHelper.setTapToFocusMode(false);
-                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
-                mInternalAfMode = 0;
-                mBinding.btnInternalAfToggle.setText("AF: Off");
-            } else if (mInternalCameraHelper.getAfMode() == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
-                mInternalCameraHelper.setTapToFocusMode(true);
-                mInternalAfMode = 3;
-                mBinding.btnInternalAfToggle.setText("AF: Tap");
+            int currentObsAfMode = getCurrentObsAfMode();
+            if (currentObsAfMode == 3) {
+                applyObsAfMode(0);
+            } else if (currentObsAfMode == 2) {
+                applyObsAfMode(3);
             } else {
-                mInternalCameraHelper.setTapToFocusMode(false);
-                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
-                mInternalAfMode = 2;
-                mBinding.btnInternalAfToggle.setText("AF: Auto");
+                applyObsAfMode(2);
             }
-            mBinding.btnQuickAf.setText(mInternalCameraHelper.isTapToFocusMode() ? "AF Tap" :
-                    (mInternalCameraHelper.getAfMode() == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO ? "AF Auto" : "AF Off"));
+            updateInternalCameraControlPanel();
         });
 
         mBinding.btnQuickAf.setOnClickListener(v -> {
             if (mInternalCameraHelper == null) return;
-            if (mInternalCameraHelper.isTapToFocusMode()) {
-                mInternalCameraHelper.setTapToFocusMode(false);
-                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
-                mInternalAfMode = 0;
-                mBinding.btnQuickAf.setText("AF Off");
-                mBinding.btnInternalAfToggle.setText("AF: Off");
-            } else if (mInternalCameraHelper.getAfMode() == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
-                mInternalCameraHelper.setTapToFocusMode(true);
-                mInternalAfMode = 3;
-                mBinding.btnQuickAf.setText("AF Tap");
-                mBinding.btnInternalAfToggle.setText("AF: Tap");
+            int currentObsAfMode = getCurrentObsAfMode();
+            if (currentObsAfMode == 3) {
+                applyObsAfMode(0);
+            } else if (currentObsAfMode == 2) {
+                applyObsAfMode(3);
             } else {
-                mInternalCameraHelper.setTapToFocusMode(false);
-                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
-                mInternalAfMode = 2;
-                mBinding.btnQuickAf.setText("AF Auto");
-                mBinding.btnInternalAfToggle.setText("AF: Auto");
+                applyObsAfMode(2);
             }
+            updateInternalCameraControlPanel();
         });
 
         mBinding.btnBottomSelectCamera.setOnClickListener(v -> showInternalCameraListDialog());
@@ -1975,16 +1963,32 @@ public class MainActivity extends AppCompatActivity {
             mBinding.seekbarInternalKelvin.setProgress((kelvin - 2000) * 100 / 8000);
         }
 
-        int afMode = mInternalCameraHelper.getAfMode();
-        if (mInternalCameraHelper.isTapToFocusMode()) {
+        int obsAfMode = getCurrentObsAfMode();
+        mInternalAfMode = obsAfMode;
+        if (obsAfMode == 3) {
             mBinding.btnInternalAfToggle.setText("AF: Tap");
             mBinding.btnQuickAf.setText("AF Tap");
             mBinding.btnBottomAfMode.setText(mInternalAfLock ? "AF Locked" : "AF Tap");
-        } else if (afMode == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
+        } else if (obsAfMode == 5) {
+            mBinding.btnInternalAfToggle.setText("AF: Macro");
+            mBinding.btnQuickAf.setText("AF Macro");
+            mBinding.btnBottomAfMode.setText(mInternalAfLock ? "AF Locked" : "AF Macro");
+        } else if (obsAfMode == 4) {
+            mBinding.btnInternalAfToggle.setText("AF: Infinity");
+            mBinding.btnQuickAf.setText("AF Infinity");
+            mBinding.btnBottomAfMode.setText(mInternalAfLock ? "AF Locked" : "AF Infinity");
+        } else if (obsAfMode == 2) {
+            mInternalAfMode = 2;
+            mBinding.btnInternalAfToggle.setText("AF: Continuous");
+            mBinding.btnQuickAf.setText("AF Cont");
+            mBinding.btnBottomAfMode.setText(mInternalAfLock ? "AF Locked" : "AF Continuous");
+        } else if (obsAfMode == 1) {
+            mInternalAfMode = 1;
             mBinding.btnInternalAfToggle.setText("AF: Auto");
             mBinding.btnQuickAf.setText("AF Auto");
             mBinding.btnBottomAfMode.setText(mInternalAfLock ? "AF Locked" : "AF Auto");
         } else {
+            mInternalAfMode = 0;
             mBinding.btnInternalAfToggle.setText("AF: Off");
             mBinding.btnQuickAf.setText("AF Off");
             mBinding.btnBottomAfMode.setText(mInternalAfLock ? "AF Locked" : "AF Off");
@@ -2008,6 +2012,7 @@ public class MainActivity extends AppCompatActivity {
         mBinding.btnBottomFocusLock.setTextColor(mInternalFocusLock ? activeColor : inactiveColor);
         mBinding.btnBottomExposureLock.setBackgroundTintList(android.content.res.ColorStateList.valueOf(mInternalExposureLock ? activeBackground : inactiveBackground));
         mBinding.btnBottomFocusLock.setBackgroundTintList(android.content.res.ColorStateList.valueOf(mInternalFocusLock ? activeBackground : inactiveBackground));
+        maybeSendTcpControlStateToObs();
     }
 
     private void showExposureDialog() {
@@ -2081,24 +2086,7 @@ public class MainActivity extends AppCompatActivity {
         AlertDialog.Builder builder = new AlertDialog.Builder(this);
         builder.setTitle("Autofocus Mode");
         builder.setItems(labels, (dialog, which) -> {
-            if (which == 3) {
-                mInternalCameraHelper.setTapToFocusMode(true);
-                mInternalAfMode = 3;
-            } else if (which == 4) {
-                mInternalCameraHelper.setTapToFocusMode(false);
-                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
-                mInternalCameraHelper.setFocusDistance(0f);
-                mInternalAfMode = 4;
-            } else if (which == 5) {
-                mInternalCameraHelper.setTapToFocusMode(false);
-                mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
-                mInternalCameraHelper.setFocusDistance(mInternalCameraHelper.getMinFocusDistance());
-                mInternalAfMode = 5;
-            } else {
-                mInternalCameraHelper.setTapToFocusMode(false);
-                mInternalCameraHelper.setAfMode(modes[which]);
-                mInternalAfMode = which;
-            }
+            applyObsAfMode(which);
             updateInternalCameraControlPanel();
         });
         builder.show();
@@ -2225,6 +2213,7 @@ public class MainActivity extends AppCompatActivity {
         }
         mLastProcessedTcpControlPayload = msg != null ? msg : "";
         mLastProcessedTcpControlNs = nowNs;
+        Log.i(TAG, "Received CONTROL from OBS: " + msg);
 
         boolean exposureLock = msg.contains("exposure_lock=1");
         boolean focusLock = msg.contains("focus_lock=1");
@@ -2234,6 +2223,9 @@ public class MainActivity extends AppCompatActivity {
         int parsedFlashMode = -1;
         int parsedWbMode = -1;
         int parsedWbKelvin = mInternalWbKelvin;
+        int parsedResolutionIndex = mapCurrentPreviewToObsResolutionIndex();
+        int parsedTargetFps = mVideoTargetFps;
+        int parsedQuality = mVideoQuality;
 
         String[] parts = msg.split(";");
         for (String part : parts) {
@@ -2262,6 +2254,21 @@ public class MainActivity extends AppCompatActivity {
                     parsedWbKelvin = Integer.parseInt(part.substring(part.indexOf('=') + 1));
                 } catch (NumberFormatException ignored) {
                 }
+            } else if (part.startsWith("resolution_index=")) {
+                try {
+                    parsedResolutionIndex = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                } catch (NumberFormatException ignored) {
+                }
+            } else if (part.startsWith("fps=")) {
+                try {
+                    parsedTargetFps = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                } catch (NumberFormatException ignored) {
+                }
+            } else if (part.startsWith("quality=")) {
+                try {
+                    parsedQuality = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                } catch (NumberFormatException ignored) {
+                }
             }
         }
 
@@ -2270,44 +2277,26 @@ public class MainActivity extends AppCompatActivity {
         final int flashMode = parsedFlashMode;
         final int wbMode = parsedWbMode;
         final int wbKelvin = parsedWbKelvin;
+        final int resolutionIndex = parsedResolutionIndex;
+        final int targetFps = parsedTargetFps;
+        final int quality = parsedQuality;
 
         runOnUiThread(() -> {
             mInternalExposureLock = exposureLock;
-            mInternalFocusLock = focusLock;
-            mInternalAfLock = afLock;
             if (mInternalCameraHelper != null && mCameraMode == CameraMode.INTERNAL) {
                 mInternalCameraHelper.setPreviewUpdatesSuspended(true);
                 try {
-                    if (mInternalExposureLock) {
-                        if (!mInternalCameraHelper.isAeAuto()) {
-                            mInternalCameraHelper.setAeAuto(true);
-                        }
-                        if (mInternalCameraHelper.isAeAuto()) {
-                            mInternalCameraHelper.setExposureCompensation(exposureCompensation);
-                        }
-                        mInternalCameraHelper.setAeLock(true);
-                    } else {
-                        mInternalCameraHelper.setAeLock(false);
+                    /* Exposure compensation should track immediately and independently
+                     * from AE lock.  The helper stores the requested EV value even if
+                     * the camera is not currently locked, so the UI reflects the change
+                     * right away and Camera2 applies it whenever AE mode allows it. */
+                    mInternalCameraHelper.setExposureCompensation(exposureCompensation);
+                    if (mInternalExposureLock && !mInternalCameraHelper.isAeAuto()) {
+                        mInternalCameraHelper.setAeAuto(true);
                     }
+                    mInternalCameraHelper.setAeLock(mInternalExposureLock);
                     if (afMode >= 0) {
-                        if (afMode == 3) { // Tap
-                            mInternalCameraHelper.setTapToFocusMode(true);
-                        } else if (afMode == 4) { // Infinity
-                            mInternalCameraHelper.setTapToFocusMode(false);
-                            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
-                            mInternalCameraHelper.setFocusDistance(0f);
-                        } else if (afMode == 5) { // Macro
-                            mInternalCameraHelper.setTapToFocusMode(false);
-                            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
-                            mInternalCameraHelper.setFocusDistance(mInternalCameraHelper.getMinFocusDistance());
-                        } else if (afMode == 2) { // Continuous — OBS index 2 → Camera2 CONTINUOUS_VIDEO=3
-                            mInternalCameraHelper.setTapToFocusMode(false);
-                            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
-                        } else { // 0=Off, 1=Auto — Camera2 OFF=0, AUTO=1
-                            mInternalCameraHelper.setTapToFocusMode(false);
-                            mInternalCameraHelper.setAfMode(afMode);
-                        }
-                        mInternalAfMode = afMode;
+                        applyObsAfMode(afMode);
                     }
                     if (flashMode >= 0) {
                         // OBS plugin: 0=Auto, 1=On, 2=Off, 3=Torch
@@ -2363,22 +2352,30 @@ public class MainActivity extends AppCompatActivity {
                                 break;
                         }
                     }
-                    if (mInternalFocusLock) {
-                        setInternalFocusLock(true);
+                    if (mInternalFocusLock != focusLock) {
+                        setInternalFocusLock(focusLock);
                     } else {
-                        setInternalFocusLock(false);
+                        mInternalFocusLock = focusLock;
                     }
-                    if (mInternalAfLock) {
-                        setInternalAfLock(true);
+                    if (mInternalAfLock != afLock) {
+                        setInternalAfLock(afLock);
                     } else {
-                        setInternalAfLock(false);
+                        mInternalAfLock = afLock;
                     }
                 } finally {
                     mInternalCameraHelper.setPreviewUpdatesSuspended(false);
-                    clearTcpUdpFrameQueue();
-                    requestH264SyncFrameAsync();
                 }
+                // Immediate refresh — reads UI-field values (locks etc.) which are
+                // already up to date.
+                updateInternalCameraControlPanel();
+                // Delayed refresh — camera applies AE/AF/AWB changes asynchronously;
+                // wait 400 ms so getAfMode()/isAeAuto()/etc. return the new state.
+                mBinding.getRoot().postDelayed(this::updateInternalCameraControlPanel, 400);
+            } else {
+                mInternalFocusLock = focusLock;
+                mInternalAfLock = afLock;
             }
+            applyRemoteStreamSettings(resolutionIndex, targetFps, quality);
         });
     }
 
@@ -2391,8 +2388,8 @@ public class MainActivity extends AppCompatActivity {
 
         if (locked) {
             if (!mInternalFocusLock) {
-                mInternalFocusLockPreviousAfMode = mInternalCameraHelper.getAfMode();
-                mInternalFocusLockPreviousTapToFocus = mInternalCameraHelper.isTapToFocusMode();
+                mInternalFocusLockPreviousAfMode = getCurrentObsAfMode();
+                mInternalFocusLockPreviousTapToFocus = (mInternalFocusLockPreviousAfMode == 3);
             }
             mInternalFocusLock = true;
             mInternalCameraHelper.setTapToFocusMode(false);
@@ -2400,10 +2397,9 @@ public class MainActivity extends AppCompatActivity {
         } else {
             mInternalFocusLock = false;
             if (mInternalFocusLockPreviousTapToFocus) {
-                mInternalCameraHelper.setTapToFocusMode(true);
+                applyObsAfMode(3);
             } else {
-                mInternalCameraHelper.setTapToFocusMode(false);
-                mInternalCameraHelper.setAfMode(mInternalFocusLockPreviousAfMode);
+                applyObsAfMode(mInternalFocusLockPreviousAfMode);
             }
         }
         updateInternalCameraControlPanel();
@@ -2418,8 +2414,8 @@ public class MainActivity extends AppCompatActivity {
 
         if (locked) {
             if (!mInternalAfLock) {
-                mInternalAfLockPreviousAfMode = mInternalCameraHelper.getAfMode();
-                mInternalAfLockPreviousTapToFocus = mInternalCameraHelper.isTapToFocusMode();
+                mInternalAfLockPreviousAfMode = getCurrentObsAfMode();
+                mInternalAfLockPreviousTapToFocus = (mInternalAfLockPreviousAfMode == 3);
             }
             mInternalAfLock = true;
             mInternalCameraHelper.setTapToFocusMode(false);
@@ -2427,10 +2423,9 @@ public class MainActivity extends AppCompatActivity {
         } else {
             mInternalAfLock = false;
             if (mInternalAfLockPreviousTapToFocus) {
-                mInternalCameraHelper.setTapToFocusMode(true);
+                applyObsAfMode(3);
             } else {
-                mInternalCameraHelper.setTapToFocusMode(false);
-                mInternalCameraHelper.setAfMode(mInternalAfLockPreviousAfMode);
+                applyObsAfMode(mInternalAfLockPreviousAfMode);
             }
         }
         updateInternalCameraControlPanel();
@@ -2822,6 +2817,133 @@ public class MainActivity extends AppCompatActivity {
             }
         });
         mInternalResolutionDialog.show(getSupportFragmentManager(), "internal_resolution");
+    }
+
+    private int clampObsResolutionIndex(int index) {
+        return Math.max(0, Math.min(3, index));
+    }
+
+    private int mapCurrentPreviewToObsResolutionIndex() {
+        if (mInternalPreviewSize == null) {
+            return 1;
+        }
+
+        android.util.Size[] obsSizes = new android.util.Size[] {
+                new android.util.Size(640, 360),
+                new android.util.Size(1280, 720),
+                new android.util.Size(1920, 1080),
+                new android.util.Size(3840, 2160)
+        };
+
+        int bestIndex = 1;
+        long bestScore = Long.MAX_VALUE;
+        long currentPixels = (long) mInternalPreviewSize.getWidth() * (long) mInternalPreviewSize.getHeight();
+        float currentAspect = mInternalPreviewSize.getWidth() / (float) Math.max(1, mInternalPreviewSize.getHeight());
+        for (int i = 0; i < obsSizes.length; i++) {
+            android.util.Size candidate = obsSizes[i];
+            if (candidate.equals(mInternalPreviewSize)) {
+                return i;
+            }
+            long candidatePixels = (long) candidate.getWidth() * (long) candidate.getHeight();
+            float candidateAspect = candidate.getWidth() / (float) Math.max(1, candidate.getHeight());
+            long score = Math.abs(candidatePixels - currentPixels)
+                    + (long) (Math.abs(candidateAspect - currentAspect) * 10_000_000L);
+            if (score < bestScore) {
+                bestScore = score;
+                bestIndex = i;
+            }
+        }
+        return bestIndex;
+    }
+
+    private android.util.Size getBestInternalSizeForObsResolutionIndex(InternalCameraInfo cameraInfo, int resolutionIndex) {
+        if (cameraInfo == null) {
+            return mInternalPreviewSize;
+        }
+
+        android.util.Size[] supported = InternalCameraHelper.getSupportedSizes(this, cameraInfo.cameraId);
+        if (supported == null || supported.length == 0) {
+            return mInternalPreviewSize;
+        }
+
+        android.util.Size[] obsSizes = new android.util.Size[] {
+                new android.util.Size(640, 360),
+                new android.util.Size(1280, 720),
+                new android.util.Size(1920, 1080),
+                new android.util.Size(3840, 2160)
+        };
+        android.util.Size desired = obsSizes[clampObsResolutionIndex(resolutionIndex)];
+        android.util.Size best = supported[0];
+        long desiredPixels = (long) desired.getWidth() * (long) desired.getHeight();
+        float desiredAspect = desired.getWidth() / (float) Math.max(1, desired.getHeight());
+        long bestScore = Long.MAX_VALUE;
+
+        for (android.util.Size candidate : supported) {
+            if (candidate.equals(desired)) {
+                return candidate;
+            }
+            long candidatePixels = (long) candidate.getWidth() * (long) candidate.getHeight();
+            float candidateAspect = candidate.getWidth() / (float) Math.max(1, candidate.getHeight());
+            long score = Math.abs(candidatePixels - desiredPixels)
+                    + (long) (Math.abs(candidateAspect - desiredAspect) * 10_000_000L);
+            if (score < bestScore) {
+                bestScore = score;
+                best = candidate;
+            }
+        }
+
+        return best;
+    }
+
+    private void applyRemoteStreamSettings(int resolutionIndex, int targetFps, int quality) {
+        int clampedResolutionIndex = clampObsResolutionIndex(resolutionIndex);
+        int clampedTargetFps = Math.max(24, Math.min(60, targetFps));
+        int clampedQuality = Math.max(10, Math.min(100, quality));
+        Log.i(TAG, "Applying OBS stream settings: resolution_index=" + clampedResolutionIndex
+            + " fps=" + clampedTargetFps + " quality=" + clampedQuality);
+
+        boolean fpsChanged = clampedTargetFps != mVideoTargetFps;
+        boolean qualityChanged = clampedQuality != mVideoQuality;
+        if (fpsChanged) {
+            setSavedVideoTargetFps(clampedTargetFps);
+        }
+        if (qualityChanged) {
+            setSavedVideoQuality(clampedQuality);
+        }
+
+        boolean resolutionChanged = false;
+        android.util.Size targetSize = null;
+        if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null) {
+            targetSize = getBestInternalSizeForObsResolutionIndex(mCurrentInternalCamera, clampedResolutionIndex);
+            resolutionChanged = targetSize != null
+                    && (mInternalPreviewSize == null || !targetSize.equals(mInternalPreviewSize));
+            if (resolutionChanged && !mIsCameraConnected) {
+                mInternalPreviewSize = targetSize;
+                resolutionChanged = false;
+            }
+        }
+
+        updateStreamStatus();
+        invalidateOptionsMenu();
+
+        if (resolutionChanged && mInternalCameraHelper != null) {
+            mPendingOpenCamera = mCurrentInternalCamera;
+            mPendingOpenSize = targetSize;
+            mInternalCameraHelper.closeCamera();
+            return;
+        }
+
+        if ((fpsChanged || qualityChanged) && mStreamProtocol == StreamProtocol.TCP_UDP && mIsCameraConnected) {
+            cleanupNdiAndStreaming();
+            if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
+                setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+            } else if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
+                Size usbSize = mCameraHelper.getPreviewSize();
+                if (usbSize != null) {
+                    setupTcpUdpForUsbCamera(mUsbDevice, usbSize);
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -3639,21 +3761,83 @@ public class MainActivity extends AppCompatActivity {
         return 2;
     }
 
+    private int getCurrentObsAfMode() {
+        if (mInternalCameraHelper == null) {
+            return mInternalAfMode;
+        }
+        if (mInternalCameraHelper.isTapToFocusMode()) {
+            return 3;
+        }
+
+        int afMode = mInternalCameraHelper.getAfMode();
+        if (afMode == CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO) {
+            return 2;
+        }
+        if (afMode == CaptureRequest.CONTROL_AF_MODE_AUTO) {
+            return 1;
+        }
+        if (afMode == CaptureRequest.CONTROL_AF_MODE_OFF) {
+            float minFocusDistance = mInternalCameraHelper.getMinFocusDistance();
+            float currentFocusDistance = mInternalCameraHelper.getCurrentFocusDistance();
+            if (mInternalAfMode == 4 && currentFocusDistance <= 0.01f) {
+                return 4;
+            }
+            if (mInternalAfMode == 5 && minFocusDistance > 0f
+                    && Math.abs(currentFocusDistance - minFocusDistance) <= Math.max(0.05f, minFocusDistance * 0.05f)) {
+                return 5;
+            }
+        }
+        return 0;
+    }
+
+    private void applyObsAfMode(int obsAfMode) {
+        if (mInternalCameraHelper == null) {
+            mInternalAfMode = obsAfMode;
+            return;
+        }
+
+        if (obsAfMode == 3) {
+            mInternalCameraHelper.setTapToFocusMode(true);
+        } else if (obsAfMode == 4) {
+            mInternalCameraHelper.setTapToFocusMode(false);
+            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+            mInternalCameraHelper.setFocusDistance(0f);
+        } else if (obsAfMode == 5) {
+            mInternalCameraHelper.setTapToFocusMode(false);
+            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+            mInternalCameraHelper.setFocusDistance(mInternalCameraHelper.getMinFocusDistance());
+        } else if (obsAfMode == 2) {
+            mInternalCameraHelper.setTapToFocusMode(false);
+            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+        } else if (obsAfMode == 1) {
+            mInternalCameraHelper.setTapToFocusMode(false);
+            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_AUTO);
+        } else {
+            mInternalCameraHelper.setTapToFocusMode(false);
+            mInternalCameraHelper.setAfMode(CaptureRequest.CONTROL_AF_MODE_OFF);
+        }
+
+        mInternalAfMode = obsAfMode;
+    }
+
     private String buildTcpControlStatePayload() {
         int exposureCompensation = 0;
         if (mInternalCameraHelper != null) {
             exposureCompensation = mInternalCameraHelper.getCurrentExposureCompensation();
         }
         return String.format(java.util.Locale.US,
-                "CONTROL_STATE;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d",
+                "CONTROL_STATE;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d",
                 mInternalExposureLock ? 1 : 0,
                 mInternalFocusLock ? 1 : 0,
                 exposureCompensation,
-                mInternalAfMode,
+                getCurrentObsAfMode(),
                 mInternalAfLock ? 1 : 0,
                 mapInternalFlashModeToObsFlashMode(),
                 mapInternalWbModeToObsWbMode(),
-                mInternalWbKelvin);
+                mInternalWbKelvin,
+                mapCurrentPreviewToObsResolutionIndex(),
+                mVideoTargetFps,
+                mVideoQuality);
     }
 
     private void maybeSendTcpControlStateToObs() {
