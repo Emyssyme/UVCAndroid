@@ -425,6 +425,13 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
     parse_message_int(msg, "fps=", &fps);
     parse_message_int(msg, "quality=", &quality);
 
+    /* Ignore noisy EV drift when AE lock is off to avoid sync churn/freeze loops. */
+    if (exposure_lock == 0) {
+        pthread_mutex_lock(&context->lock);
+        exposure_compensation = context->control_exposure_compensation;
+        pthread_mutex_unlock(&context->lock);
+    }
+
     bool changed = false;
     pthread_mutex_lock(&context->lock);
     /* Only queue the Android state if it actually differs from what OBS already
