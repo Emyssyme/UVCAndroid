@@ -193,7 +193,8 @@ static bool uvc_custom_network_activate_button(obs_properties_t *props, obs_prop
     }
 
     bool was_running = context->receiver_running || context->srt_receiver_running;
-    bool has_target = (context->port > 0) && (context->host && context->host[0] != '\0');
+    bool has_target = (context->host && context->host[0] != '\0')
+        && (context->use_srt ? context->srt_port > 0 : context->port > 0);
 
     if (was_running) {
         uvc_custom_network_receiver_stop(context);
@@ -400,8 +401,10 @@ static void uvc_custom_network_send_tally(uvc_custom_network *context, bool forc
         return;
     }
 
-    char payload[64];
-    snprintf(payload, sizeof(payload), "TALLY;program=%d;preview=%d", program ? 1 : 0, preview ? 1 : 0);
+    char payload[96];
+    snprintf(payload, sizeof(payload),
+             "TALLY;program=%d;preview=%d;srt_port=%d",
+             program ? 1 : 0, preview ? 1 : 0, context->srt_port);
 
     if (changed || force_send) {
         blog(LOG_INFO, "UVC TALLY -> Android (%s:%d): %s",
@@ -476,9 +479,9 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
         return;
     }
 
-    char payload[320];
+    char payload[384];
     snprintf(payload, sizeof(payload),
-             "CONTROL;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d",
+             "CONTROL;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d;srt_port=%d",
              exposure_lock ? 1 : 0,
              focus_lock ? 1 : 0,
              exposure_compensation,
@@ -489,7 +492,8 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
              wb_kelvin,
              resolution_index,
              fps,
-             quality);
+             quality,
+             context->srt_port);
 
     blog(LOG_INFO, "UVC CONTROL -> Android: %s", payload);
 
@@ -645,10 +649,14 @@ static void uvc_custom_network_video_tick(void *data, float seconds)
 
     /* ── Sync status & source name to settings (rate-limited) ── */
     bool do_ui_refresh = context->pending_ui_refresh;
+    bool do_discovery_save = context->pending_discovery_save;
     if (do_ui_refresh) {
         context->pending_ui_refresh = false;
     }
-    if (now_ns - context->last_props_refresh_ns >= 500000000ULL || do_ui_refresh) {
+    if (do_discovery_save) {
+        context->pending_discovery_save = false;
+    }
+    if (now_ns - context->last_props_refresh_ns >= 500000000ULL || do_ui_refresh || do_discovery_save) {
         context->last_props_refresh_ns = now_ns;
         obs_data_t *settings = obs_source_get_settings(context->source);
         if (settings) {
@@ -656,6 +664,12 @@ static void uvc_custom_network_video_tick(void *data, float seconds)
             if (context->discovery_status) {
                 obs_data_set_string(settings, "discovery_status",
                     context->discovery_status);
+            }
+            /* Persist auto-discovered host/port so the source can
+             * auto-start on the next OBS launch. */
+            if (do_discovery_save && context->host && context->host[0] != '\0') {
+                obs_data_set_string(settings, "host", context->host);
+                obs_data_set_int(settings, "port", context->port);
             }
             pthread_mutex_unlock(&context->lock);
             obs_data_release(settings);
@@ -995,14 +1009,26 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
     int rcvbuf = 4 * 1024 * 1024;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&rcvbuf, sizeof(rcvbuf));
 
-    struct sockaddr_in local_addr;
-    memset(&local_addr, 0, sizeof(local_addr));
-    local_addr.sin_family = AF_INET;
-    local_addr.sin_port = htons((uint16_t)port);
-    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
-        blog(LOG_WARNING, "UVC SRT: bind failed on port %d", port);
+    /* Auto-select an available UDP port.  Try the configured port first,
+     * then scan upward so multiple OBS sources never collide. */
+    int bound_port = 0;
+    {
+        struct sockaddr_in local_addr;
+        for (int attempt = 0; attempt < 100; attempt++) {
+            int try_port = port + attempt;
+            if (try_port < 1024 || try_port > 65535) continue;
+            memset(&local_addr, 0, sizeof(local_addr));
+            local_addr.sin_family = AF_INET;
+            local_addr.sin_port = htons((uint16_t)try_port);
+            local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+            if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) == 0) {
+                bound_port = try_port;
+                break;
+            }
+        }
+    }
+    if (bound_port == 0) {
+        blog(LOG_WARNING, "UVC SRT: no available UDP port in range %d–%d", port, port + 99);
 #ifdef _WIN32
         closesocket(sock);
 #else
@@ -1014,6 +1040,14 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
         context->srt_receiver_running = false;
         return NULL;
     }
+    port = bound_port;
+
+    /* Store the actual bound port so other code (TALLY, status) uses it. */
+    pthread_mutex_lock(&context->lock);
+    context->srt_port = bound_port;
+    context->configured_srt_port = bound_port;
+    pthread_mutex_unlock(&context->lock);
+    blog(LOG_INFO, "UVC SRT: bound to UDP port %d", bound_port);
 
 #ifdef _WIN32
     DWORD timeout = 500;
@@ -1063,6 +1097,7 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
     }
 
     bool logged_first = false;
+    bool logged_first_packet = false;
     uint8_t recv_buf[64 * 1024];
 
     /* Chunk reassembly state */
@@ -1072,6 +1107,22 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
     uint16_t reasm_total = 0;
     uint16_t reasm_got = 0;
     size_t  reasm_size = 0;
+
+    /* ── SRT latency buffer: smooths jitter by delaying frame output ── */
+#define SRT_DELAY_MAX 32
+    struct srt_delayed {
+        struct obs_source_frame obs;
+        AVFrame *av_frame;   // referenced (av_frame_ref), freed on output
+        uint64_t output_ns;
+    } delay_buf[SRT_DELAY_MAX];
+    int delay_head = 0, delay_count = 0;
+
+    int latency_ms;
+    pthread_mutex_lock(&context->lock);
+    latency_ms = context->srt_latency_ms;
+    pthread_mutex_unlock(&context->lock);
+    uint64_t latency_ns = (uint64_t)latency_ms * 1000000ULL;
+    blog(LOG_INFO, "UVC SRT: latency buffer = %d ms", latency_ms);
 
     while (context->srt_receiver_running) {
         struct sockaddr_in from_addr;
@@ -1086,6 +1137,14 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
 #endif
         if (got <= 0) continue;
         if (got < 16) continue; /* need at least the 16-byte chunk header */
+
+        if (!logged_first_packet) {
+            char from_ip[64];
+            inet_ntop(AF_INET, &from_addr.sin_addr, from_ip, sizeof(from_ip));
+            blog(LOG_INFO, "UVC SRT: first packet received — %d bytes from %s:%d",
+                 got, from_ip, (int)ntohs(from_addr.sin_port));
+            logged_first_packet = true;
+        }
 
         uint64_t recv_time_ns = os_gettime_ns();
 
@@ -1231,9 +1290,41 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
                     uvc_custom_network_set_status(context, "%s", status);
                 }
 
-                /* Guard: don't output video if the source is being removed */
-                if (!context->destroying) {
-                    obs_source_output_video(context->source, &obs_frame);
+                /* ── Latency-buffered output ──
+                 * Drain any frames whose delay has expired, then
+                 * enqueue this frame for delayed output. */
+                {
+                    uint64_t drain_now = os_gettime_ns();
+                    while (delay_count > 0) {
+                        if (drain_now >= delay_buf[delay_head].output_ns) {
+                            if (!context->destroying) {
+                                obs_source_output_video(context->source,
+                                    &delay_buf[delay_head].obs);
+                            }
+                            av_frame_free(&delay_buf[delay_head].av_frame);
+                            delay_head = (delay_head + 1) % SRT_DELAY_MAX;
+                            delay_count--;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    /* Enqueue the new frame */
+                    if (delay_count < SRT_DELAY_MAX) {
+                        int tail = (delay_head + delay_count) % SRT_DELAY_MAX;
+                        delay_buf[tail].obs = obs_frame;
+                        delay_buf[tail].av_frame = av_frame_alloc();
+                        if (delay_buf[tail].av_frame) {
+                            av_frame_ref(delay_buf[tail].av_frame, frame);
+                        }
+                        delay_buf[tail].output_ns = os_gettime_ns() + latency_ns;
+                        delay_count++;
+                    } else {
+                        /* Buffer saturated — force output immediately */
+                        if (!context->destroying) {
+                            obs_source_output_video(context->source, &obs_frame);
+                        }
+                    }
                 }
 
                 if (!logged_first) {
@@ -1244,6 +1335,15 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
             }
             av_frame_unref(frame);
         }
+    }
+
+    /* Drain any frames still in the latency buffer before cleanup */
+    for (int i = 0; i < delay_count; i++) {
+        int idx = (delay_head + i) % SRT_DELAY_MAX;
+        if (!context->destroying) {
+            obs_source_output_video(context->source, &delay_buf[idx].obs);
+        }
+        av_frame_free(&delay_buf[idx].av_frame);
     }
 
     if (decoder) avcodec_free_context(&decoder);
@@ -1687,6 +1787,10 @@ static void uvc_custom_network_discovery_callback(const char *host, int port, vo
         char name_buf[128];
         snprintf(name_buf, sizeof(name_buf), "📱 %s:%d (new)", host, port);
         context->source_display_name = bstrdup(name_buf);
+        /* Signal video_tick to persist the auto-filled host/port to settings
+         * so the source can auto-start on next OBS launch. */
+        context->pending_discovery_save = true;
+        context->pending_ui_refresh = true;
     }
 
     if (added) {
@@ -1812,6 +1916,10 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
             context->srt_port = saved_srt_port;
         }
     }
+    context->configured_srt_port = context->srt_port;
+    context->srt_latency_ms = (int)obs_data_get_int(settings, "srt_latency_ms");
+    if (context->srt_latency_ms < 20) context->srt_latency_ms = 20;
+    if (context->srt_latency_ms > 5000) context->srt_latency_ms = 5000;
 #ifdef _WIN32
     context->srt_receiver_socket = INVALID_SOCKET;
 #else
@@ -1825,6 +1933,7 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
     context->last_props_refresh_ns = 0;
     context->destroying = false;
     context->pending_ui_refresh = false;
+    context->pending_discovery_save = false;
     context->user_activated = false;
 #ifdef _WIN32
     context->tally_socket = INVALID_SOCKET;
@@ -1844,8 +1953,13 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
         network_discovery_start(context->discovery);
     }
 
-    // Auto-start receiver if phone IP and port are already configured
-    if (context->port > 0 && context->host && context->host[0] != '\0') {
+    // Auto-start receiver if phone IP and port are already configured.
+    // For SRT mode the relevant port is srt_port; for TCP it's port.
+    bool has_host = (context->host && context->host[0] != '\0');
+    bool can_start = context->use_srt
+        ? (has_host && context->srt_port > 0)
+        : (has_host && context->port > 0);
+    if (can_start) {
         context->user_activated = true; /* saved settings = user intended this */
         if (context->use_srt) {
             blog(LOG_INFO, "UVC SRT: auto-starting receiver (listening on UDP port %d from %s)",
@@ -1942,8 +2056,26 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
     p = obs_properties_add_bool(props, "use_srt", "Use SRT (UDP) — tally/control stay on TCP");
     if (is_active) obs_property_set_enabled(p, false);
 
-    p = obs_properties_add_int(props, "srt_port", "SRT Port", 1024, 65535, 1);
+    p = obs_properties_add_int(props, "srt_port", "SRT Port (auto-selects next free if busy)", 1024, 65535, 1);
     if (is_active) obs_property_set_enabled(p, false);
+
+    /* Show the port the SRT receiver actually bound to */
+    if (context && context->srt_receiver_running) {
+        p = obs_properties_add_text(props, "srt_bound_port", "📡 Listening SRT Port", OBS_TEXT_INFO);
+        if (p) {
+            char bound[32];
+            snprintf(bound, sizeof(bound), "%d", context->srt_port);
+            obs_property_set_long_description(p, bound);
+        }
+    }
+
+    p = obs_properties_add_int(props, "srt_latency_ms", "SRT Latency (ms)", 20, 500, 10);
+    if (p) {
+        obs_property_set_long_description(p,
+            "Frame buffer latency. Higher = smoother video but more delay.\n"
+            "Recommended: 4 x RTT + jitter (typically 80-200 ms on WiFi).");
+        if (is_active) obs_property_set_enabled(p, false);
+    }
 
     p = obs_properties_add_button(props, "activate",
         (context && (context->receiver_running || context->srt_receiver_running))
@@ -2019,7 +2151,7 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     if (!new_host) {
         new_host = "";
     }
-    if (context->receiver_running && new_host[0] == '\0' && previous_host[0] != '\0') {
+    if ((context->receiver_running || context->srt_receiver_running) && new_host[0] == '\0' && previous_host[0] != '\0') {
         /* When OBS rebuilds/reloads the properties view, transient blank host
          * values can be submitted with unrelated control changes.  Preserve the
          * active target so a checkbox toggle cannot silently clear the host and
@@ -2034,7 +2166,7 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     }
 
     int new_port = (int)obs_data_get_int(settings, "port");
-    if (context->receiver_running && new_port <= 0 && previous_port > 0) {
+    if ((context->receiver_running || context->srt_receiver_running) && new_port <= 0 && previous_port > 0) {
         obs_data_set_int(settings, "port", previous_port);
         new_port = previous_port;
     }
@@ -2067,11 +2199,21 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     /* SRT toggle and port */
     bool use_srt = obs_data_get_bool(settings, "use_srt");
     int srt_port = (int)obs_data_get_int(settings, "srt_port");
-    bool srt_changed = (use_srt != context->use_srt) || (srt_port != context->srt_port);
+    bool srt_changed = (use_srt != context->use_srt) || (srt_port != context->configured_srt_port);
     context->use_srt = use_srt;
     if (srt_port > 0 && srt_port <= 65535) {
-        context->srt_port = srt_port;
+        context->configured_srt_port = srt_port;
+        /* Only overwrite the live port if the receiver is NOT running.
+         * When running, srt_port was set by auto-bind and may differ. */
+        if (!context->srt_receiver_running) {
+            context->srt_port = srt_port;
+        }
     }
+
+    int srt_latency_ms = (int)obs_data_get_int(settings, "srt_latency_ms");
+    if (srt_latency_ms < 20) srt_latency_ms = 20;
+    if (srt_latency_ms > 5000) srt_latency_ms = 5000;
+    context->srt_latency_ms = srt_latency_ms;
 
     int resolution_index = (int)obs_data_get_int(settings, "resolution_index");
     int fps = (int)obs_data_get_int(settings, "fps");
@@ -2123,7 +2265,7 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
         context->discovery = NULL;
     }
 
-    if ((port_changed || host_changed || srt_changed) && context->receiver_running) {
+    if ((port_changed || host_changed || srt_changed) && (context->receiver_running || context->srt_receiver_running)) {
         need_receiver_restart = true;
     }
 
@@ -2243,6 +2385,7 @@ static void uvc_custom_network_defaults(obs_data_t *settings)
     obs_data_set_default_int(settings, "port", 5600);
     obs_data_set_default_bool(settings, "use_srt", false);
     obs_data_set_default_int(settings, "srt_port", SRT_DEFAULT_PORT);
+    obs_data_set_default_int(settings, "srt_latency_ms", 120);
     obs_data_set_default_int(settings, "fps", 30);
     obs_data_set_default_int(settings, "quality", 50);
     obs_data_set_default_int(settings, "resolution_index", 1);

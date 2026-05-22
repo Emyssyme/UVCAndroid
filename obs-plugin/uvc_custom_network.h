@@ -89,6 +89,8 @@ struct uvc_custom_network {
 #endif
     int srt_port;
     bool use_srt; // true when source is configured as SRT
+    int configured_srt_port; // user-configured port (srt_port may differ after auto-bind)
+    int srt_latency_ms; // frame buffer latency (default 120 ms)
 
     // last sent tally state (OBS -> Android UDP backchannel)
     bool tally_program;
@@ -121,6 +123,10 @@ struct uvc_custom_network {
     /* Set by button callbacks when the UI needs a dialog rebuild.
      * video_tick picks this up and calls obs_source_update_properties. */
     volatile bool pending_ui_refresh;
+
+    /* Set by the discovery callback when it auto-fills host/port so that
+     * video_tick can persist them to the source settings on the main thread. */
+    volatile bool pending_discovery_save;
 
     /* Set to true when the user pressed Activate; false after Stop.
      * Prevents scene-switch deactivation from stopping the receiver. */

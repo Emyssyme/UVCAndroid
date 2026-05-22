@@ -399,6 +399,7 @@ public class MainActivity extends AppCompatActivity {
         mStreamProtocol = getSavedStreamProtocol();
         mStreamHost = getSavedStreamHost();
         mStreamPort = getSavedStreamPort();
+        mSrtPort = getSavedSrtPort();
         mVideoTargetFps = getSavedVideoTargetFps();
         mVideoQuality = getSavedVideoQuality();
         mDeviceIp = getLocalIpAddress();
@@ -582,6 +583,7 @@ public class MainActivity extends AppCompatActivity {
                             }
                         } else if (nextProtocol == StreamProtocol.TCP_UDP) {
                             setupTcpUdpForUsbCamera(mUsbDevice, size);
+                            mHandler.post(mTallyPoller);
                         } else {
                             // SRT: video over SRT, tally/control stay on TCP
                             setupSrtForUsbCamera(mUsbDevice, size);
@@ -597,6 +599,7 @@ public class MainActivity extends AppCompatActivity {
                         setupNdiForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
                     } else if (nextProtocol == StreamProtocol.TCP_UDP) {
                         setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                        mHandler.post(mTallyPoller);
                     } else {
                         // SRT: video over SRT, tally/control stay on TCP
                         setupSrtForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
@@ -1360,6 +1363,12 @@ public class MainActivity extends AppCompatActivity {
                 .getInt(PREF_VIDEO_QUALITY, DEFAULT_VIDEO_QUALITY);
     }
 
+    private int getSavedSrtPort() {
+        return PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getInt(PREF_SRT_PORT, SRT_DEFAULT_PORT);
+    }
+
     private void setSavedVideoTargetFps(int fps) {
         fps = Math.max(24, Math.min(60, fps));
         PreferenceManager
@@ -1568,7 +1577,7 @@ public class MainActivity extends AppCompatActivity {
                 if (mInternalPreviewSize != null) {
                     resolutionLabel = " res=" + mInternalPreviewSize.getWidth() + "x" + mInternalPreviewSize.getHeight();
                 }
-                String base = ipLine + "SRT (caller): 0.0.0.0:" + mSrtPort
+                String base = ipLine + "SRT → " + mSrtRemoteHost + ":" + mSrtRemotePort
                         + resolutionLabel
                         + " @ " + mVideoTargetFps + " fps"
                         + " q=" + mVideoQuality;
@@ -2409,6 +2418,22 @@ public class MainActivity extends AppCompatActivity {
             } else if (part.startsWith("quality=")) {
                 try {
                     parsedQuality = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                } catch (NumberFormatException ignored) {
+                }
+            } else if (part.startsWith("srt_port=")) {
+                try {
+                    int p = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                    if (p > 0 && p <= 65535) {
+                        if (p != mSrtRemotePort) {
+                            mSrtRemotePort = p;
+                            Log.i(TAG, "SRT port updated from CONTROL: " + p);
+                        }
+                        // Also update the stored default so a SRT thread
+                        // restart does not revert to the old port.
+                        if (p != mSrtPort) {
+                            mSrtPort = p;
+                        }
+                    }
                 } catch (NumberFormatException ignored) {
                 }
             }
@@ -3323,6 +3348,7 @@ public class MainActivity extends AppCompatActivity {
                 setupNdiForInternalCamera(cameraInfo, previewSize);
             } else if (mStreamProtocol == StreamProtocol.TCP_UDP) {
                 setupTcpUdpForInternalCamera(cameraInfo, previewSize);
+                mHandler.post(mTallyPoller);
             } else {
                 // SRT: video over SRT, tally/control on TCP
                 setupSrtForInternalCamera(cameraInfo, previewSize);
@@ -3614,11 +3640,13 @@ public class MainActivity extends AppCompatActivity {
         mSrtWorkerRunning = true;
 
         // Initialize SRT remote target — use subnet broadcast as fallback
-        // until discovery ACK provides the exact OBS IP.
+        // until discovery ACK or tally packet provides the exact OBS IP.
+        mSrtRemotePort = mSrtPort > 0 ? mSrtPort : SRT_DEFAULT_PORT;
         if (mSrtRemoteHost == null || mSrtRemoteHost.isEmpty()) {
             mSrtRemoteHost = getSubnetBroadcast();
-            mSrtRemotePort = mSrtPort > 0 ? mSrtPort : SRT_DEFAULT_PORT;
             Log.i(TAG, "SRT: using broadcast fallback " + mSrtRemoteHost + ":" + mSrtRemotePort);
+        } else {
+            Log.i(TAG, "SRT: using known host " + mSrtRemoteHost + ":" + mSrtRemotePort);
         }
         // Cache InetAddress once — never resolve per-packet
         try {
@@ -3636,9 +3664,9 @@ public class MainActivity extends AppCompatActivity {
             try {
                 mSrtSocket = new java.net.DatagramSocket();
                 mSrtSocket.setSendBufferSize(1024 * 1024);
-                // Connect the socket to filter and cache the target address
-                mSrtSocket.connect(new java.net.InetSocketAddress(mSrtRemoteAddr, mSrtRemotePort));
-                Log.i(TAG, "SRT: socket connected to " + mSrtRemoteHost + ":" + mSrtRemotePort);
+                mSrtSocket.setBroadcast(true); // needed when destination is a broadcast address
+                // Do NOT connect — destination may change when tally listener learns OBS IP.
+                Log.i(TAG, "SRT: socket ready, sending to " + mSrtRemoteHost + ":" + mSrtRemotePort);
             } catch (java.net.SocketException e) {
                 Log.e(TAG, "Failed to open SRT UDP socket", e);
                 mSrtWorkerRunning = false;
@@ -3646,10 +3674,18 @@ public class MainActivity extends AppCompatActivity {
             }
 
             // Main frame draining loop
+            boolean srtFirstFrame = true;
             while (mSrtWorkerRunning) {
                 try {
                     CustomUdpFrame frame = mSrtFrameQueue.poll(5, java.util.concurrent.TimeUnit.MILLISECONDS);
                     if (frame == null) continue;
+                    if (srtFirstFrame) {
+                        Log.i(TAG, "SRT: first frame dequeued "
+                                + frame.width + "x" + frame.height
+                                + " target=" + mSrtRemoteHost + ":" + mSrtRemotePort
+                                + " socket=" + (mSrtSocket != null));
+                        srtFirstFrame = false;
+                    }
                     try {
                         // Lazy-init encoder on first frame or when resolution changes
                         if (mH264Encoder == null
@@ -3690,6 +3726,10 @@ public class MainActivity extends AppCompatActivity {
     private void feedFrameToH264EncoderSrt(CustomUdpFrame frame) throws IOException {
         MediaCodec enc = mH264Encoder;
         if (enc == null) return;
+        if (mSrtSocket == null) {
+            Log.w(TAG, "SRT: encoder feed skipped — socket not ready");
+            return;
+        }
         long encodeStartNs = System.nanoTime();
 
         int yuvSize = frame.width * frame.height * 3 / 2;
@@ -3781,6 +3821,12 @@ public class MainActivity extends AppCompatActivity {
                                java.net.DatagramSocket socket) throws IOException {
         if (socket == null || mSrtRemoteAddr == null || mSrtRemotePort <= 0) return;
         if (length <= 0) return;
+
+        // One-shot diagnostic on first successful send
+        if (mSrtPacketsSent.get() == 0 && pts != H264_NO_PTS) {
+            Log.i(TAG, "SRT: first video packet — "
+                    + length + " bytes → " + mSrtRemoteAddr + ":" + mSrtRemotePort);
+        }
 
         int maxPayload = SRT_MAX_CHUNK - 16; // 16-byte chunk header
         int totalChunks = (length + maxPayload - 1) / maxPayload;
@@ -4188,8 +4234,44 @@ public class MainActivity extends AppCompatActivity {
                     if (msg.startsWith("CONTROL;")) {
                         processTcpControlMessage(msg);
                     }
+                    // Parse SRT port from TALLY (OBS auto-selects an available port)
+                    if (mStreamProtocol == StreamProtocol.SRT) {
+                        int idx = msg.indexOf("srt_port=");
+                        if (idx >= 0) {
+                            try {
+                                int p = Integer.parseInt(
+                                    msg.substring(idx + 9).split(";")[0]);
+                                if (p > 0 && p <= 65535) {
+                                    if (p != mSrtRemotePort) {
+                                        mSrtRemotePort = p;
+                                        Log.i(TAG, "SRT port updated from TALLY: " + p);
+                                    }
+                                    // Also update stored default so restart does not revert.
+                                    if (p != mSrtPort) {
+                                        mSrtPort = p;
+                                    }
+                                }
+                            } catch (NumberFormatException ignored) {}
+                        }
+                    }
                     maybeSendTcpControlStateToObs();
                     mTcpLastTallyUpdateNs = System.nanoTime();
+
+                    // Update SRT destination to the actual OBS IP learned from
+                    // incoming TALLY/CONTROL packets, replacing the broadcast
+                    // fallback used at startup.
+                    if (mStreamProtocol == StreamProtocol.SRT
+                            && mTcpTallyRemoteHost != null
+                            && !mTcpTallyRemoteHost.isEmpty()
+                            && !mTcpTallyRemoteHost.equals(mSrtRemoteHost)) {
+                        mSrtRemoteHost = mTcpTallyRemoteHost;
+                        mSrtRemotePort = mSrtPort > 0 ? mSrtPort : SRT_DEFAULT_PORT;
+                        try {
+                            mSrtRemoteAddr = java.net.InetAddress.getByName(mSrtRemoteHost);
+                            Log.i(TAG, "SRT: learned OBS IP from tally: " + mSrtRemoteHost + ":" + mSrtRemotePort);
+                        } catch (java.net.UnknownHostException ignored) {
+                        }
+                    }
                 }
             } catch (Exception e) {
                 if (mTcpTallyListenerRunning) {
@@ -4478,6 +4560,7 @@ public class MainActivity extends AppCompatActivity {
         mHandler.post(mTallyPoller);
         startTcpDiscoveryBeaconThread();
         startTcpTallyListenerThread();
+        mHandler.post(mTallyPoller);
         mTcpUdpWorkerRunning = true;
         mTcpUdpWorkerThread = new Thread(() -> {
             Log.i(TAG, "H.265 TCP forwarding thread started, port=" + mStreamPort);
