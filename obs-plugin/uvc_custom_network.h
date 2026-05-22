@@ -71,11 +71,40 @@ struct uvc_custom_network {
     uint32_t width;
     uint32_t height;
 
+    // latency tracking (ms) — displayed in discovery_status
+    double latency_ms;
+    uint64_t last_latency_update_ns;
+
+    // dynamic source name (shown in OBS sources list)
+    char *source_display_name;
+    uint64_t last_name_update_ns;
+
+    // SRT receiver (UDP) — separate from TCP receiver
+    bool srt_receiver_running;
+    pthread_t srt_receiver_thread;
+#ifdef _WIN32
+    SOCKET srt_receiver_socket;
+#else
+    int srt_receiver_socket;
+#endif
+    int srt_port;
+    bool use_srt; // true when source is configured as SRT
+
     // last sent tally state (OBS -> Android UDP backchannel)
     bool tally_program;
     bool tally_preview;
     uint64_t last_tally_send_ns;
     uint64_t last_remote_apply_ns;
+
+    // Persistent tally UDP socket + destination — created once and reused
+    // from video_tick so tally is sent independently of video frame arrival.
+#ifdef _WIN32
+    SOCKET tally_socket;
+#else
+    int tally_socket;
+#endif
+    struct sockaddr_in tally_addr;
+    bool tally_addr_valid;
 
     /* Timestamp of the last CONTROL packet sent from OBS to Android.
      * While within OBS_CONTROL_AUTHORITY_NS of this timestamp, incoming
@@ -88,6 +117,17 @@ struct uvc_custom_network {
 
     /* Set to true at the top of destroy() so video_tick skips unsafe OBS API calls. */
     volatile bool destroying;
+
+    /* Set by button callbacks when the UI needs a dialog rebuild.
+     * video_tick picks this up and calls obs_source_update_properties. */
+    volatile bool pending_ui_refresh;
+
+    /* Set to true when the user pressed Activate; false after Stop.
+     * Prevents scene-switch deactivation from stopping the receiver. */
+    bool user_activated;
+
+    /* Cached main-thread ID for safe OBS API calls. */
+    unsigned long main_thread_id;
 };
 
 obs_source_info *get_uvc_custom_network_info();

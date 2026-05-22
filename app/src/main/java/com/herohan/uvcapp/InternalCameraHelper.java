@@ -1150,12 +1150,13 @@ public class InternalCameraHelper {
     // -------------------------------------------------------------------------
 
     private void onNdiFrameAvailable(ImageReader reader) {
-        if (mClosed || mFrameListener == null) return;
+        final OnFrameAvailableListener listener = mFrameListener;
+        if (mClosed || listener == null) return;
         try (Image image = reader.acquireLatestImage()) {
             if (image == null) return;
             ByteBuffer nv12 = yuv420ToNv12(image);
             if (nv12 != null && !mClosed) {
-                mFrameListener.onFrame(nv12, image.getWidth(), image.getHeight());
+                listener.onFrame(nv12, image.getWidth(), image.getHeight());
             }
         } catch (IllegalStateException e) {
             // Image buffer was invalidated (camera closed mid-frame) — discard silently

@@ -37,6 +37,7 @@ static const char *RESOLUTIONS[] = {"640x360", "1280x720", "1920x1080", "3840x21
 static const uint32_t RESOLUTION_VALUES[][2] = {{640, 360}, {1280, 720}, {1920, 1080}, {3840, 2160}};
 static const int CUSTOM_DISCOVERY_PORT = 8866;
 static const int CUSTOM_TALLY_PORT = 8867;
+static const int SRT_DEFAULT_PORT = 5601;
 
 /* H.265-over-TCP frame header constants (same as DroidCam protocol) */
 static const uint64_t H264_NO_PTS   = 0xFFFFFFFFFFFFFFFFULL; /* config/SPS+PPS marker */
@@ -115,16 +116,12 @@ static void *uvc_custom_network_receiver_thread(void *data);
 static void *uvc_custom_network_control_state_thread(void *data);
 static void uvc_custom_network_control_state_start(uvc_custom_network *context);
 static void uvc_custom_network_control_state_stop(uvc_custom_network *context);
+static void uvc_custom_network_srt_receiver_start(uvc_custom_network *context);
+static void uvc_custom_network_srt_receiver_stop(uvc_custom_network *context);
+static void *uvc_custom_network_srt_receiver_thread(void *data);
 static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *context, const char *msg);
 static void uvc_custom_network_video_tick(void *data, float seconds);
-static void uvc_custom_network_send_tally(uvc_custom_network *context,
-#ifdef _WIN32
-                                          SOCKET tally_socket,
-#else
-                                          int tally_socket,
-#endif
-                                          const struct sockaddr_in *tally_addr,
-                                          bool force_send);
+static void uvc_custom_network_send_tally(uvc_custom_network *context, bool force_send);
 
 static void uvc_custom_network_clear_discovered_devices(uvc_custom_network *context)
 {
@@ -183,21 +180,29 @@ static bool uvc_custom_network_activate_button(obs_properties_t *props, obs_prop
         return false;
     }
 
+    /* Sync current dialog values into settings so the initial CONTROL
+     * sent by the receiver thread has the user's chosen resolution/FPS/
+     * quality.  This is separate from the dialog rebuild which is deferred
+     * via pending_ui_refresh to avoid tearing down the dialog mid-event. */
     if (context->source) {
         obs_data_t *settings = obs_source_get_settings(context->source);
         if (settings) {
-            obs_properties_apply_settings(props, settings);
             obs_source_update(context->source, settings);
             obs_data_release(settings);
         }
     }
 
-    bool was_running = context->receiver_running;
+    bool was_running = context->receiver_running || context->srt_receiver_running;
     bool has_target = (context->port > 0) && (context->host && context->host[0] != '\0');
 
     if (was_running) {
         uvc_custom_network_receiver_stop(context);
-        uvc_custom_network_set_status(context, "Stopped");
+        uvc_custom_network_srt_receiver_stop(context);
+        context->user_activated = false;
+        bfree(context->source_display_name);
+        context->source_display_name = bstrdup("UVC Custom Network (stopped)");
+        uvc_custom_network_set_status(context, "⏹ Stopped — press ▶ Activate to reconnect");
+        context->pending_ui_refresh = true;
         return true;
     }
 
@@ -206,8 +211,16 @@ static bool uvc_custom_network_activate_button(obs_properties_t *props, obs_prop
         return true;
     }
 
-    uvc_custom_network_start_receiver(context);
-    uvc_custom_network_set_status(context, "Connecting to %s:%d (H.265 TCP)", context->host, context->port);
+    context->user_activated = true;
+    if (context->use_srt) {
+        uvc_custom_network_srt_receiver_start(context);
+        uvc_custom_network_set_status(context, "Connecting SRT %s:%d (tally/control on TCP)",
+                                      context->host, context->srt_port);
+    } else {
+        uvc_custom_network_start_receiver(context);
+        uvc_custom_network_set_status(context, "Connecting to %s:%d (H.265 TCP)", context->host, context->port);
+    }
+    context->pending_ui_refresh = true;
     return true;
 }
 
@@ -264,31 +277,121 @@ static void uvc_custom_network_set_status(uvc_custom_network *context, const cha
 
     bfree(context->discovery_status);
     context->discovery_status = bstrdup(temp);
+
+    /* Write to settings only when called from the main thread (update/
+     * properties/button callbacks), not from background threads. */
+    if (context->source && !context->destroying
+#ifdef _WIN32
+        && GetCurrentThreadId() == context->main_thread_id
+#endif
+        ) {
+        obs_data_t *settings = obs_source_get_settings(context->source);
+        if (settings) {
+            obs_data_set_string(settings, "discovery_status", temp);
+            obs_data_release(settings);
+        }
+    }
 }
 
-static void uvc_custom_network_send_tally(uvc_custom_network *context,
-#ifdef _WIN32
-                                          SOCKET tally_socket,
-#else
-                                          int tally_socket,
-#endif
-                                          const struct sockaddr_in *tally_addr,
-                                          bool force_send)
+static void uvc_custom_network_tally_open_socket(uvc_custom_network *context)
 {
-    if (!context || !tally_addr) {
+    if (!context) {
+        return;
+    }
+
+    /* Close any existing socket first */
+#ifdef _WIN32
+    if (context->tally_socket != INVALID_SOCKET) {
+        closesocket(context->tally_socket);
+    }
+    context->tally_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (context->tally_socket == INVALID_SOCKET) {
+#else
+    if (context->tally_socket >= 0) {
+        close(context->tally_socket);
+    }
+    context->tally_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (context->tally_socket < 0) {
+#endif
+        context->tally_addr_valid = false;
+        blog(LOG_WARNING, "UVC Tally: failed to create UDP socket");
+        return;
+    }
+}
+
+static void uvc_custom_network_tally_update_addr(uvc_custom_network *context)
+{
+    if (!context || !context->host || context->host[0] == '\0') {
+        context->tally_addr_valid = false;
+        return;
+    }
+
+    /* Open socket if needed */
+#ifdef _WIN32
+    if (context->tally_socket == INVALID_SOCKET) {
+#else
+    if (context->tally_socket < 0) {
+#endif
+        uvc_custom_network_tally_open_socket(context);
+    }
+
+    memset(&context->tally_addr, 0, sizeof(context->tally_addr));
+    context->tally_addr.sin_family = AF_INET;
+    context->tally_addr.sin_port = htons((uint16_t)CUSTOM_TALLY_PORT);
+
+    if (inet_pton(AF_INET, context->host, &context->tally_addr.sin_addr) <= 0) {
+        context->tally_addr_valid = false;
+        blog(LOG_WARNING, "UVC Tally: cannot resolve %s for tally", context->host);
+        return;
+    }
+
+    context->tally_addr_valid = true;
+}
+
+static void uvc_custom_network_tally_close_socket(uvc_custom_network *context)
+{
+    if (!context) {
         return;
     }
 #ifdef _WIN32
-    if (tally_socket == INVALID_SOCKET) {
+    if (context->tally_socket != INVALID_SOCKET) {
+        closesocket(context->tally_socket);
+        context->tally_socket = INVALID_SOCKET;
+    }
 #else
-    if (tally_socket < 0) {
+    if (context->tally_socket >= 0) {
+        close(context->tally_socket);
+        context->tally_socket = -1;
+    }
+#endif
+    context->tally_addr_valid = false;
+}
+
+static void uvc_custom_network_send_tally(uvc_custom_network *context, bool force_send)
+{
+    if (!context || !context->tally_addr_valid) {
+        return;
+    }
+    /* Only send tally when a receiver is actually connected to Android */
+    if (!context->receiver_running && !context->srt_receiver_running) {
+        return;
+    }
+#ifdef _WIN32
+    if (context->tally_socket == INVALID_SOCKET) {
+#else
+    if (context->tally_socket < 0) {
 #endif
         return;
     }
 
-    bool program = obs_source_active(context->source);
+    bool active = obs_source_active(context->source);
     bool showing = obs_source_showing(context->source);
-    bool preview = showing && !program;
+    /* "active" means the source is being rendered for output (program).
+     * "showing" means the source is visible in the UI (preview or program).
+     * A source in preview-only is showing=true, active=false.
+     * A source in program (live) is showing=true, active=true. */
+    bool program = active;
+    bool preview = showing && !active;
 
     uint64_t now_ns = os_gettime_ns();
     bool changed = (program != context->tally_program) || (preview != context->tally_preview);
@@ -300,13 +403,28 @@ static void uvc_custom_network_send_tally(uvc_custom_network *context,
     char payload[64];
     snprintf(payload, sizeof(payload), "TALLY;program=%d;preview=%d", program ? 1 : 0, preview ? 1 : 0);
 
+    if (changed || force_send) {
+        blog(LOG_INFO, "UVC TALLY -> Android (%s:%d): %s",
+             context->host ? context->host : "?",
+             CUSTOM_TALLY_PORT, payload);
+    }
+
 #ifdef _WIN32
-    sendto(tally_socket, payload, (int)strlen(payload), 0,
-           (const struct sockaddr *)tally_addr, sizeof(*tally_addr));
+    int sent = sendto(context->tally_socket, payload, (int)strlen(payload), 0,
+                      (const struct sockaddr *)&context->tally_addr, sizeof(context->tally_addr));
 #else
-    sendto(tally_socket, payload, strlen(payload), 0,
-           (const struct sockaddr *)tally_addr, sizeof(*tally_addr));
+    ssize_t sent = sendto(context->tally_socket, payload, strlen(payload), 0,
+                          (const struct sockaddr *)&context->tally_addr, sizeof(context->tally_addr));
 #endif
+    if (sent < 0) {
+        blog(LOG_WARNING, "UVC TALLY: sendto() failed (socket=%d, addr_valid=%d)",
+#ifdef _WIN32
+             (int)context->tally_socket,
+#else
+             context->tally_socket,
+#endif
+             context->tally_addr_valid ? 1 : 0);
+    }
 
     context->tally_program = program;
     context->tally_preview = preview;
@@ -323,6 +441,7 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
                                             int resolution_index, int fps, int quality)
 {
     if (!context || !context->host || context->host[0] == '\0') {
+        blog(LOG_WARNING, "UVC CONTROL: skipped — host is empty");
         return;
     }
 
@@ -339,6 +458,7 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
 #endif
+        blog(LOG_WARNING, "UVC CONTROL: socket() failed, cannot send to %s", host_copy);
         return;
     }
 
@@ -347,6 +467,7 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
     addr.sin_family = AF_INET;
     addr.sin_port = htons((uint16_t)CUSTOM_TALLY_PORT);
     if (inet_pton(AF_INET, host_copy, &addr.sin_addr) <= 0) {
+        blog(LOG_WARNING, "UVC CONTROL: inet_pton failed for host '%s'", host_copy);
 #ifdef _WIN32
         closesocket(sock);
 #else
@@ -381,11 +502,21 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
            (const struct sockaddr *)&addr, sizeof(addr));
     close(sock);
 #endif
+
+    /* Ensure the control-state listener is running so we can receive
+     * Android's CONTROL_STATE reply and keep settings in sync. */
+    uvc_custom_network_control_state_start(context);
 }
 
 static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *context, const char *msg)
 {
     if (!context || !msg || strncmp(msg, "CONTROL_STATE;", 14) != 0) {
+        return;
+    }
+
+    /* If the source is being removed, bail out — the mutex is about to
+     * be destroyed and any queued state changes are irrelevant. */
+    if (context->destroying) {
         return;
     }
 
@@ -497,17 +628,6 @@ static void uvc_custom_network_apply_pending_state_to_source(uvc_custom_network 
     obs_data_set_int(settings, "fps", context->fps);
     obs_data_set_int(settings, "quality", context->quality);
     obs_data_release(settings);
-
-    /* Refresh the open Properties dialog so the user sees the latest Android
-     * state.  Rate-limited to once per second to avoid rebuilding the dialog
-     * while the user is interacting with it.  Only called after the authority
-     * window has expired (video_tick already checked that), so OBS-initiated
-     * edits are never disrupted by echo-state refreshes. */
-    uint64_t now_props = os_gettime_ns();
-    if (now_props - context->last_props_refresh_ns >= 1000000000ULL) {
-        obs_source_update_properties(context->source);
-        context->last_props_refresh_ns = now_props;
-    }
 }
 
 static void uvc_custom_network_video_tick(void *data, float seconds)
@@ -519,6 +639,33 @@ static void uvc_custom_network_video_tick(void *data, float seconds)
     }
 
     uint64_t now_ns = os_gettime_ns();
+
+    /* ── Send tally to Android (independent of video frame arrival) ── */
+    uvc_custom_network_send_tally(context, false);
+
+    /* ── Sync status & source name to settings (rate-limited) ── */
+    bool do_ui_refresh = context->pending_ui_refresh;
+    if (do_ui_refresh) {
+        context->pending_ui_refresh = false;
+    }
+    if (now_ns - context->last_props_refresh_ns >= 500000000ULL || do_ui_refresh) {
+        context->last_props_refresh_ns = now_ns;
+        obs_data_t *settings = obs_source_get_settings(context->source);
+        if (settings) {
+            pthread_mutex_lock(&context->lock);
+            if (context->discovery_status) {
+                obs_data_set_string(settings, "discovery_status",
+                    context->discovery_status);
+            }
+            pthread_mutex_unlock(&context->lock);
+            obs_data_release(settings);
+        }
+        if (do_ui_refresh && !context->destroying) {
+            obs_source_update_properties(context->source);
+        }
+    }
+
+    /* ── Handle remote control state from Android ── */
     pthread_mutex_lock(&context->lock);
     if (!context->pending_remote_control_state) {
         pthread_mutex_unlock(&context->lock);
@@ -555,10 +702,31 @@ static void uvc_custom_network_video_tick(void *data, float seconds)
     context->fps                          = context->pending_fps;
     context->quality                      = context->pending_quality;
     context->pending_remote_control_state = false;
+    context->pending_ui_refresh = true;  /* trigger dialog rebuild so UI reflects remote changes */
     pthread_mutex_unlock(&context->lock);
 
     uvc_custom_network_apply_pending_state_to_source(context);
     context->last_remote_apply_ns = now_ns;
+}
+
+/* ── Source activate / deactivate ─────────────────────────────────────
+ * Scene switching calls these.  We keep the receiver running so video
+ * flow is never interrupted — OBS simply stops/starts consuming frames
+ * via video_tick.  No reconnect needed. */
+static void uvc_custom_network_activate(void *data)
+{
+    uvc_custom_network *context = (uvc_custom_network *)data;
+    if (!context) return;
+    blog(LOG_INFO, "UVC: source activated — video_tick resumes");
+}
+
+static void uvc_custom_network_deactivate(void *data)
+{
+    uvc_custom_network *context = (uvc_custom_network *)data;
+    if (!context) return;
+    /* Do NOT stop the receiver.  Just log — video_tick pauses
+     * automatically and the receiver keeps buffering in the background. */
+    blog(LOG_INFO, "UVC: source deactivated (receiver stays alive)");
 }
 
 
@@ -629,6 +797,13 @@ static void *uvc_custom_network_control_state_thread(void *data)
         }
 
         buf[got] = '\0';
+
+        /* Bail out if the source is being removed — the mutex may
+         * already be invalid or about to be destroyed. */
+        if (context->destroying) {
+            continue;
+        }
+
         if (strncmp(buf, "CONTROL_STATE;", 14) != 0) {
             continue;
         }
@@ -701,9 +876,406 @@ static void uvc_custom_network_control_state_stop(uvc_custom_network *context)
     pthread_join(context->control_state_thread, NULL);
 }
 
+static void uvc_custom_network_srt_receiver_stop(uvc_custom_network *context)
+{
+    if (!context || !context->srt_receiver_running) {
+        return;
+    }
+    context->srt_receiver_running = false;
+#ifdef _WIN32
+    if (context->srt_receiver_socket != INVALID_SOCKET) {
+        closesocket(context->srt_receiver_socket);
+        context->srt_receiver_socket = INVALID_SOCKET;
+    }
+#else
+    if (context->srt_receiver_socket >= 0) {
+        close(context->srt_receiver_socket);
+        context->srt_receiver_socket = -1;
+    }
+#endif
+    pthread_join(context->srt_receiver_thread, NULL);
+}
+
+static void uvc_custom_network_srt_receiver_start(uvc_custom_network *context)
+{
+    if (!context || context->srt_receiver_running) {
+        return;
+    }
+
+    /* Set up persistent tally socket so video_tick can send tally
+     * independently of video frame arrival. */
+    uvc_custom_network_tally_update_addr(context);
+
+    /* Send initial CONTROL from the main thread BEFORE the SRT receiver
+     * thread starts — same rationale as start_receiver. */
+    {
+        bool exp_lock, fcs_lock, af_lock;
+        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual;
+        pthread_mutex_lock(&context->lock);
+        exp_lock = context->control_exposure_lock;
+        fcs_lock = context->control_focus_lock;
+        exp_comp = context->control_exposure_compensation;
+        af_md    = context->control_af_mode;
+        af_lock  = context->control_af_lock;
+        fl_md    = context->control_flash_mode;
+        wb_md    = context->control_wb_mode;
+        wb_k     = context->control_wb_kelvin;
+        res_idx  = context->resolution_index;
+        fps_v    = context->fps;
+        qual     = context->quality;
+        pthread_mutex_unlock(&context->lock);
+        uvc_custom_network_send_control(context,
+            exp_lock, fcs_lock, exp_comp,
+            af_md, af_lock, fl_md, wb_md, wb_k,
+            res_idx, fps_v, qual);
+    }
+
+    context->srt_receiver_running = true;
+#ifdef _WIN32
+    context->srt_receiver_socket = INVALID_SOCKET;
+#else
+    context->srt_receiver_socket = -1;
+#endif
+    pthread_create(&context->srt_receiver_thread, NULL, uvc_custom_network_srt_receiver_thread, context);
+}
+
+static void *uvc_custom_network_srt_receiver_thread(void *data)
+{
+    uvc_custom_network *context = (uvc_custom_network *)data;
+
+    pthread_mutex_lock(&context->lock);
+    int port = context->srt_port > 0 ? context->srt_port : 5601;
+    char *host = bstrdup(context->host ? context->host : "");
+    pthread_mutex_unlock(&context->lock);
+
+    if (!host || host[0] == '\0') {
+        blog(LOG_WARNING, "UVC SRT: Phone IP is not set");
+        bfree(host);
+        context->srt_receiver_running = false;
+        return NULL;
+    }
+
+    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    if (!codec) {
+        blog(LOG_ERROR, "UVC SRT: H.265 decoder not found");
+        bfree(host);
+        context->srt_receiver_running = false;
+        return NULL;
+    }
+
+    AVPacket *pkt = av_packet_alloc();
+    AVFrame *frame = av_frame_alloc();
+    AVCodecContext *decoder = NULL;
+
+    if (!pkt || !frame) {
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
+        bfree(host);
+        context->srt_receiver_running = false;
+        return NULL;
+    }
+
+    blog(LOG_INFO, "UVC SRT: starting UDP listener on port %d", port);
+
+#ifdef _WIN32
+    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == INVALID_SOCKET) {
+#else
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+#endif
+        blog(LOG_WARNING, "UVC SRT: socket() failed");
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
+        bfree(host);
+        context->srt_receiver_running = false;
+        return NULL;
+    }
+
+    int rcvbuf = 4 * 1024 * 1024;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&rcvbuf, sizeof(rcvbuf));
+
+    struct sockaddr_in local_addr;
+    memset(&local_addr, 0, sizeof(local_addr));
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_port = htons((uint16_t)port);
+    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+        blog(LOG_WARNING, "UVC SRT: bind failed on port %d", port);
+#ifdef _WIN32
+        closesocket(sock);
+#else
+        close(sock);
+#endif
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
+        bfree(host);
+        context->srt_receiver_running = false;
+        return NULL;
+    }
+
+#ifdef _WIN32
+    DWORD timeout = 500;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+#else
+    struct timeval tv = {0, 500000};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
+    context->srt_receiver_socket = sock;
+    blog(LOG_INFO, "UVC SRT: listening on UDP port %d", port);
+
+    /* Update source display name */
+    {
+        char name_buf[128];
+        snprintf(name_buf, sizeof(name_buf), "📱 %s:%d (SRT)", host, port);
+        pthread_mutex_lock(&context->lock);
+        bfree(context->source_display_name);
+        context->source_display_name = bstrdup(name_buf);
+        pthread_mutex_unlock(&context->lock);
+    }
+
+    /* Initial CONTROL is now sent from srt_receiver_start() on the main
+     * thread before this thread is spawned — no need to duplicate here. */
+    uvc_custom_network_set_status(context, "SRT listening %s:%d — waiting for video", host, port);
+
+    decoder = avcodec_alloc_context3(codec);
+    decoder->flags |= AV_CODEC_FLAG_LOW_DELAY;
+    decoder->flags2 |= AV_CODEC_FLAG2_FAST;
+    decoder->thread_type = FF_THREAD_SLICE;
+    decoder->thread_count = 4;
+    if (avcodec_open2(decoder, codec, NULL) != 0) {
+        blog(LOG_ERROR, "UVC SRT: avcodec_open2 failed");
+        avcodec_free_context(&decoder);
+        av_packet_free(&pkt);
+        av_frame_free(&frame);
+#ifdef _WIN32
+        closesocket(sock);
+        context->srt_receiver_socket = INVALID_SOCKET;
+#else
+        close(sock);
+        context->srt_receiver_socket = -1;
+#endif
+        bfree(host);
+        context->srt_receiver_running = false;
+        return NULL;
+    }
+
+    bool logged_first = false;
+    uint8_t recv_buf[64 * 1024];
+
+    /* Chunk reassembly state */
+    uint8_t *reasm_buf = NULL;
+    size_t  reasm_capacity = 0;
+    uint64_t reasm_pts = H264_NO_PTS;
+    uint16_t reasm_total = 0;
+    uint16_t reasm_got = 0;
+    size_t  reasm_size = 0;
+
+    while (context->srt_receiver_running) {
+        struct sockaddr_in from_addr;
+#ifdef _WIN32
+        int from_len = (int)sizeof(from_addr);
+        int got = recvfrom(sock, (char *)recv_buf, (int)sizeof(recv_buf), 0,
+                           (struct sockaddr *)&from_addr, &from_len);
+#else
+        socklen_t from_len = (socklen_t)sizeof(from_addr);
+        ssize_t got = recvfrom(sock, recv_buf, sizeof(recv_buf), 0,
+                               (struct sockaddr *)&from_addr, &from_len);
+#endif
+        if (got <= 0) continue;
+        if (got < 16) continue; /* need at least the 16-byte chunk header */
+
+        uint64_t recv_time_ns = os_gettime_ns();
+
+        /* Parse 16-byte chunk header */
+        uint64_t chunk_pts  = read_u64be(recv_buf);       /* bytes 0-7 */
+        uint16_t chunk_idx  = (uint16_t)((recv_buf[8] << 8) | recv_buf[9]);   /* bytes 8-9 */
+        uint16_t total_chunks = (uint16_t)((recv_buf[10] << 8) | recv_buf[11]); /* bytes 10-11 */
+        uint32_t chunk_len  = read_u32be(recv_buf + 12);  /* bytes 12-15 */
+
+        if (chunk_len == 0 || chunk_len > H264_MAX_SIZE
+                || (size_t)(16 + chunk_len) > (size_t)got
+                || total_chunks == 0 || total_chunks > 1024
+                || chunk_idx >= total_chunks) {
+            continue;
+        }
+
+        if (total_chunks == 1) {
+            /* Fast path: single chunk, no reassembly needed */
+            if (av_new_packet(pkt, (int)chunk_len + AV_INPUT_BUFFER_PADDING_SIZE) < 0) continue;
+            pkt->size = (int)chunk_len;
+            memcpy(pkt->data, recv_buf + 16, chunk_len);
+            memset(pkt->data + chunk_len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+            pkt->pts = (chunk_pts == H264_NO_PTS) ? AV_NOPTS_VALUE : (int64_t)chunk_pts;
+        } else {
+            /* Multi-chunk: start or continue reassembly */
+            if (reasm_pts != chunk_pts || reasm_total != total_chunks) {
+                /* New NAL unit — reset reassembly state */
+                reasm_pts = chunk_pts;
+                reasm_total = total_chunks;
+                reasm_got = 0;
+                reasm_size = 0;
+                /* Estimate total size from first chunk's proportion */
+                size_t est = (size_t)chunk_len * (size_t)total_chunks;
+                if (est > H264_MAX_SIZE) est = H264_MAX_SIZE;
+                if (est + AV_INPUT_BUFFER_PADDING_SIZE > reasm_capacity) {
+                    bfree(reasm_buf);
+                    reasm_capacity = est + AV_INPUT_BUFFER_PADDING_SIZE;
+                    reasm_buf = (uint8_t *)bmalloc(reasm_capacity);
+                }
+                memset(reasm_buf, 0, reasm_capacity);
+            }
+
+            if (reasm_buf && reasm_size + chunk_len <= reasm_capacity) {
+                memcpy(reasm_buf + reasm_size, recv_buf + 16, chunk_len);
+                reasm_size += chunk_len;
+                reasm_got++;
+            }
+
+            if (reasm_got < reasm_total) {
+                continue; /* wait for more chunks */
+            }
+
+            /* All chunks received — feed reassembled NAL unit to decoder */
+            if (av_new_packet(pkt, (int)reasm_size + AV_INPUT_BUFFER_PADDING_SIZE) < 0) {
+                reasm_pts = H264_NO_PTS; /* reset */
+                continue;
+            }
+            pkt->size = (int)reasm_size;
+            memcpy(pkt->data, reasm_buf, reasm_size);
+            memset(pkt->data + reasm_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+            pkt->pts = (chunk_pts == H264_NO_PTS) ? AV_NOPTS_VALUE : (int64_t)chunk_pts;
+            reasm_pts = H264_NO_PTS; /* consumed */
+        }
+
+        int ret = avcodec_send_packet(decoder, pkt);
+        av_packet_unref(pkt);
+        if (ret < 0 && ret != AVERROR(EAGAIN)) continue;
+
+        while (avcodec_receive_frame(decoder, frame) == 0) {
+            struct obs_source_frame obs_frame;
+            memset(&obs_frame, 0, sizeof(obs_frame));
+            obs_frame.width = (uint32_t)frame->width;
+            obs_frame.height = (uint32_t)frame->height;
+            obs_frame.timestamp = recv_time_ns;
+            obs_frame.trc = VIDEO_TRC_DEFAULT;
+
+            bool format_ok = true;
+            switch (frame->format) {
+            case AV_PIX_FMT_YUV420P:
+            case AV_PIX_FMT_YUVJ420P:
+                obs_frame.format = VIDEO_FORMAT_I420;
+                obs_frame.data[0] = frame->data[0];
+                obs_frame.data[1] = frame->data[1];
+                obs_frame.data[2] = frame->data[2];
+                obs_frame.linesize[0] = (uint32_t)frame->linesize[0];
+                obs_frame.linesize[1] = (uint32_t)frame->linesize[1];
+                obs_frame.linesize[2] = (uint32_t)frame->linesize[2];
+                break;
+            case AV_PIX_FMT_NV12:
+                obs_frame.format = VIDEO_FORMAT_NV12;
+                obs_frame.data[0] = frame->data[0];
+                obs_frame.data[1] = frame->data[1];
+                obs_frame.linesize[0] = (uint32_t)frame->linesize[0];
+                obs_frame.linesize[1] = (uint32_t)frame->linesize[1];
+                break;
+            default:
+                format_ok = false;
+                break;
+            }
+
+            if (format_ok) {
+                enum video_range_type range =
+                    (frame->color_range == AVCOL_RANGE_JPEG)
+                        ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
+                obs_frame.full_range = (range == VIDEO_RANGE_FULL);
+                video_format_get_parameters_for_format(
+                    VIDEO_CS_DEFAULT, range, obs_frame.format,
+                    obs_frame.color_matrix,
+                    obs_frame.color_range_min, obs_frame.color_range_max);
+
+                pthread_mutex_lock(&context->lock);
+                context->width = (uint32_t)frame->width;
+                context->height = (uint32_t)frame->height;
+                if (chunk_pts != H264_NO_PTS && chunk_pts > 0) {
+                    uint64_t capture_ns = (uint64_t)chunk_pts * 1000ULL;
+                    if (recv_time_ns > capture_ns) {
+                        context->latency_ms = (double)(recv_time_ns - capture_ns) / 1000000.0;
+                    }
+                }
+                double lat = context->latency_ms;
+                int fw = frame->width;
+                int fh = frame->height;
+                uint64_t now_ns = os_gettime_ns();
+                bool do_update = (now_ns - context->last_latency_update_ns >= 500000000ULL);
+                if (do_update) {
+                    context->last_latency_update_ns = now_ns;
+                    /* Also update source name in OBS list */
+                    char name_buf[128];
+                    snprintf(name_buf, sizeof(name_buf),
+                             "📱 %s:%d  %dx%d  %.0fms",
+                             host, port, fw, fh, lat);
+                    bfree(context->source_display_name);
+                    context->source_display_name = bstrdup(name_buf);
+                }
+                pthread_mutex_unlock(&context->lock);
+
+                /* Write status through the setter so 📡 Status text field updates */
+                if (do_update) {
+                    char status[128];
+                    snprintf(status, sizeof(status),
+                             "SRT %s:%d | %dx%d | %.0f ms delay",
+                             host, port, fw, fh, lat);
+                    uvc_custom_network_set_status(context, "%s", status);
+                }
+
+                /* Guard: don't output video if the source is being removed */
+                if (!context->destroying) {
+                    obs_source_output_video(context->source, &obs_frame);
+                }
+
+                if (!logged_first) {
+                    blog(LOG_INFO, "UVC SRT: first decoded frame %dx%d",
+                         frame->width, frame->height);
+                    logged_first = true;
+                }
+            }
+            av_frame_unref(frame);
+        }
+    }
+
+    if (decoder) avcodec_free_context(&decoder);
+    av_packet_free(&pkt);
+    av_frame_free(&frame);
+    bfree(reasm_buf);
+
+    /* Clean up SRT socket */
+#ifdef _WIN32
+    if (context->srt_receiver_socket != INVALID_SOCKET) {
+        closesocket(sock);
+        context->srt_receiver_socket = INVALID_SOCKET;
+    }
+#else
+    if (context->srt_receiver_socket >= 0) {
+        close(sock);
+        context->srt_receiver_socket = -1;
+    }
+#endif
+    bfree(host);
+    blog(LOG_INFO, "UVC SRT: receiver thread exiting");
+    return NULL;
+}
+
 static void uvc_custom_network_receiver_stop(uvc_custom_network *context)
 {
     if (!context || !context->receiver_running) {
+        /* SRT-only mode: just stop the SRT receiver.  Keep control_state
+         * alive — it's managed independently for settings sync. */
+        if (context && context->srt_receiver_running) {
+            uvc_custom_network_srt_receiver_stop(context);
+        }
         return;
     }
 
@@ -772,11 +1344,9 @@ static void *uvc_custom_network_receiver_thread(void *data)
     while (context->receiver_running) {
 #ifdef _WIN32
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        SOCKET tally_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (sock == INVALID_SOCKET) {
 #else
         int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        int tally_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (sock < 0) {
 #endif
             blog(LOG_WARNING, "UVC H265 TCP: socket() failed");
@@ -793,19 +1363,12 @@ static void *uvc_custom_network_receiver_thread(void *data)
         addr.sin_family = AF_INET;
         addr.sin_port   = htons((uint16_t)port);
 
-        struct sockaddr_in tally_addr;
-        memset(&tally_addr, 0, sizeof(tally_addr));
-        tally_addr.sin_family = AF_INET;
-        tally_addr.sin_port = htons((uint16_t)CUSTOM_TALLY_PORT);
-
-        if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0 || inet_pton(AF_INET, host, &tally_addr.sin_addr) <= 0) {
+        if (inet_pton(AF_INET, host, &addr.sin_addr) <= 0) {
             blog(LOG_WARNING, "UVC H265 TCP: invalid phone IP '%s' — check source settings", host);
 #ifdef _WIN32
             closesocket(sock);
-            if (tally_sock != INVALID_SOCKET) closesocket(tally_sock);
 #else
             close(sock);
-            if (tally_sock >= 0) close(tally_sock);
 #endif
             for (int i = 0; i < 40 && context->receiver_running; i++) os_sleep_ms(50);
             continue;
@@ -815,10 +1378,8 @@ static void *uvc_custom_network_receiver_thread(void *data)
             blog(LOG_INFO, "UVC H265 TCP: connect to %s:%d failed, retrying...", host, port);
 #ifdef _WIN32
             closesocket(sock);
-            if (tally_sock != INVALID_SOCKET) closesocket(tally_sock);
 #else
             close(sock);
-            if (tally_sock >= 0) close(tally_sock);
 #endif
             for (int i = 0; i < 40 && context->receiver_running; i++) os_sleep_ms(50);
             continue;
@@ -832,6 +1393,20 @@ static void *uvc_custom_network_receiver_thread(void *data)
         context->receiver_socket = sock;
         blog(LOG_INFO, "UVC H265 TCP: connected to Android %s:%d", host, port);
 
+        /* Update the source display name so OBS sources list shows device */
+        {
+            char name_buf[128];
+            snprintf(name_buf, sizeof(name_buf), "📱 %s:%d (TCP)", host, port);
+            pthread_mutex_lock(&context->lock);
+            bfree(context->source_display_name);
+            context->source_display_name = bstrdup(name_buf);
+            pthread_mutex_unlock(&context->lock);
+        }
+
+        /* Initial CONTROL is now sent from start_receiver() on the main
+         * thread before this thread is spawned — no need to duplicate. */
+        uvc_custom_network_set_status(context, "Connected %s:%d — waiting for video", host, port);
+
         /* fresh H.265 decoder for each connection */
         if (decoder) { avcodec_free_context(&decoder); decoder = NULL; }
         decoder = avcodec_alloc_context3(codec);
@@ -844,11 +1419,9 @@ static void *uvc_custom_network_receiver_thread(void *data)
 #ifdef _WIN32
             closesocket(sock);
             context->receiver_socket = INVALID_SOCKET;
-            if (tally_sock != INVALID_SOCKET) closesocket(tally_sock);
 #else
             close(sock);
             context->receiver_socket = -1;
-            if (tally_sock >= 0) close(tally_sock);
 #endif
             for (int i = 0; i < 40 && context->receiver_running; i++) os_sleep_ms(50);
             continue;
@@ -861,8 +1434,6 @@ static void *uvc_custom_network_receiver_thread(void *data)
 
         /* inner receive/decode loop */
         while (context->receiver_running) {
-            uvc_custom_network_send_tally(context, tally_sock, &tally_addr, false);
-
             uint8_t header[12];
             if (!tcp_recv_all(sock, header, 12)) {
                 if (context->receiver_running)
@@ -872,6 +1443,7 @@ static void *uvc_custom_network_receiver_thread(void *data)
 
             uint64_t pts = read_u64be(header);
             uint32_t len = read_u32be(header + 8);
+            uint64_t recv_time_ns = os_gettime_ns(); /* time when header was received */
 
             if (len == 0 || len > H264_MAX_SIZE) {
                 blog(LOG_WARNING, "UVC H265 TCP: bad packet length %u, reconnecting", len);
@@ -1002,7 +1574,54 @@ static void *uvc_custom_network_receiver_thread(void *data)
                     context->height = (uint32_t)frame->height;
                     pthread_mutex_unlock(&context->lock);
 
-                    obs_source_output_video(context->source, &obs_frame);
+                    /* Guard: don't output video if the source is being removed */
+                    if (!context->destroying) {
+                        obs_source_output_video(context->source, &obs_frame);
+                    }
+
+                    /* Calculate end-to-end latency: OBS receive time minus
+                     * Android capture time.  The capture PTS is in microseconds
+                     * (System.nanoTime()/1000).  We convert to ns and compare
+                     * with the recv_time_ns captured when the header arrived. */
+                    if (pts != H264_NO_PTS && pts > 0) {
+                        uint64_t capture_ns = (uint64_t)pts * 1000ULL;
+                        if (recv_time_ns > capture_ns) {
+                            double lat = (double)(recv_time_ns - capture_ns) / 1000000.0;
+                            pthread_mutex_lock(&context->lock);
+                            context->latency_ms = lat;
+                            pthread_mutex_unlock(&context->lock);
+                        }
+                    }
+                    /* Update status text with latency every 500 ms */
+                    {
+                        uint64_t now_ns = os_gettime_ns();
+                        if (now_ns - context->last_latency_update_ns >= 500000000ULL) {
+                            context->last_latency_update_ns = now_ns;
+                            double lat;
+                            int fw, fh;
+                            pthread_mutex_lock(&context->lock);
+                            lat = context->latency_ms;
+                            fw  = frame->width;
+                            fh  = frame->height;
+                            pthread_mutex_unlock(&context->lock);
+                            /* Build status — write through the setter so the
+                             * 📡 Status property text field stays in sync. */
+                            char status[128];
+                            snprintf(status, sizeof(status),
+                                     "Connected %s:%d | %dx%d | %.0f ms delay",
+                                     host, port, fw, fh, lat);
+                            uvc_custom_network_set_status(context, "%s", status);
+                            /* Also update the source name in the OBS list */
+                            char name_buf[128];
+                            snprintf(name_buf, sizeof(name_buf),
+                                     "📱 %s:%d  %dx%d  %.0fms",
+                                     host, port, fw, fh, lat);
+                            pthread_mutex_lock(&context->lock);
+                            bfree(context->source_display_name);
+                            context->source_display_name = bstrdup(name_buf);
+                            pthread_mutex_unlock(&context->lock);
+                        }
+                    }
 
                     if (!logged_first) {
                         blog(LOG_INFO, "UVC H265 TCP: first decoded frame %dx%d pixfmt=%d",
@@ -1014,27 +1633,16 @@ static void *uvc_custom_network_receiver_thread(void *data)
             }
         } /* inner loop */
 
-        /* force send neutral tally on disconnect */
-        context->tally_program = true;
-        context->tally_preview = true;
-        uvc_custom_network_send_tally(context, tally_sock, &tally_addr, true);
-
         /* close the socket — guard against double-close with receiver_stop */
 #ifdef _WIN32
         if (context->receiver_socket != INVALID_SOCKET) {
             closesocket(sock);
             context->receiver_socket = INVALID_SOCKET;
         }
-        if (tally_sock != INVALID_SOCKET) {
-            closesocket(tally_sock);
-        }
 #else
         if (context->receiver_socket >= 0) {
             close(sock);
             context->receiver_socket = -1;
-        }
-        if (tally_sock >= 0) {
-            close(tally_sock);
         }
 #endif
 
@@ -1063,25 +1671,34 @@ static void uvc_custom_network_discovery_callback(const char *host, int port, vo
     bool added = uvc_custom_network_add_discovered_device(context, host, port);
     int count = context->discovered_device_count;
 
-    if (!context->host || *context->host == '\0') {
+    /* Auto-fill ONLY if this source has no host set yet AND no other source
+     * in the scene collection already claimed this device.  This prevents
+     * multiple sources from all grabbing the first discovered device. */
+    bool host_was_empty = (!context->host || *context->host == '\0');
+    if (host_was_empty) {
         bfree(context->host);
         context->host = bstrdup(host);
         context->port = port;
         if (context->selected_device_index < 0) {
             context->selected_device_index = 0;
         }
+        /* Update the display name so the source is identifiable immediately */
+        bfree(context->source_display_name);
+        char name_buf[128];
+        snprintf(name_buf, sizeof(name_buf), "📱 %s:%d (new)", host, port);
+        context->source_display_name = bstrdup(name_buf);
     }
 
     if (added) {
         blog(LOG_INFO, "UVC Custom Network: discovered device %s:%d", host, port);
         if (count == 1) {
-            uvc_custom_network_set_status(context, "Discovered 1 device: %s:%d", host, port);
+            uvc_custom_network_set_status(context, "📡 Found %s:%d — press ▶ Activate to connect", host, port);
         } else {
-            uvc_custom_network_set_status(context, "Discovered %d devices", count);
+            uvc_custom_network_set_status(context, "📡 Found %d devices — pick one & press ▶ Activate", count);
         }
-        if (!context->receiver_running && context->port > 0 && context->host && context->host[0] != '\0') {
-            uvc_custom_network_start_receiver(context);
-        }
+        /* Discovery only populates the list.  The user must press Activate
+         * to start the connection — auto-connect was removed here to give
+         * the user full control. */
     }
 
     pthread_mutex_unlock(&context->lock);
@@ -1095,6 +1712,37 @@ static void uvc_custom_network_start_receiver(uvc_custom_network *context)
 
     blog(LOG_INFO, "UVC H265 TCP: starting receiver thread (will connect to %s:%d)",
          context->host ? context->host : "(none)", context->port);
+
+    /* Set up persistent tally socket so video_tick can send tally
+     * independently of video frame arrival. */
+    uvc_custom_network_tally_update_addr(context);
+
+    /* Send initial CONTROL from the main thread BEFORE the receiver thread
+     * starts.  This avoids a race on context->host (send_control reads it
+     * without the lock) and ensures CONTROL reaches Android immediately,
+     * before any FFmpeg/socket setup delay in the background thread. */
+    {
+        bool exp_lock, fcs_lock, af_lock;
+        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual;
+        pthread_mutex_lock(&context->lock);
+        exp_lock = context->control_exposure_lock;
+        fcs_lock = context->control_focus_lock;
+        exp_comp = context->control_exposure_compensation;
+        af_md    = context->control_af_mode;
+        af_lock  = context->control_af_lock;
+        fl_md    = context->control_flash_mode;
+        wb_md    = context->control_wb_mode;
+        wb_k     = context->control_wb_kelvin;
+        res_idx  = context->resolution_index;
+        fps_v    = context->fps;
+        qual     = context->quality;
+        pthread_mutex_unlock(&context->lock);
+        uvc_custom_network_send_control(context,
+            exp_lock, fcs_lock, exp_comp,
+            af_md, af_lock, fl_md, wb_md, wb_k,
+            res_idx, fps_v, qual);
+    }
+
     context->receiver_running = true;
 #ifdef _WIN32
     context->receiver_socket = INVALID_SOCKET;
@@ -1102,7 +1750,7 @@ static void uvc_custom_network_start_receiver(uvc_custom_network *context)
     context->receiver_socket = -1;
 #endif
     pthread_create(&context->receiver_thread, NULL, uvc_custom_network_receiver_thread, context);
-    uvc_custom_network_control_state_start(context);
+    /* control_state_start is already called by send_control() above */
 }
 
 static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *source)
@@ -1151,6 +1799,24 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
     context->control_state_running = false;
     context->width = 0;
     context->height = 0;
+    context->latency_ms = 0.0;
+    context->last_latency_update_ns = 0;
+    context->source_display_name = bstrdup("UVC Custom Network (idle)");
+    context->last_name_update_ns = 0;
+    context->srt_receiver_running = false;
+    context->srt_port = SRT_DEFAULT_PORT;
+    context->use_srt = obs_data_get_bool(settings, "use_srt");
+    {
+        int saved_srt_port = (int)obs_data_get_int(settings, "srt_port");
+        if (saved_srt_port > 0 && saved_srt_port <= 65535) {
+            context->srt_port = saved_srt_port;
+        }
+    }
+#ifdef _WIN32
+    context->srt_receiver_socket = INVALID_SOCKET;
+#else
+    context->srt_receiver_socket = -1;
+#endif
     context->tally_program = false;
     context->tally_preview = false;
     context->last_tally_send_ns = 0;
@@ -1158,6 +1824,18 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
     context->last_obs_control_send_ns = 0;
     context->last_props_refresh_ns = 0;
     context->destroying = false;
+    context->pending_ui_refresh = false;
+    context->user_activated = false;
+#ifdef _WIN32
+    context->tally_socket = INVALID_SOCKET;
+#else
+    context->tally_socket = -1;
+#endif
+    memset(&context->tally_addr, 0, sizeof(context->tally_addr));
+    context->tally_addr_valid = false;
+#ifdef _WIN32
+    context->main_thread_id = GetCurrentThreadId();
+#endif
     context->discovery_status = bstrdup("Idle");
 
     if (context->discovery_enabled) {
@@ -1168,9 +1846,16 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
 
     // Auto-start receiver if phone IP and port are already configured
     if (context->port > 0 && context->host && context->host[0] != '\0') {
-        blog(LOG_INFO, "UVC H265 TCP: auto-starting receiver (connecting to %s:%d)",
-             context->host, context->port);
-        uvc_custom_network_start_receiver(context);
+        context->user_activated = true; /* saved settings = user intended this */
+        if (context->use_srt) {
+            blog(LOG_INFO, "UVC SRT: auto-starting receiver (listening on UDP port %d from %s)",
+                 context->srt_port, context->host);
+            uvc_custom_network_srt_receiver_start(context);
+        } else {
+            blog(LOG_INFO, "UVC H265 TCP: auto-starting receiver (connecting to %s:%d)",
+                 context->host, context->port);
+            uvc_custom_network_start_receiver(context);
+        }
     }
 
     return context;
@@ -1188,9 +1873,13 @@ static void uvc_custom_network_destroy(void *data)
         network_discovery_destroy(context->discovery);
     }
     uvc_custom_network_receiver_stop(context);
+    uvc_custom_network_srt_receiver_stop(context);
+    uvc_custom_network_control_state_stop(context); /* safety: ensure thread is dead */
+    uvc_custom_network_tally_close_socket(context);
 
     uvc_custom_network_clear_discovered_devices(context);
     bfree(context->discovery_status);
+    bfree(context->source_display_name);
     bfree(context->host);
     pthread_mutex_destroy(&context->lock);
     bfree(context);
@@ -1202,30 +1891,68 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
     obs_properties_t *props = obs_properties_create();
     obs_property_t *p;
 
-    p = obs_properties_add_list(props, "selected_device_index", "Discovered Device", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    if (p) {
-        if (context->discovered_device_count == 0) {
-            obs_property_list_add_int(p, "No devices discovered", -1);
-            obs_property_set_enabled(p, false);
+    /* ── Status bar (top of panel, shows connection state + delay) ── */
+    p = obs_properties_add_text(props, "discovery_status", "📡 Status", OBS_TEXT_INFO);
+    UNUSED_PARAMETER(p);
+    if (p && context) {
+        if (context->receiver_running || context->srt_receiver_running) {
+            char label[160];
+            snprintf(label, sizeof(label), "✅ Connected — %s:%d  %s  %dx%d",
+                     context->host ? context->host : "?",
+                     context->use_srt ? context->srt_port : context->port,
+                     context->use_srt ? "SRT" : "TCP",
+                     (int)(context->width > 0 ? context->width : 1280),
+                     (int)(context->height > 0 ? context->height : 720));
+            obs_property_set_long_description(p, label);
+        } else if (context->host && context->host[0] != '\0') {
+            obs_property_set_long_description(p, "⏳ Connecting...");
         } else {
+            obs_property_set_long_description(p, "⚫ No device selected — pick from list below");
+        }
+    }
+
+    /* ── Discovery list (per-source binding) ────────────────────── */
+    bool is_active = (context && (context->receiver_running || context->srt_receiver_running));
+    p = obs_properties_add_list(props, "selected_device_index", "📋 Discovered Devices", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    if (p) {
+        if (is_active) obs_property_set_enabled(p, false);
+        obs_property_list_add_int(p, is_active ? "🔒 Connected — stop first" : "— auto-detect from list —", -1);
+        if (context && context->discovered_device_count > 0) {
             for (int i = 0; i < context->discovered_device_count; i++) {
-                obs_property_list_add_int(p, context->discovered_devices[i].label, i);
+                char entry[160];
+                bool is_this = (context->host && context->discovered_devices[i].host
+                        && strcmp(context->host, context->discovered_devices[i].host) == 0
+                        && context->port == context->discovered_devices[i].port);
+                snprintf(entry, sizeof(entry), "%s  %s",
+                         context->discovered_devices[i].label,
+                         is_this ? "← THIS SOURCE" : "");
+                obs_property_list_add_int(p, entry, i);
             }
+        } else {
+            obs_property_list_add_int(p, "No devices discovered yet", -1);
+            if (!is_active) obs_property_set_enabled(p, false);
         }
     }
 
     p = obs_properties_add_text(props, "host", "Phone IP", OBS_TEXT_DEFAULT);
-    UNUSED_PARAMETER(p);
-    p = obs_properties_add_int(props, "port", "Stream Port", 1024, 65535, 1);
+    if (is_active) obs_property_set_enabled(p, false);
+    p = obs_properties_add_int(props, "port", "Stream Port (TCP)", 1024, 65535, 1);
+    if (is_active) obs_property_set_enabled(p, false);
+
+    p = obs_properties_add_bool(props, "use_srt", "Use SRT (UDP) — tally/control stay on TCP");
+    if (is_active) obs_property_set_enabled(p, false);
+
+    p = obs_properties_add_int(props, "srt_port", "SRT Port", 1024, 65535, 1);
+    if (is_active) obs_property_set_enabled(p, false);
+
+    p = obs_properties_add_button(props, "activate",
+        (context && (context->receiver_running || context->srt_receiver_running))
+            ? "⏹ Stop" : "▶ Activate",
+        (obs_property_clicked_t)uvc_custom_network_activate_button);
     UNUSED_PARAMETER(p);
 
-    p = obs_properties_add_text(props, "discovery_status", "Discovery Status", OBS_TEXT_INFO);
-    UNUSED_PARAMETER(p);
-
-    p = obs_properties_add_button(props, "activate", "Activate", (obs_property_clicked_t)uvc_custom_network_activate_button);
-    UNUSED_PARAMETER(p);
-
-    p = obs_properties_add_button(props, "refresh_discovery", "Refresh Discovery", (obs_property_clicked_t)uvc_custom_network_refresh_button);
+    p = obs_properties_add_button(props, "refresh_discovery", "🔄 Refresh Discovery",
+                                  (obs_property_clicked_t)uvc_custom_network_refresh_button);
     UNUSED_PARAMETER(p);
 
     p = obs_properties_add_list(props, "resolution_index", "Resolution", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -1318,14 +2045,32 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     if (selected_device_index != context->selected_device_index) {
         context->selected_device_index = selected_device_index;
         if (selected_device_index >= 0 && selected_device_index < context->discovered_device_count) {
-            bfree(context->host);
-            context->host = bstrdup(context->discovered_devices[selected_device_index].host);
-            if (context->port != context->discovered_devices[selected_device_index].port) {
+            const char *new_device_host = context->discovered_devices[selected_device_index].host;
+            int new_device_port = context->discovered_devices[selected_device_index].port;
+            obs_data_set_string(settings, "host", new_device_host);
+            obs_data_set_int(settings, "port", new_device_port);
+            if (!context->host || strcmp(context->host, new_device_host) != 0) {
+                bfree(context->host);
+                context->host = bstrdup(new_device_host);
+                host_changed = true;
+            }
+            if (context->port != new_device_port) {
                 port_changed = true;
             }
-            context->port = context->discovered_devices[selected_device_index].port;
-            host_changed = true;
+            context->port = new_device_port;
+            /* Signal video_tick to rebuild the dialog so Phone IP /
+             * Port fields reflect the selection immediately. */
+            context->pending_ui_refresh = true;
         }
+    }
+
+    /* SRT toggle and port */
+    bool use_srt = obs_data_get_bool(settings, "use_srt");
+    int srt_port = (int)obs_data_get_int(settings, "srt_port");
+    bool srt_changed = (use_srt != context->use_srt) || (srt_port != context->srt_port);
+    context->use_srt = use_srt;
+    if (srt_port > 0 && srt_port <= 65535) {
+        context->srt_port = srt_port;
     }
 
     int resolution_index = (int)obs_data_get_int(settings, "resolution_index");
@@ -1378,35 +2123,48 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
         context->discovery = NULL;
     }
 
-    if ((port_changed || host_changed) && context->receiver_running) {
+    if ((port_changed || host_changed || srt_changed) && context->receiver_running) {
         need_receiver_restart = true;
     }
 
     pthread_mutex_unlock(&context->lock);
 
     blog(LOG_INFO,
-         "UVC update: prev_target=%s:%d new_target=%s:%d host_changed=%d port_changed=%d stream_changed=%d send_control=%d suppress=%d restart=%d",
+         "UVC update: prev_target=%s:%d new_target=%s:%d host_changed=%d port_changed=%d srt_changed=%d stream_changed=%d send_control=%d suppress=%d restart=%d use_srt=%d",
          previous_host[0] != '\0' ? previous_host : "(none)",
          previous_port,
          context->host && context->host[0] != '\0' ? context->host : "(none)",
          context->port,
          host_changed ? 1 : 0,
          port_changed ? 1 : 0,
+         srt_changed ? 1 : 0,
          stream_settings_changed ? 1 : 0,
          send_control ? 1 : 0,
          suppress_control_send ? 1 : 0,
-         need_receiver_restart ? 1 : 0);
+         need_receiver_restart ? 1 : 0,
+         context->use_srt ? 1 : 0);
 
     // Do blocking operations OUTSIDE the lock to avoid deadlock with callback threads
     if (old_discovery) {
         network_discovery_destroy(old_discovery);
     }
 
+    /* Update the persistent tally socket destination when the host changes,
+     * even if the receiver is not currently running. */
+    if (host_changed) {
+        uvc_custom_network_tally_update_addr(context);
+    }
+
     if (need_receiver_restart) {
         uvc_custom_network_receiver_stop(context);
+        uvc_custom_network_srt_receiver_stop(context);
         pthread_mutex_lock(&context->lock);
-        if (context->port > 0) {
-            uvc_custom_network_start_receiver(context);
+        if (context->port > 0 || context->srt_port > 0) {
+            if (context->use_srt) {
+                uvc_custom_network_srt_receiver_start(context);
+            } else {
+                uvc_custom_network_start_receiver(context);
+            }
         }
         pthread_mutex_unlock(&context->lock);
     }
@@ -1436,10 +2194,13 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     UNUSED_PARAMETER(host_changed);
 }
 
-static const char *uvc_custom_network_get_name(void *unused)
+static const char *uvc_custom_network_get_name(void *data)
 {
-    UNUSED_PARAMETER(unused);
-    return "UVC Custom Network Source";
+    uvc_custom_network *context = (uvc_custom_network *)data;
+    if (context && context->source_display_name && context->source_display_name[0] != '\0') {
+        return context->source_display_name;
+    }
+    return "UVC Custom Network (idle)";
 }
 
 static uint32_t uvc_custom_network_get_width(void *data)
@@ -1480,6 +2241,8 @@ static void uvc_custom_network_defaults(obs_data_t *settings)
     obs_data_set_default_int(settings, "wb_mode", 0);
     obs_data_set_default_int(settings, "wb_kelvin", 4500);
     obs_data_set_default_int(settings, "port", 5600);
+    obs_data_set_default_bool(settings, "use_srt", false);
+    obs_data_set_default_int(settings, "srt_port", SRT_DEFAULT_PORT);
     obs_data_set_default_int(settings, "fps", 30);
     obs_data_set_default_int(settings, "quality", 50);
     obs_data_set_default_int(settings, "resolution_index", 1);
@@ -1501,6 +2264,8 @@ extern "C" bool obs_module_load(void)
     uvc_custom_network_info.get_properties = uvc_custom_network_properties;
     uvc_custom_network_info.update = uvc_custom_network_update;
     uvc_custom_network_info.video_tick = uvc_custom_network_video_tick;
+    uvc_custom_network_info.activate = uvc_custom_network_activate;
+    uvc_custom_network_info.deactivate = uvc_custom_network_deactivate;
 
     obs_register_source(&uvc_custom_network_info);
     blog(LOG_INFO, "Loaded UVC Custom Network OBS plugin");

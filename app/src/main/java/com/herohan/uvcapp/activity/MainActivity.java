@@ -189,7 +189,7 @@ public class MainActivity extends AppCompatActivity {
     private boolean mNdiHighQuality = false;   // toggle state for NDI mode
     // RTP streaming removed per request; keep NDI only
 
-    private enum StreamProtocol { NDI, TCP_UDP }
+    private enum StreamProtocol { NDI, TCP_UDP, SRT }
     private StreamProtocol mStreamProtocol = StreamProtocol.NDI;
     private static final String PREF_STREAM_PROTOCOL = "pref_stream_protocol";
     private static final String PREF_STREAM_HOST = "pref_stream_host";
@@ -269,6 +269,28 @@ public class MainActivity extends AppCompatActivity {
     private volatile String mLastProcessedTcpControlPayload = "";
     private volatile long mLastProcessedTcpControlNs = 0;
     private static final long TCP_TALLY_STALE_TIMEOUT_MS = 1500;
+
+    // SRT streaming — video over SRT, tally/control remain on TCP
+    private static final int SRT_DEFAULT_PORT = 5601;
+    private static final int SRT_MAX_CHUNK = 1400; // safe MTU for UDP (avoids IP fragmentation)
+    private static final String PREF_SRT_PORT = "pref_srt_port";
+    private int mSrtPort = SRT_DEFAULT_PORT;
+    private Thread mSrtWorkerThread;
+    private volatile boolean mSrtWorkerRunning = false;
+    private java.net.DatagramSocket mSrtSocket; // SRT-lite over UDP (caller-mode)
+    private volatile String mSrtRemoteHost;
+    private volatile int mSrtRemotePort;
+    private volatile java.net.InetAddress mSrtRemoteAddr; // cached address
+    private final byte[] mSrtSendBuf = new byte[64 * 1024]; // reusable send buffer
+    private final java.util.concurrent.ArrayBlockingQueue<CustomUdpFrame> mSrtFrameQueue = new java.util.concurrent.ArrayBlockingQueue<>(6);
+    private int mSrtTargetFps = 30;
+    private long mSrtMinFrameIntervalNs = 0;
+    private long mNextSrtEnqueueTimeNs = 0;
+    private final java.util.concurrent.atomic.AtomicLong mSrtFramesCaptured = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mSrtFramesDropped = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mSrtFramesEncoded = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mSrtPacketsSent = new java.util.concurrent.atomic.AtomicLong();
+
     private Thread mTcpDiscoveryThread;
     private volatile boolean mTcpDiscoveryRunning = false;
     private Thread mTcpTallyListenerThread;
@@ -325,8 +347,9 @@ public class MainActivity extends AppCompatActivity {
                     else                mTallyIndicator.setBackgroundColor(Color.GRAY);
                 }
             }
-            // Tally for TCP/UDP: reflect OBS state sent by plugin (program/preview/none).
-            else if (mStreamProtocol == StreamProtocol.TCP_UDP && mTcpUdpWorkerRunning) {
+            // Tally for TCP/UDP or SRT: reflect OBS state sent by plugin (program/preview/none).
+            else if ((mStreamProtocol == StreamProtocol.TCP_UDP && mTcpUdpWorkerRunning)
+                    || (mStreamProtocol == StreamProtocol.SRT && mTcpTallyListenerRunning)) {
                 long nowNs = System.nanoTime();
                 long staleMs = (nowNs - mTcpLastTallyUpdateNs) / 1_000_000;
                 int color = Color.GRAY;
@@ -342,7 +365,8 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
             // Schedule next poll if any transport is active
-            if (mNdiSender != null || (mStreamProtocol == StreamProtocol.TCP_UDP && mTcpUdpWorkerRunning)) {
+            if (mNdiSender != null || (mStreamProtocol == StreamProtocol.TCP_UDP && mTcpUdpWorkerRunning)
+                    || (mStreamProtocol == StreamProtocol.SRT && mTcpTallyListenerRunning)) {
                 mHandler.postDelayed(this, 50);
             }
         }
@@ -514,10 +538,17 @@ public class MainActivity extends AppCompatActivity {
                             : getString(R.string.action_preview_mode_fit),
                     Toast.LENGTH_SHORT).show();
         } else if (id == R.id.action_stream_protocol) {
-            final StreamProtocol nextProtocol = (mStreamProtocol == StreamProtocol.NDI)
-                    ? StreamProtocol.TCP_UDP
-                    : StreamProtocol.NDI;
-            if (nextProtocol == StreamProtocol.TCP_UDP && !hasCustomTransportDestination()) {
+            // Cycle: NDI → TCP_UDP → SRT → NDI
+            final StreamProtocol nextProtocol;
+            if (mStreamProtocol == StreamProtocol.NDI) {
+                nextProtocol = StreamProtocol.TCP_UDP;
+            } else if (mStreamProtocol == StreamProtocol.TCP_UDP) {
+                nextProtocol = StreamProtocol.SRT;
+            } else {
+                nextProtocol = StreamProtocol.NDI;
+            }
+            if ((nextProtocol == StreamProtocol.TCP_UDP || nextProtocol == StreamProtocol.SRT)
+                    && !hasCustomTransportDestination()) {
                 showSetStreamDestinationDialog();
                 return true;
             }
@@ -549,16 +580,29 @@ public class MainActivity extends AppCompatActivity {
                             } catch (Exception e) {
                                 Log.e(TAG, "❌ Failed to create NDI sender", e);
                             }
-                        } else {
+                        } else if (nextProtocol == StreamProtocol.TCP_UDP) {
                             setupTcpUdpForUsbCamera(mUsbDevice, size);
+                        } else {
+                            // SRT: video over SRT, tally/control stay on TCP
+                            setupSrtForUsbCamera(mUsbDevice, size);
+                            // keep TCP tally/control alive
+                            startTcpTallyListenerThread();
+                            startTcpDiscoveryBeaconThread();
+                            mHandler.post(mTallyPoller);
                         }
                     }
                 } else if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
                     cleanupNdiAndStreaming();
                     if (nextProtocol == StreamProtocol.NDI) {
                         setupNdiForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
-                    } else {
+                    } else if (nextProtocol == StreamProtocol.TCP_UDP) {
                         setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                    } else {
+                        // SRT: video over SRT, tally/control stay on TCP
+                        setupSrtForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                        startTcpTallyListenerThread();
+                        startTcpDiscoveryBeaconThread();
+                        mHandler.post(mTallyPoller);
                     }
                 }
                 if (mCameraHelper != null && mMultiCallback != null) {
@@ -569,11 +613,19 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }
             }
-            Toast.makeText(this,
-                    nextProtocol == StreamProtocol.NDI
-                            ? getString(R.string.action_stream_protocol_ndi)
-                            : getString(R.string.action_stream_protocol_tcp_udp),
-                    Toast.LENGTH_SHORT).show();
+            final String protocolLabel;
+            switch (nextProtocol) {
+                case NDI:
+                    protocolLabel = getString(R.string.action_stream_protocol_ndi);
+                    break;
+                case TCP_UDP:
+                    protocolLabel = getString(R.string.action_stream_protocol_tcp_udp);
+                    break;
+                default:
+                    protocolLabel = "SRT (video) + TCP (tally)";
+                    break;
+            }
+            Toast.makeText(this, protocolLabel, Toast.LENGTH_SHORT).show();
         } else if (id == R.id.action_set_stream_destination) {
             showSetStreamDestinationDialog();
         } else if (id == R.id.action_ndimode) {
@@ -654,9 +706,17 @@ public class MainActivity extends AppCompatActivity {
         }
         final MenuItem streamProtocolItem = menu.findItem(R.id.action_stream_protocol);
         if (streamProtocolItem != null) {
-            streamProtocolItem.setTitle(mStreamProtocol == StreamProtocol.NDI
-                    ? R.string.action_stream_protocol_ndi
-                    : R.string.action_stream_protocol_tcp_udp);
+            switch (mStreamProtocol) {
+                case NDI:
+                    streamProtocolItem.setTitle(R.string.action_stream_protocol_ndi);
+                    break;
+                case TCP_UDP:
+                    streamProtocolItem.setTitle(R.string.action_stream_protocol_tcp_udp);
+                    break;
+                default:
+                    streamProtocolItem.setTitle("SRT (video) + TCP (tally)");
+                    break;
+            }
             streamProtocolItem.setVisible(true);
         }
         final MenuItem destinationItem = menu.findItem(R.id.action_set_stream_destination);
@@ -809,6 +869,8 @@ public class MainActivity extends AppCompatActivity {
             }
             if (mStreamProtocol == StreamProtocol.NDI) {
                 enqueueNdiFrame(frame);
+            } else if (mStreamProtocol == StreamProtocol.SRT) {
+                enqueueSrtFrame(frame, mPreviewWidth, mPreviewHeight);
             } else {
                 enqueueTcpUdpFrame(frame, mPreviewWidth, mPreviewHeight);
             }
@@ -1055,8 +1117,14 @@ public class MainActivity extends AppCompatActivity {
                         mNdiSender = null;
                         mFrameForwarder = null;
                     }
-                } else {
+                } else if (mStreamProtocol == StreamProtocol.TCP_UDP) {
                     setupTcpUdpForUsbCamera(device, size);
+                } else {
+                    // SRT: video over SRT, tally/control on TCP
+                    setupSrtForUsbCamera(device, size);
+                    startTcpTallyListenerThread();
+                    startTcpDiscoveryBeaconThread();
+                    mHandler.post(mTallyPoller);
                 }
             }
             
@@ -1331,6 +1399,34 @@ public class MainActivity extends AppCompatActivity {
         return "";
     }
 
+    /**
+     * Returns the subnet broadcast address (e.g. 192.168.1.255) for the first
+     * non-loopback IPv4 interface. Used as fallback SRT destination until OBS
+     * ACK provides the exact IP.
+     */
+    private String getSubnetBroadcast() {
+        try {
+            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements(); ) {
+                NetworkInterface intf = en.nextElement();
+                if (!intf.isUp() || intf.isLoopback() || intf.isVirtual()) {
+                    continue;
+                }
+                for (java.net.InterfaceAddress ifAddr : intf.getInterfaceAddresses()) {
+                    InetAddress addr = ifAddr.getAddress();
+                    if (addr instanceof Inet4Address && !addr.isLoopbackAddress()) {
+                        InetAddress broadcast = ifAddr.getBroadcast();
+                        if (broadcast != null) {
+                            return broadcast.getHostAddress();
+                        }
+                    }
+                }
+            }
+        } catch (SocketException e) {
+            Log.w(TAG, "Failed to get subnet broadcast", e);
+        }
+        return "255.255.255.255"; // ultimate fallback
+    }
+
     private void setSavedStreamDestination(final String host, final int port) {
         if (port <= 0 || port > 65535) return;
         PreferenceManager
@@ -1411,15 +1507,30 @@ public class MainActivity extends AppCompatActivity {
                     setSavedVideoQuality(quality);
                     Toast.makeText(this, String.format("%s:%d fps=%d quality=%d", host, port, targetFps, quality), Toast.LENGTH_SHORT).show();
                     invalidateOptionsMenu();
-                    if (mStreamProtocol == StreamProtocol.TCP_UDP && mIsCameraConnected) {
+                    if ((mStreamProtocol == StreamProtocol.TCP_UDP || mStreamProtocol == StreamProtocol.SRT)
+                            && mIsCameraConnected) {
                         cleanupNdiAndStreaming();
                         if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
                             Size size = mCameraHelper.getPreviewSize();
                             if (size != null) {
-                                setupTcpUdpForUsbCamera(mUsbDevice, size);
+                                if (mStreamProtocol == StreamProtocol.SRT) {
+                                    setupSrtForUsbCamera(mUsbDevice, size);
+                                    startTcpTallyListenerThread();
+                                    startTcpDiscoveryBeaconThread();
+                                    mHandler.post(mTallyPoller);
+                                } else {
+                                    setupTcpUdpForUsbCamera(mUsbDevice, size);
+                                }
                             }
                         } else if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
-                            setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                            if (mStreamProtocol == StreamProtocol.SRT) {
+                                setupSrtForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                                startTcpTallyListenerThread();
+                                startTcpDiscoveryBeaconThread();
+                                mHandler.post(mTallyPoller);
+                            } else {
+                                setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                            }
                         }
                     }
                 })
@@ -1431,29 +1542,60 @@ public class MainActivity extends AppCompatActivity {
         if (mBinding == null || mBinding.tvStreamStatus == null) {
             return;
         }
+        // always show device IP for easy discovery
+        String ipLine = (mDeviceIp != null && !mDeviceIp.isEmpty())
+                ? "📱 IP: " + mDeviceIp + "\n"
+                : "";
         if (mStreamProtocol == StreamProtocol.NDI) {
-            mBinding.tvStreamStatus.setText(R.string.stream_status_ndi);
+            mBinding.tvStreamStatus.setText(ipLine + getString(R.string.stream_status_ndi));
         } else if (mStreamProtocol == StreamProtocol.TCP_UDP) {
             if (hasCustomTransportDestination()) {
                 String resolutionLabel = "";
                 if (mInternalPreviewSize != null) {
                     resolutionLabel = " res=" + mInternalPreviewSize.getWidth() + "x" + mInternalPreviewSize.getHeight();
                 }
-                String base = "H.265 TCP server: 0.0.0.0:" + mStreamPort
+                String base = ipLine + "H.265 TCP server: 0.0.0.0:" + mStreamPort
                         + resolutionLabel
                         + " @ " + mVideoTargetFps + " fps"
                         + " q=" + mVideoQuality;
                 mBinding.tvStreamStatus.setText(base + "\n" + getTcpTelemetryOverlay());
             } else {
-                mBinding.tvStreamStatus.setText(R.string.stream_status_no_destination);
+                mBinding.tvStreamStatus.setText(ipLine + getString(R.string.stream_status_no_destination));
+            }
+        } else if (mStreamProtocol == StreamProtocol.SRT) {
+            if (hasCustomTransportDestination()) {
+                String resolutionLabel = "";
+                if (mInternalPreviewSize != null) {
+                    resolutionLabel = " res=" + mInternalPreviewSize.getWidth() + "x" + mInternalPreviewSize.getHeight();
+                }
+                String base = ipLine + "SRT (caller): 0.0.0.0:" + mSrtPort
+                        + resolutionLabel
+                        + " @ " + mVideoTargetFps + " fps"
+                        + " q=" + mVideoQuality;
+                mBinding.tvStreamStatus.setText(base + "\n" + getSrtTelemetryOverlay());
+            } else {
+                mBinding.tvStreamStatus.setText(ipLine + getString(R.string.stream_status_no_destination));
             }
         } else {
-            mBinding.tvStreamStatus.setText(R.string.stream_status_inactive);
+            mBinding.tvStreamStatus.setText(ipLine + getString(R.string.stream_status_inactive));
         }
     }
 
     private boolean isCustomTransportActive() {
-        return mStreamProtocol == StreamProtocol.TCP_UDP;
+        return mStreamProtocol == StreamProtocol.TCP_UDP || mStreamProtocol == StreamProtocol.SRT;
+    }
+
+    private String getSrtTelemetryOverlay() {
+        long captured = mSrtFramesCaptured.get();
+        long dropped = mSrtFramesDropped.get();
+        long encoded = mSrtFramesEncoded.get();
+        long sent = mSrtPacketsSent.get();
+        return String.format(Locale.US,
+                "cap=%d drop=%d enc=%d sent=%d",
+                captured,
+                dropped,
+                encoded,
+                sent);
     }
 
     private String getTcpTelemetryOverlay() {
@@ -2933,14 +3075,32 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        if ((fpsChanged || qualityChanged) && mStreamProtocol == StreamProtocol.TCP_UDP && mIsCameraConnected) {
-            cleanupNdiAndStreaming();
-            if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
-                setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
-            } else if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
-                Size usbSize = mCameraHelper.getPreviewSize();
-                if (usbSize != null) {
-                    setupTcpUdpForUsbCamera(mUsbDevice, usbSize);
+        if ((fpsChanged || qualityChanged) && mIsCameraConnected) {
+            if (mStreamProtocol == StreamProtocol.TCP_UDP) {
+                cleanupNdiAndStreaming();
+                if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
+                    setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                } else if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
+                    Size usbSize = mCameraHelper.getPreviewSize();
+                    if (usbSize != null) {
+                        setupTcpUdpForUsbCamera(mUsbDevice, usbSize);
+                    }
+                }
+            } else if (mStreamProtocol == StreamProtocol.SRT) {
+                cleanupNdiAndStreaming();
+                if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
+                    setupSrtForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                    startTcpTallyListenerThread();
+                    startTcpDiscoveryBeaconThread();
+                    mHandler.post(mTallyPoller);
+                } else if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
+                    Size usbSize = mCameraHelper.getPreviewSize();
+                    if (usbSize != null) {
+                        setupSrtForUsbCamera(mUsbDevice, usbSize);
+                        startTcpTallyListenerThread();
+                        startTcpDiscoveryBeaconThread();
+                        mHandler.post(mTallyPoller);
+                    }
                 }
             }
         }
@@ -3003,6 +3163,16 @@ public class MainActivity extends AppCompatActivity {
                 enqueueNdiFrame(nv12Frame);
             });
             Log.i(TAG, "Internal camera transport set to NDI");
+        } else if (mStreamProtocol == StreamProtocol.SRT) {
+            mInternalCameraHelper.setFrameListener((nv12Frame, width, height) -> {
+                if (nv12Frame == null) {
+                    return;
+                }
+                mPreviewWidth = width;
+                mPreviewHeight = height;
+                enqueueSrtFrame(nv12Frame, width, height);
+            });
+            Log.i(TAG, "Internal camera transport set to SRT");
         } else {
             mInternalCameraHelper.setFrameListener((nv12Frame, width, height) -> {
                 if (nv12Frame == null) {
@@ -3151,8 +3321,14 @@ public class MainActivity extends AppCompatActivity {
             // Set up the selected transport
             if (mStreamProtocol == StreamProtocol.NDI) {
                 setupNdiForInternalCamera(cameraInfo, previewSize);
-            } else {
+            } else if (mStreamProtocol == StreamProtocol.TCP_UDP) {
                 setupTcpUdpForInternalCamera(cameraInfo, previewSize);
+            } else {
+                // SRT: video over SRT, tally/control on TCP
+                setupSrtForInternalCamera(cameraInfo, previewSize);
+                startTcpTallyListenerThread();
+                startTcpDiscoveryBeaconThread();
+                mHandler.post(mTallyPoller);
             }
 
             startKeepAliveService();
@@ -3238,6 +3414,7 @@ public class MainActivity extends AppCompatActivity {
     private void setupTcpUdpForUsbCamera(final UsbDevice device, final Size previewSize) {
         Log.i(TAG, "✅ H.265 TCP stream mode selected for USB camera.");
         stopNdiForwardingThread();
+        stopSrtForwardingThread();
         cleanupNdiAndStreaming();
         new Thread(() -> {
             if (!hasCustomTransportDestination()) {
@@ -3250,10 +3427,26 @@ public class MainActivity extends AppCompatActivity {
         }, "CustomTransportInit").start();
     }
 
+    private void setupSrtForUsbCamera(final UsbDevice device, final Size previewSize) {
+        Log.i(TAG, "✅ SRT stream mode selected for USB camera (tally/control stay on TCP).");
+        stopNdiForwardingThread();
+        stopTcpUdpForwardingThread();
+        new Thread(() -> {
+            if (!hasCustomTransportDestination()) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "Port not configured — tap the stream protocol button to set a port",
+                        Toast.LENGTH_SHORT).show());
+                return;
+            }
+            startSrtForwardingThread();
+        }, "SrtTransportInit").start();
+    }
+
     private void setupTcpUdpForInternalCamera(final InternalCameraInfo cameraInfo,
                                               final android.util.Size previewSize) {
         Log.i(TAG, "✅ H.265 TCP stream mode selected for internal camera.");
         stopNdiForwardingThread();
+        stopSrtForwardingThread();
         cleanupNdiAndStreaming();
         new Thread(() -> {
             if (!hasCustomTransportDestination()) {
@@ -3265,6 +3458,23 @@ public class MainActivity extends AppCompatActivity {
             updateInternalCameraFrameListener();
             startTcpUdpForwardingThread();
         }, "CustomTransportInit").start();
+    }
+
+    private void setupSrtForInternalCamera(final InternalCameraInfo cameraInfo,
+                                           final android.util.Size previewSize) {
+        Log.i(TAG, "✅ SRT stream mode selected for internal camera (tally/control stay on TCP).");
+        stopNdiForwardingThread();
+        stopTcpUdpForwardingThread();
+        new Thread(() -> {
+            if (!hasCustomTransportDestination()) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "Port not configured — tap the stream protocol button to set a port",
+                        Toast.LENGTH_SHORT).show());
+                return;
+            }
+            updateInternalCameraFrameListener();
+            startSrtForwardingThread();
+        }, "SrtTransportInit").start();
     }
 
     /** Tears down NDI sender and frame forwarder — used by both camera paths. */
@@ -3286,6 +3496,7 @@ public class MainActivity extends AppCompatActivity {
                 mNdiSender = null;
             }
             stopTcpUdpForwardingThread();
+            stopSrtForwardingThread();
         } catch (Exception e) {
             Log.e(TAG, "Error stopping NDI", e);
         }
@@ -3362,6 +3573,253 @@ public class MainActivity extends AppCompatActivity {
         }
         clearTcpUdpFrameQueue();
         runOnUiThread(this::updateStreamStatus);
+    }
+
+    private void stopSrtForwardingThread() {
+        mSrtWorkerRunning = false;
+        java.net.DatagramSocket sock = mSrtSocket;
+        mSrtSocket = null;
+        if (sock != null) {
+            try { sock.close(); } catch (Exception ignored) {}
+        }
+        if (mSrtWorkerThread != null) {
+            mSrtWorkerThread.interrupt();
+            try {
+                mSrtWorkerThread.join(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            mSrtWorkerThread = null;
+        }
+        // Clear SRT queue
+        CustomUdpFrame pending;
+        while ((pending = mSrtFrameQueue.poll()) != null) {
+            recycleFrameBuffer(pending.frame);
+        }
+        stopH264Encoder();
+        runOnUiThread(this::updateStreamStatus);
+    }
+
+    private void startSrtForwardingThread() {
+        if (mSrtWorkerRunning) {
+            return;
+        }
+        mSrtTargetFps = Math.max(24, Math.min(60, mVideoTargetFps));
+        mSrtMinFrameIntervalNs = 1_000_000_000L / mSrtTargetFps;
+        mNextSrtEnqueueTimeNs = 0;
+        mSrtFramesCaptured.set(0);
+        mSrtFramesDropped.set(0);
+        mSrtFramesEncoded.set(0);
+        mSrtPacketsSent.set(0);
+        mSrtWorkerRunning = true;
+
+        // Initialize SRT remote target — use subnet broadcast as fallback
+        // until discovery ACK provides the exact OBS IP.
+        if (mSrtRemoteHost == null || mSrtRemoteHost.isEmpty()) {
+            mSrtRemoteHost = getSubnetBroadcast();
+            mSrtRemotePort = mSrtPort > 0 ? mSrtPort : SRT_DEFAULT_PORT;
+            Log.i(TAG, "SRT: using broadcast fallback " + mSrtRemoteHost + ":" + mSrtRemotePort);
+        }
+        // Cache InetAddress once — never resolve per-packet
+        try {
+            mSrtRemoteAddr = java.net.InetAddress.getByName(mSrtRemoteHost);
+        } catch (java.net.UnknownHostException e) {
+            Log.e(TAG, "SRT: cannot resolve " + mSrtRemoteHost, e);
+            mSrtWorkerRunning = false;
+            return;
+        }
+
+        mSrtWorkerThread = new Thread(() -> {
+            Log.i(TAG, "SRT forwarding thread started (video only, tally/control on TCP), port=" + mSrtPort);
+
+            // Open UDP socket for SRT-lite (caller-mode, sends directly to OBS listener)
+            try {
+                mSrtSocket = new java.net.DatagramSocket();
+                mSrtSocket.setSendBufferSize(1024 * 1024);
+                // Connect the socket to filter and cache the target address
+                mSrtSocket.connect(new java.net.InetSocketAddress(mSrtRemoteAddr, mSrtRemotePort));
+                Log.i(TAG, "SRT: socket connected to " + mSrtRemoteHost + ":" + mSrtRemotePort);
+            } catch (java.net.SocketException e) {
+                Log.e(TAG, "Failed to open SRT UDP socket", e);
+                mSrtWorkerRunning = false;
+                return;
+            }
+
+            // Main frame draining loop
+            while (mSrtWorkerRunning) {
+                try {
+                    CustomUdpFrame frame = mSrtFrameQueue.poll(5, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    if (frame == null) continue;
+                    try {
+                        // Lazy-init encoder on first frame or when resolution changes
+                        if (mH264Encoder == null
+                                || frame.width != mH264EncoderWidth
+                                || frame.height != mH264EncoderHeight) {
+                            reconfigureH264Encoder(frame.width, frame.height);
+                        }
+                        // Encode and send via SRT (UDP with H.265 payload)
+                        feedFrameToH264EncoderSrt(frame);
+                        mSrtFramesEncoded.incrementAndGet();
+                    } finally {
+                        recycleFrameBuffer(frame.frame);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                } catch (Exception e) {
+                    if (mSrtWorkerRunning) {
+                        Log.w(TAG, "Error in SRT forwarding thread", e);
+                    }
+                }
+            }
+
+            stopH264Encoder();
+            java.net.DatagramSocket sock = mSrtSocket;
+            mSrtSocket = null;
+            if (sock != null) try { sock.close(); } catch (Exception ignored) {}
+            Log.i(TAG, "SRT forwarding thread exiting");
+        }, "SrtForwarder");
+        mSrtWorkerThread.setPriority(Thread.MAX_PRIORITY);
+        mSrtWorkerThread.start();
+    }
+
+    /**
+     * Encodes a frame and sends it as H.265 over UDP (SRT-lite caller mode).
+     * Each NAL unit is wrapped in a simple header: 4-byte length prefix.
+     */
+    private void feedFrameToH264EncoderSrt(CustomUdpFrame frame) throws IOException {
+        MediaCodec enc = mH264Encoder;
+        if (enc == null) return;
+        long encodeStartNs = System.nanoTime();
+
+        int yuvSize = frame.width * frame.height * 3 / 2;
+        int actualYuvSize = Math.min(yuvSize, frame.frame.remaining());
+
+        // Drain any ready output first
+        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+        drainEncoderOutputSrt(enc, info, 0);
+
+        // Submit input frame
+        int inputIndex = enc.dequeueInputBuffer(5_000);
+        int enqueuedSize = 0;
+        if (inputIndex >= 0) {
+            java.nio.ByteBuffer inputBuf = enc.getInputBuffer(inputIndex);
+            if (inputBuf != null) {
+                inputBuf.clear();
+                java.nio.ByteBuffer src = frame.frame.duplicate();
+                src.limit(src.position() + Math.min(actualYuvSize, inputBuf.remaining()));
+                enqueuedSize = src.remaining();
+                inputBuf.put(src);
+            }
+            long ptsUs = frame.captureTimeNs > 0 ? (frame.captureTimeNs / 1000L) : (System.nanoTime() / 1000L);
+            enc.queueInputBuffer(inputIndex, 0, enqueuedSize, ptsUs, 0);
+        } else {
+            mSrtFramesDropped.incrementAndGet();
+            return;
+        }
+
+        // Drain output
+        drainEncoderOutputSrt(enc, info, 10_000);
+        mTcpEncodeTimeNsSum.addAndGet(System.nanoTime() - encodeStartNs);
+        mTcpEncodeSamples.incrementAndGet();
+    }
+
+    /** Drain encoder output and send each packet over SRT (UDP). */
+    private void drainEncoderOutputSrt(MediaCodec enc, MediaCodec.BufferInfo info, long firstTimeoutUs)
+            throws IOException {
+        long timeoutUs = firstTimeoutUs;
+        java.net.DatagramSocket socket = mSrtSocket;
+        while (true) {
+            int outIndex = enc.dequeueOutputBuffer(info, timeoutUs);
+            timeoutUs = 0;
+            if (outIndex == MediaCodec.INFO_TRY_AGAIN_LATER) break;
+            if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                MediaFormat newFmt = enc.getOutputFormat();
+                java.nio.ByteBuffer spsB = newFmt.getByteBuffer("csd-0");
+                java.nio.ByteBuffer ppsB = newFmt.getByteBuffer("csd-1");
+                int spsLen = spsB != null ? spsB.remaining() : 0;
+                int ppsLen = ppsB != null ? ppsB.remaining() : 0;
+                byte[] spsPps = new byte[spsLen + ppsLen];
+                if (spsB != null) spsB.get(spsPps, 0, spsLen);
+                if (ppsB != null) ppsB.get(spsPps, spsLen, ppsLen);
+                mH264SpsPps = spsPps;
+                // Send SPS+PPS over SRT
+                if (socket != null && mSrtRemoteHost != null) {
+                    sendSrtPacket(H264_NO_PTS, spsPps, 0, spsPps.length, socket);
+                }
+                continue;
+            }
+            if (outIndex < 0) break;
+            java.nio.ByteBuffer outBuf = enc.getOutputBuffer(outIndex);
+            if (outBuf != null && info.size > 0 && socket != null && mSrtRemoteHost != null) {
+                boolean isConfig = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+                if (mH264OutputBuffer == null || mH264OutputBuffer.length < info.size) {
+                    mH264OutputBuffer = new byte[info.size * 2];
+                }
+                byte[] data = mH264OutputBuffer;
+                outBuf.position(info.offset);
+                outBuf.get(data, 0, info.size);
+                long pts = isConfig ? H264_NO_PTS : info.presentationTimeUs;
+                sendSrtPacket(pts, data, 0, info.size, socket);
+                if (isConfig) {
+                    mH264SpsPps = java.util.Arrays.copyOf(data, info.size);
+                } else {
+                    mSrtPacketsSent.incrementAndGet();
+                }
+            }
+            enc.releaseOutputBuffer(outIndex, false);
+            if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
+        }
+    }
+
+    /**
+     * Send a single H.265 NAL unit over UDP with MTU-aware fragmentation.
+     * Each chunk: 16-byte header [PTS(8)|chunkIdx(2)|totalChunks(2)|payloadLen(4)] + payload.
+     * OBS reassembles chunks into a complete NAL unit before decoding.
+     */
+    private void sendSrtPacket(long pts, byte[] data, int offset, int length,
+                               java.net.DatagramSocket socket) throws IOException {
+        if (socket == null || mSrtRemoteAddr == null || mSrtRemotePort <= 0) return;
+        if (length <= 0) return;
+
+        int maxPayload = SRT_MAX_CHUNK - 16; // 16-byte chunk header
+        int totalChunks = (length + maxPayload - 1) / maxPayload;
+        if (totalChunks > 65535) totalChunks = 65535; // safety cap
+
+        byte[] buf = mSrtSendBuf;
+        for (int chunk = 0; chunk < totalChunks; chunk++) {
+            int chunkOff = offset + chunk * maxPayload;
+            int chunkLen = Math.min(maxPayload, length - chunk * maxPayload);
+            int hdrOff = 0;
+
+            // PTS (8 bytes, big-endian)
+            buf[hdrOff++] = (byte) (pts >>> 56);
+            buf[hdrOff++] = (byte) (pts >>> 48);
+            buf[hdrOff++] = (byte) (pts >>> 40);
+            buf[hdrOff++] = (byte) (pts >>> 32);
+            buf[hdrOff++] = (byte) (pts >>> 24);
+            buf[hdrOff++] = (byte) (pts >>> 16);
+            buf[hdrOff++] = (byte) (pts >>> 8);
+            buf[hdrOff++] = (byte) (pts);
+            // Chunk index (2 bytes, big-endian)
+            buf[hdrOff++] = (byte) (chunk >>> 8);
+            buf[hdrOff++] = (byte) (chunk);
+            // Total chunks (2 bytes, big-endian)
+            buf[hdrOff++] = (byte) (totalChunks >>> 8);
+            buf[hdrOff++] = (byte) (totalChunks);
+            // Payload length (4 bytes, big-endian)
+            buf[hdrOff++] = (byte) (chunkLen >>> 24);
+            buf[hdrOff++] = (byte) (chunkLen >>> 16);
+            buf[hdrOff++] = (byte) (chunkLen >>> 8);
+            buf[hdrOff++] = (byte) (chunkLen);
+
+            // Copy payload after header
+            System.arraycopy(data, chunkOff, buf, 16, chunkLen);
+
+            java.net.DatagramPacket packet = new java.net.DatagramPacket(
+                    buf, 16 + chunkLen, mSrtRemoteAddr, mSrtRemotePort);
+            socket.send(packet);
+        }
     }
 
     // ── H.265 encoder lifecycle ──────────────────────────────────────────────
@@ -3636,13 +4094,15 @@ public class MainActivity extends AppCompatActivity {
 
     private void sendTcpDiscoveryBeacon() {
         int port = mStreamPort > 0 ? mStreamPort : DEFAULT_STREAM_PORT;
-        String payload = "UVCAPP;port=" + port;
+        int srtPort = mSrtPort > 0 ? mSrtPort : SRT_DEFAULT_PORT;
+        String payload = "UVCAPP;port=" + port + ";srt_port=" + srtPort;
         byte[] data = payload.getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
         java.net.DatagramSocket socket = null;
         try {
             socket = new java.net.DatagramSocket();
             socket.setBroadcast(true);
+            socket.setSoTimeout(200); // short timeout for ACK listen
 
             // Broadcast to global address.
             java.net.DatagramPacket globalPacket = new java.net.DatagramPacket(
@@ -3667,6 +4127,28 @@ public class MainActivity extends AppCompatActivity {
                             data, data.length, broadcast, DISCOVERY_PORT);
                     socket.send(packet);
                 }
+            }
+
+            // Listen for OBS ACK ("UVCOBS") to learn OBS IP for SRT mode
+            byte[] ackBuf = new byte[64];
+            java.net.DatagramPacket ackPacket = new java.net.DatagramPacket(ackBuf, ackBuf.length);
+            try {
+                socket.receive(ackPacket);
+                String ackMsg = new String(ackPacket.getData(), 0, ackPacket.getLength(),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                if (ackMsg.startsWith("UVCOBS") && ackPacket.getAddress() != null) {
+                    String obsIp = ackPacket.getAddress().getHostAddress();
+                    if (mStreamProtocol == StreamProtocol.SRT && !obsIp.equals(mSrtRemoteHost)) {
+                        mSrtRemoteHost = obsIp;
+                        mSrtRemotePort = mSrtPort;
+                        try {
+                            mSrtRemoteAddr = java.net.InetAddress.getByName(obsIp);
+                        } catch (Exception ignored) {}
+                        Log.i(TAG, "SRT: learned OBS IP from discovery ACK: " + obsIp);
+                    }
+                }
+            } catch (java.net.SocketTimeoutException ignored) {
+                // No ACK received — OBS may not be running or not in discovery mode
             }
         } catch (Exception e) {
             Log.w(TAG, "TCP discovery beacon error", e);
@@ -3932,6 +4414,55 @@ public class MainActivity extends AppCompatActivity {
             Log.w(TAG, "TCP/UDP enqueue: unexpected error", e);
             mTcpFramesDropped.incrementAndGet();
             maybePublishTcpTelemetry(false);
+        }
+    }
+
+    private void enqueueSrtFrame(java.nio.ByteBuffer frame, int width, int height) {
+        if (frame == null) {
+            return;
+        }
+        if (width <= 0 || height <= 0) {
+            Log.w(TAG, "SRT enqueue: invalid frame dimensions " + width + "x" + height);
+            return;
+        }
+        mSrtFramesCaptured.incrementAndGet();
+        long nowNs = System.nanoTime();
+        if (mSrtTargetFps > 0 && mSrtMinFrameIntervalNs > 0) {
+            long nextNs = mNextSrtEnqueueTimeNs;
+            if (nextNs <= 0) {
+                nextNs = nowNs;
+            }
+            if (nowNs + (mSrtMinFrameIntervalNs / 3) < nextNs) {
+                mSrtFramesDropped.incrementAndGet();
+                return;
+            }
+            while (nowNs > nextNs + mSrtMinFrameIntervalNs) {
+                nextNs += mSrtMinFrameIntervalNs;
+            }
+            mNextSrtEnqueueTimeNs = nextNs + mSrtMinFrameIntervalNs;
+        }
+
+        java.nio.ByteBuffer frameCopy = copyFrameBuffer(frame);
+        if (frameCopy == null) {
+            mSrtFramesDropped.incrementAndGet();
+            return;
+        }
+        try {
+            CustomUdpFrame packet = new CustomUdpFrame(frameCopy, width, height, nowNs);
+            if (!mSrtFrameQueue.offer(packet)) {
+                CustomUdpFrame stale = mSrtFrameQueue.poll();
+                if (stale != null) {
+                    recycleFrameBuffer(stale.frame);
+                    mSrtFramesDropped.incrementAndGet();
+                }
+                if (!mSrtFrameQueue.offer(packet)) {
+                    recycleFrameBuffer(frameCopy);
+                    mSrtFramesDropped.incrementAndGet();
+                }
+            }
+        } catch (Exception e) {
+            recycleFrameBuffer(frameCopy);
+            mSrtFramesDropped.incrementAndGet();
         }
     }
 
