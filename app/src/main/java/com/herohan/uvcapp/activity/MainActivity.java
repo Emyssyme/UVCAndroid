@@ -238,7 +238,7 @@ public class MainActivity extends AppCompatActivity {
     private byte[] mH264OutputBuffer = new byte[2 * 1024 * 1024]; // reused encoded-packet buffer
     private Thread mTcpUdpWorkerThread;
     private volatile boolean mTcpUdpWorkerRunning = false;
-    private final java.util.concurrent.ArrayBlockingQueue<CustomUdpFrame> mTcpUdpFrameQueue = new java.util.concurrent.ArrayBlockingQueue<>(6);
+    private final java.util.concurrent.ArrayBlockingQueue<CustomUdpFrame> mTcpUdpFrameQueue = new java.util.concurrent.ArrayBlockingQueue<>(12);
     private int mTcpUdpTargetFps = 30;
     private long mTcpUdpMinFrameIntervalNs = 0;
     private long mLastTcpUdpEnqueueTimeNs = 0;
@@ -282,7 +282,7 @@ public class MainActivity extends AppCompatActivity {
     private volatile int mSrtRemotePort;
     private volatile java.net.InetAddress mSrtRemoteAddr; // cached address
     private final byte[] mSrtSendBuf = new byte[64 * 1024]; // reusable send buffer
-    private final java.util.concurrent.ArrayBlockingQueue<CustomUdpFrame> mSrtFrameQueue = new java.util.concurrent.ArrayBlockingQueue<>(6);
+    private final java.util.concurrent.ArrayBlockingQueue<CustomUdpFrame> mSrtFrameQueue = new java.util.concurrent.ArrayBlockingQueue<>(12);
     private int mSrtTargetFps = 30;
     private long mSrtMinFrameIntervalNs = 0;
     private long mNextSrtEnqueueTimeNs = 0;
@@ -3740,7 +3740,7 @@ public class MainActivity extends AppCompatActivity {
         drainEncoderOutputSrt(enc, info, 0);
 
         // Submit input frame
-        int inputIndex = enc.dequeueInputBuffer(5_000);
+        int inputIndex = enc.dequeueInputBuffer(15_000);
         int enqueuedSize = 0;
         if (inputIndex >= 0) {
             java.nio.ByteBuffer inputBuf = enc.getInputBuffer(inputIndex);
@@ -3956,7 +3956,7 @@ public class MainActivity extends AppCompatActivity {
         drainEncoderOutput(enc, info, 0);
 
         // Phase 2 — submit the new frame (short timeout: skip rather than block the pipeline)
-        int inputIndex = enc.dequeueInputBuffer(5_000 /* µs */);
+        int inputIndex = enc.dequeueInputBuffer(15_000 /* µs */);
         int enqueuedSize = 0;
         if (inputIndex >= 0) {
             java.nio.ByteBuffer inputBuf = enc.getInputBuffer(inputIndex);
@@ -4456,7 +4456,7 @@ public class MainActivity extends AppCompatActivity {
                 nextNs = nowNs;
             }
             // Small early-accept window keeps cadence stable despite callback jitter.
-            if (nowNs + (mTcpUdpMinFrameIntervalNs / 3) < nextNs) {
+            if (nowNs + (mTcpUdpMinFrameIntervalNs / 2) < nextNs) {
                 mTcpFramesDropped.incrementAndGet();
                 maybePublishTcpTelemetry(false);
                 return;
@@ -4514,7 +4514,8 @@ public class MainActivity extends AppCompatActivity {
             if (nextNs <= 0) {
                 nextNs = nowNs;
             }
-            if (nowNs + (mSrtMinFrameIntervalNs / 3) < nextNs) {
+            // Allow frames up to half an interval early (was /3) — less aggressive drop
+            if (nowNs + (mSrtMinFrameIntervalNs / 2) < nextNs) {
                 mSrtFramesDropped.incrementAndGet();
                 return;
             }

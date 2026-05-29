@@ -19,6 +19,8 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #define INVALID_SOCKET_VAL (-1)
 #endif
 
@@ -33,8 +35,8 @@ extern "C" {
 #include <string.h>
 #include <stdint.h>
 
-static const char *RESOLUTIONS[] = {"640x360", "1280x720", "1920x1080", "3840x2160"};
-static const uint32_t RESOLUTION_VALUES[][2] = {{640, 360}, {1280, 720}, {1920, 1080}, {3840, 2160}};
+static const char *RESOLUTIONS[] = {"640x360", "1280x720", "1920x1080", "2560x1440", "3840x2160"};
+static const uint32_t RESOLUTION_VALUES[][2] = {{640, 360}, {1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
 static const int CUSTOM_DISCOVERY_PORT = 8866;
 static const int CUSTOM_TALLY_PORT = 8867;
 static const int SRT_DEFAULT_PORT = 5601;
@@ -920,31 +922,14 @@ static void uvc_custom_network_srt_receiver_start(uvc_custom_network *context)
      * independently of video frame arrival. */
     uvc_custom_network_tally_update_addr(context);
 
-    /* Send initial CONTROL from the main thread BEFORE the SRT receiver
-     * thread starts — same rationale as start_receiver. */
-    {
-        bool exp_lock, fcs_lock, af_lock;
-        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual;
-        pthread_mutex_lock(&context->lock);
-        exp_lock = context->control_exposure_lock;
-        fcs_lock = context->control_focus_lock;
-        exp_comp = context->control_exposure_compensation;
-        af_md    = context->control_af_mode;
-        af_lock  = context->control_af_lock;
-        fl_md    = context->control_flash_mode;
-        wb_md    = context->control_wb_mode;
-        wb_k     = context->control_wb_kelvin;
-        res_idx  = context->resolution_index;
-        fps_v    = context->fps;
-        qual     = context->quality;
-        pthread_mutex_unlock(&context->lock);
-        uvc_custom_network_send_control(context,
-            exp_lock, fcs_lock, exp_comp,
-            af_md, af_lock, fl_md, wb_md, wb_k,
-            res_idx, fps_v, qual);
-    }
+    /* CONTROL is now sent from inside the SRT receiver thread AFTER the
+     * UDP socket binds to its actual port — the port may differ from the
+     * configured one when auto-bind picks the next free port.  Sending
+     * CONTROL here (before the thread binds) would give the phone a stale
+     * port and cause the video stream to be silently lost. */
 
     context->srt_receiver_running = true;
+    context->last_video_frame_ns = os_gettime_ns();
 #ifdef _WIN32
     context->srt_receiver_socket = INVALID_SOCKET;
 #else
@@ -1006,7 +991,7 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
         return NULL;
     }
 
-    int rcvbuf = 4 * 1024 * 1024;
+    int rcvbuf = 8 * 1024 * 1024;
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&rcvbuf, sizeof(rcvbuf));
 
     /* Auto-select an available UDP port.  Try the configured port first,
@@ -1070,8 +1055,33 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
         pthread_mutex_unlock(&context->lock);
     }
 
-    /* Initial CONTROL is now sent from srt_receiver_start() on the main
-     * thread before this thread is spawned — no need to duplicate here. */
+    /* Send initial CONTROL with the ACTUAL bound port (not the
+     * configured one — auto-bind may have picked a different port).
+     * This tells the phone exactly where to stream video.  Must be
+     * done BEFORE the status update below so the phone has a chance
+     * to start sending before we wait for the first packet. */
+    {
+        bool exp_lock, fcs_lock, af_lock;
+        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual;
+        pthread_mutex_lock(&context->lock);
+        exp_lock = context->control_exposure_lock;
+        fcs_lock = context->control_focus_lock;
+        exp_comp = context->control_exposure_compensation;
+        af_md    = context->control_af_mode;
+        af_lock  = context->control_af_lock;
+        fl_md    = context->control_flash_mode;
+        wb_md    = context->control_wb_mode;
+        wb_k     = context->control_wb_kelvin;
+        res_idx  = context->resolution_index;
+        fps_v    = context->fps;
+        qual     = context->quality;
+        pthread_mutex_unlock(&context->lock);
+        uvc_custom_network_send_control(context,
+            exp_lock, fcs_lock, exp_comp,
+            af_md, af_lock, fl_md, wb_md, wb_k,
+            res_idx, fps_v, qual);
+    }
+
     uvc_custom_network_set_status(context, "SRT listening %s:%d — waiting for video", host, port);
 
     decoder = avcodec_alloc_context3(codec);
@@ -1109,7 +1119,7 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
     size_t  reasm_size = 0;
 
     /* ── SRT latency buffer: smooths jitter by delaying frame output ── */
-#define SRT_DELAY_MAX 32
+#define SRT_DELAY_MAX 64
     struct srt_delayed {
         struct obs_source_frame obs;
         AVFrame *av_frame;   // referenced (av_frame_ref), freed on output
@@ -1148,11 +1158,23 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
 
         uint64_t recv_time_ns = os_gettime_ns();
 
-        /* Parse 16-byte chunk header */
-        uint64_t chunk_pts  = read_u64be(recv_buf);       /* bytes 0-7 */
-        uint16_t chunk_idx  = (uint16_t)((recv_buf[8] << 8) | recv_buf[9]);   /* bytes 8-9 */
-        uint16_t total_chunks = (uint16_t)((recv_buf[10] << 8) | recv_buf[11]); /* bytes 10-11 */
-        uint32_t chunk_len  = read_u32be(recv_buf + 12);  /* bytes 12-15 */
+        /* Parse 16-byte chunk header (revised format):
+         *   bytes 0-7:   PTS (uint64 BE)
+         *   bytes 8-9:   seqNum (uint16 BE) — per-frame sequence for NAK
+         *   byte  10:    chunkIdx (uint8)
+         *   byte  11:    totalChunks (uint8)
+         *   bytes 12-13: payloadLen (uint16 BE)
+         *   bytes 14-15: flags (uint16 BE) — bit0=isRetransmit
+         */
+        uint64_t chunk_pts    = read_u64be(recv_buf);                      /* bytes 0-7 */
+        uint16_t seq_num      = (uint16_t)((recv_buf[8] << 8) | recv_buf[9]);   /* bytes 8-9 */
+        uint16_t chunk_idx    = (uint16_t)recv_buf[10];                   /* byte 10 */
+        uint16_t total_chunks = (uint16_t)recv_buf[11];                   /* byte 11 */
+        uint16_t chunk_len    = (uint16_t)((recv_buf[12] << 8) | recv_buf[13]); /* bytes 12-13 */
+        uint16_t flags        = (uint16_t)((recv_buf[14] << 8) | recv_buf[15]); /* bytes 14-15 */
+
+        (void)seq_num;   // reserved for future NAK-based loss detection
+        (void)flags;     // reserved for isRetransmit flag
 
         if (chunk_len == 0 || chunk_len > H264_MAX_SIZE
                 || (size_t)(16 + chunk_len) > (size_t)got
@@ -1300,6 +1322,9 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
                             if (!context->destroying) {
                                 obs_source_output_video(context->source,
                                     &delay_buf[delay_head].obs);
+                                pthread_mutex_lock(&context->lock);
+                                context->last_video_frame_ns = os_gettime_ns();
+                                pthread_mutex_unlock(&context->lock);
                             }
                             av_frame_free(&delay_buf[delay_head].av_frame);
                             delay_head = (delay_head + 1) % SRT_DELAY_MAX;
@@ -1323,6 +1348,9 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
                         /* Buffer saturated — force output immediately */
                         if (!context->destroying) {
                             obs_source_output_video(context->source, &obs_frame);
+                            pthread_mutex_lock(&context->lock);
+                            context->last_video_frame_ns = os_gettime_ns();
+                            pthread_mutex_unlock(&context->lock);
                         }
                     }
                 }
@@ -1455,7 +1483,7 @@ static void *uvc_custom_network_receiver_thread(void *data)
         }
 
         /* large receive buffer helps with 4K bitrates */
-        int rcvbuf = 4 * 1024 * 1024;
+        int rcvbuf = 8 * 1024 * 1024;
         setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char *)&rcvbuf, sizeof(rcvbuf));
 
         struct sockaddr_in addr;
@@ -1474,7 +1502,59 @@ static void *uvc_custom_network_receiver_thread(void *data)
             continue;
         }
 
-        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        /* Non-blocking connect with a 2 s timeout so receiver_stop()
+         * can shut down the thread without hanging the OBS UI thread on
+         * pthread_join.  A blocking connect() to an unreachable host can
+         * stall for 20+ seconds on Windows or 127+ s on Linux. */
+#ifdef _WIN32
+        {
+            u_long mode = 1;
+            ioctlsocket(sock, FIONBIO, &mode);
+        }
+#else
+        int sock_flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, sock_flags | O_NONBLOCK);
+#endif
+
+        int connect_ret = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
+        bool connect_ok = (connect_ret == 0);
+#ifdef _WIN32
+        if (connect_ret < 0 && WSAGetLastError() == WSAEWOULDBLOCK) {
+#else
+        if (connect_ret < 0 && errno == EINPROGRESS) {
+#endif
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(sock, &wfds);
+            struct timeval tv;
+            tv.tv_sec = 2;
+            tv.tv_usec = 0;
+            int sel = select((int)(sock + 1), NULL, &wfds, NULL, &tv);
+            if (sel > 0) {
+                /* select says writable — check SO_ERROR for real outcome */
+                int so_err = 0;
+                socklen_t so_len = sizeof(so_err);
+                getsockopt(sock, SOL_SOCKET, SO_ERROR,
+#ifdef _WIN32
+                           (char *)&so_err, &so_len);
+#else
+                           &so_err, &so_len);
+#endif
+                connect_ok = (so_err == 0);
+            }
+        }
+
+        /* Restore blocking mode */
+#ifdef _WIN32
+        {
+            u_long mode = 0;
+            ioctlsocket(sock, FIONBIO, &mode);
+        }
+#else
+        fcntl(sock, F_SETFL, sock_flags);
+#endif
+
+        if (!connect_ok) {
             blog(LOG_INFO, "UVC H265 TCP: connect to %s:%d failed, retrying...", host, port);
 #ifdef _WIN32
             closesocket(sock);
@@ -1488,7 +1568,17 @@ static void *uvc_custom_network_receiver_thread(void *data)
         /* TCP_NODELAY: disable Nagle for lowest latency */
         int nodelay = 1;
         setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *)&nodelay, sizeof(nodelay));
-
+#ifdef _WIN32
+        {
+            DWORD timeout = 500;
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout));
+        }
+#else
+        {
+            struct timeval tv = {0, 500000};
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        }
+#endif
 
         context->receiver_socket = sock;
         blog(LOG_INFO, "UVC H265 TCP: connected to Android %s:%d", host, port);
@@ -1677,6 +1767,9 @@ static void *uvc_custom_network_receiver_thread(void *data)
                     /* Guard: don't output video if the source is being removed */
                     if (!context->destroying) {
                         obs_source_output_video(context->source, &obs_frame);
+                        pthread_mutex_lock(&context->lock);
+                        context->last_video_frame_ns = os_gettime_ns();
+                        pthread_mutex_unlock(&context->lock);
                     }
 
                     /* Calculate end-to-end latency: OBS receive time minus
@@ -1848,6 +1941,7 @@ static void uvc_custom_network_start_receiver(uvc_custom_network *context)
     }
 
     context->receiver_running = true;
+    context->last_video_frame_ns = os_gettime_ns();
 #ifdef _WIN32
     context->receiver_socket = INVALID_SOCKET;
 #else
@@ -1905,6 +1999,7 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
     context->height = 0;
     context->latency_ms = 0.0;
     context->last_latency_update_ns = 0;
+    context->last_video_frame_ns = 0;
     context->source_display_name = bstrdup("UVC Custom Network (idle)");
     context->last_name_update_ns = 0;
     context->srt_receiver_running = false;
@@ -2069,11 +2164,12 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
         }
     }
 
-    p = obs_properties_add_int(props, "srt_latency_ms", "SRT Latency (ms)", 20, 500, 10);
+    p = obs_properties_add_int(props, "srt_latency_ms", "SRT Latency (ms)", 20, 5000, 10);
     if (p) {
         obs_property_set_long_description(p,
             "Frame buffer latency. Higher = smoother video but more delay.\n"
-            "Recommended: 4 x RTT + jitter (typically 80-200 ms on WiFi).");
+            "Recommended: 4 x RTT + jitter (typically 80-200 ms on WiFi).\n"
+            "Max 5000 ms (5 sec) for unstable networks.");
         if (is_active) obs_property_set_enabled(p, false);
     }
 

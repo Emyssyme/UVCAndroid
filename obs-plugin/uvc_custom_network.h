@@ -75,6 +75,9 @@ struct uvc_custom_network {
     double latency_ms;
     uint64_t last_latency_update_ns;
 
+    // timestamp of the last received decoded frame or output video
+    uint64_t last_video_frame_ns;
+
     // dynamic source name (shown in OBS sources list)
     char *source_display_name;
     uint64_t last_name_update_ns;
