@@ -286,6 +286,8 @@ public class MainActivity extends AppCompatActivity {
     private int mSrtTargetFps = 30;
     private long mSrtMinFrameIntervalNs = 0;
     private long mNextSrtEnqueueTimeNs = 0;
+    // Per-frame sequence number for SRT chunk headers (increments with each NAL unit)
+    private int mSrtFrameSeq = 0;
     private final java.util.concurrent.atomic.AtomicLong mSrtFramesCaptured = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong mSrtFramesDropped = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong mSrtFramesEncoded = new java.util.concurrent.atomic.AtomicLong();
@@ -3457,6 +3459,10 @@ public class MainActivity extends AppCompatActivity {
         Log.i(TAG, "✅ SRT stream mode selected for USB camera (tally/control stay on TCP).");
         stopNdiForwardingThread();
         stopTcpUdpForwardingThread();
+        stopSrtForwardingThread();
+        mSrtRemoteHost = null;
+        mSrtRemoteAddr = null;
+        mSrtRemotePort = 0;
         new Thread(() -> {
             if (!hasCustomTransportDestination()) {
                 runOnUiThread(() -> Toast.makeText(this,
@@ -3491,6 +3497,10 @@ public class MainActivity extends AppCompatActivity {
         Log.i(TAG, "✅ SRT stream mode selected for internal camera (tally/control stay on TCP).");
         stopNdiForwardingThread();
         stopTcpUdpForwardingThread();
+        stopSrtForwardingThread();
+        mSrtRemoteHost = null;
+        mSrtRemoteAddr = null;
+        mSrtRemotePort = 0;
         new Thread(() -> {
             if (!hasCustomTransportDestination()) {
                 runOnUiThread(() -> Toast.makeText(this,
@@ -3628,8 +3638,11 @@ public class MainActivity extends AppCompatActivity {
 
     private void startSrtForwardingThread() {
         if (mSrtWorkerRunning) {
+            Log.w(TAG, "SRT: thread already running, not starting a new one");
             return;
         }
+        // Ensure clean encoder state — previous transport may have left stale encoder
+        stopH264Encoder();
         mSrtTargetFps = Math.max(24, Math.min(60, mVideoTargetFps));
         mSrtMinFrameIntervalNs = 1_000_000_000L / mSrtTargetFps;
         mNextSrtEnqueueTimeNs = 0;
@@ -3651,9 +3664,12 @@ public class MainActivity extends AppCompatActivity {
         // Cache InetAddress once — never resolve per-packet
         try {
             mSrtRemoteAddr = java.net.InetAddress.getByName(mSrtRemoteHost);
+            Log.i(TAG, "SRT: resolved " + mSrtRemoteHost + " → " + mSrtRemoteAddr.getHostAddress());
         } catch (java.net.UnknownHostException e) {
             Log.e(TAG, "SRT: cannot resolve " + mSrtRemoteHost, e);
             mSrtWorkerRunning = false;
+            runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                    "SRT: cannot resolve host " + mSrtRemoteHost, Toast.LENGTH_LONG).show());
             return;
         }
 
@@ -3675,10 +3691,33 @@ public class MainActivity extends AppCompatActivity {
 
             // Main frame draining loop
             boolean srtFirstFrame = true;
+            long srtLastTelemetryNs = System.nanoTime();
+            long srtPrevCaptured = 0, srtPrevDropped = 0, srtPrevEncoded = 0, srtPrevSent = 0;
             while (mSrtWorkerRunning) {
                 try {
                     CustomUdpFrame frame = mSrtFrameQueue.poll(5, java.util.concurrent.TimeUnit.MILLISECONDS);
-                    if (frame == null) continue;
+                    if (frame == null) {
+                        // Periodic telemetry even when idle
+                        long nowNs = System.nanoTime();
+                        if (nowNs - srtLastTelemetryNs >= 5_000_000_000L) {
+                            long cap = mSrtFramesCaptured.get();
+                            long drp = mSrtFramesDropped.get();
+                            long enc = mSrtFramesEncoded.get();
+                            long snt = mSrtPacketsSent.get();
+                            Log.i(TAG, "SRT telemetry/5s cap=" + (cap - srtPrevCaptured)
+                                    + " drop=" + (drp - srtPrevDropped)
+                                    + " enc=" + (enc - srtPrevEncoded)
+                                    + " sent=" + (snt - srtPrevSent)
+                                    + " q=" + mSrtFrameQueue.size()
+                                    + " target=" + mSrtRemoteHost + ":" + mSrtRemotePort);
+                            srtPrevCaptured = cap;
+                            srtPrevDropped = drp;
+                            srtPrevEncoded = enc;
+                            srtPrevSent = snt;
+                            srtLastTelemetryNs = nowNs;
+                        }
+                        continue;
+                    }
                     if (srtFirstFrame) {
                         Log.i(TAG, "SRT: first frame dequeued "
                                 + frame.width + "x" + frame.height
@@ -3699,12 +3738,33 @@ public class MainActivity extends AppCompatActivity {
                     } finally {
                         recycleFrameBuffer(frame.frame);
                     }
+                    // Periodic telemetry
+                    long nowNs = System.nanoTime();
+                    if (nowNs - srtLastTelemetryNs >= 5_000_000_000L) {
+                        long cap = mSrtFramesCaptured.get();
+                        long drp = mSrtFramesDropped.get();
+                        long enc = mSrtFramesEncoded.get();
+                        long snt = mSrtPacketsSent.get();
+                        Log.i(TAG, "SRT telemetry/5s cap=" + (cap - srtPrevCaptured)
+                                + " drop=" + (drp - srtPrevDropped)
+                                + " enc=" + (enc - srtPrevEncoded)
+                                + " sent=" + (snt - srtPrevSent)
+                                + " q=" + mSrtFrameQueue.size()
+                                + " target=" + mSrtRemoteHost + ":" + mSrtRemotePort);
+                        srtPrevCaptured = cap;
+                        srtPrevDropped = drp;
+                        srtPrevEncoded = enc;
+                        srtPrevSent = snt;
+                        srtLastTelemetryNs = nowNs;
+                    }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
                 } catch (Exception e) {
                     if (mSrtWorkerRunning) {
-                        Log.w(TAG, "Error in SRT forwarding thread", e);
+                        Log.w(TAG, "SRT forwarding error: " + e.getMessage()
+                                + " (target=" + mSrtRemoteHost + ":" + mSrtRemotePort
+                                + " socket=" + (mSrtSocket != null) + ")", e);
                     }
                 }
             }
@@ -3725,9 +3785,17 @@ public class MainActivity extends AppCompatActivity {
      */
     private void feedFrameToH264EncoderSrt(CustomUdpFrame frame) throws IOException {
         MediaCodec enc = mH264Encoder;
-        if (enc == null) return;
+        if (enc == null) {
+            Log.w(TAG, "SRT: encoder is null, dropping frame");
+            return;
+        }
         if (mSrtSocket == null) {
             Log.w(TAG, "SRT: encoder feed skipped — socket not ready");
+            return;
+        }
+        if (mSrtRemoteAddr == null || mSrtRemotePort <= 0) {
+            Log.w(TAG, "SRT: encoder feed skipped — no remote target (addr="
+                    + mSrtRemoteAddr + " port=" + mSrtRemotePort + ")");
             return;
         }
         long encodeStartNs = System.nanoTime();
@@ -3755,6 +3823,10 @@ public class MainActivity extends AppCompatActivity {
             enc.queueInputBuffer(inputIndex, 0, enqueuedSize, ptsUs, 0);
         } else {
             mSrtFramesDropped.incrementAndGet();
+            if (mSrtFramesEncoded.get() == 0) {
+                Log.w(TAG, "SRT: encoder input buffer not available (inputIndex=" + inputIndex
+                        + "), dropping frame. Encoder may still be initializing.");
+            }
             return;
         }
 
@@ -3769,6 +3841,8 @@ public class MainActivity extends AppCompatActivity {
             throws IOException {
         long timeoutUs = firstTimeoutUs;
         java.net.DatagramSocket socket = mSrtSocket;
+        java.net.InetAddress remoteAddr = mSrtRemoteAddr;
+        int remotePort = mSrtRemotePort;
         while (true) {
             int outIndex = enc.dequeueOutputBuffer(info, timeoutUs);
             timeoutUs = 0;
@@ -3783,15 +3857,14 @@ public class MainActivity extends AppCompatActivity {
                 if (spsB != null) spsB.get(spsPps, 0, spsLen);
                 if (ppsB != null) ppsB.get(spsPps, spsLen, ppsLen);
                 mH264SpsPps = spsPps;
+                Log.i(TAG, "SRT: encoder format changed — SPS+PPS " + spsPps.length + " bytes");
                 // Send SPS+PPS over SRT
-                if (socket != null && mSrtRemoteHost != null) {
-                    sendSrtPacket(H264_NO_PTS, spsPps, 0, spsPps.length, socket);
-                }
+                sendSrtPacket(H264_NO_PTS, spsPps, 0, spsPps.length, socket, remoteAddr, remotePort);
                 continue;
             }
             if (outIndex < 0) break;
             java.nio.ByteBuffer outBuf = enc.getOutputBuffer(outIndex);
-            if (outBuf != null && info.size > 0 && socket != null && mSrtRemoteHost != null) {
+            if (outBuf != null && info.size > 0) {
                 boolean isConfig = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
                 if (mH264OutputBuffer == null || mH264OutputBuffer.length < info.size) {
                     mH264OutputBuffer = new byte[info.size * 2];
@@ -3800,7 +3873,7 @@ public class MainActivity extends AppCompatActivity {
                 outBuf.position(info.offset);
                 outBuf.get(data, 0, info.size);
                 long pts = isConfig ? H264_NO_PTS : info.presentationTimeUs;
-                sendSrtPacket(pts, data, 0, info.size, socket);
+                sendSrtPacket(pts, data, 0, info.size, socket, remoteAddr, remotePort);
                 if (isConfig) {
                     mH264SpsPps = java.util.Arrays.copyOf(data, info.size);
                 } else {
@@ -3814,23 +3887,45 @@ public class MainActivity extends AppCompatActivity {
 
     /**
      * Send a single H.265 NAL unit over UDP with MTU-aware fragmentation.
-     * Each chunk: 16-byte header [PTS(8)|chunkIdx(2)|totalChunks(2)|payloadLen(4)] + payload.
+     * Each chunk uses a 16-byte header matching the OBS plugin "revised format":
+     *   bytes 0-7:   PTS (uint64 BE)
+     *   bytes 8-9:   seqNum (uint16 BE) — per-frame sequence for future NAK
+     *   byte  10:    chunkIdx (uint8)
+     *   byte  11:    totalChunks (uint8)
+     *   bytes 12-13: payloadLen (uint16 BE)
+     *   bytes 14-15: flags (uint16 BE) — bit0=isRetransmit (unused for now)
      * OBS reassembles chunks into a complete NAL unit before decoding.
+     * Throws IOException if the socket or destination is invalid, rather than silently
+     * dropping the packet — callers must handle the error to avoid silent data loss.
      */
     private void sendSrtPacket(long pts, byte[] data, int offset, int length,
-                               java.net.DatagramSocket socket) throws IOException {
-        if (socket == null || mSrtRemoteAddr == null || mSrtRemotePort <= 0) return;
+                               java.net.DatagramSocket socket,
+                               java.net.InetAddress remoteAddr,
+                               int remotePort) throws IOException {
+        if (socket == null) {
+            throw new IOException("SRT: socket is null");
+        }
+        if (remoteAddr == null) {
+            throw new IOException("SRT: remote address is null (host=" + mSrtRemoteHost + ")");
+        }
+        if (remotePort <= 0) {
+            throw new IOException("SRT: invalid remote port " + remotePort);
+        }
         if (length <= 0) return;
 
         // One-shot diagnostic on first successful send
         if (mSrtPacketsSent.get() == 0 && pts != H264_NO_PTS) {
             Log.i(TAG, "SRT: first video packet — "
-                    + length + " bytes → " + mSrtRemoteAddr + ":" + mSrtRemotePort);
+                    + length + " bytes → " + remoteAddr + ":" + remotePort);
         }
 
         int maxPayload = SRT_MAX_CHUNK - 16; // 16-byte chunk header
         int totalChunks = (length + maxPayload - 1) / maxPayload;
-        if (totalChunks > 65535) totalChunks = 65535; // safety cap
+        // uint8 cap: OBS header uses 1 byte for totalChunks
+        if (totalChunks > 255) totalChunks = 255;
+
+        // Advance frame sequence (wraps at 16-bit)
+        final int seqNum = (mSrtFrameSeq++ & 0xFFFF);
 
         byte[] buf = mSrtSendBuf;
         for (int chunk = 0; chunk < totalChunks; chunk++) {
@@ -3847,23 +3942,25 @@ public class MainActivity extends AppCompatActivity {
             buf[hdrOff++] = (byte) (pts >>> 16);
             buf[hdrOff++] = (byte) (pts >>> 8);
             buf[hdrOff++] = (byte) (pts);
-            // Chunk index (2 bytes, big-endian)
-            buf[hdrOff++] = (byte) (chunk >>> 8);
-            buf[hdrOff++] = (byte) (chunk);
-            // Total chunks (2 bytes, big-endian)
-            buf[hdrOff++] = (byte) (totalChunks >>> 8);
-            buf[hdrOff++] = (byte) (totalChunks);
-            // Payload length (4 bytes, big-endian)
-            buf[hdrOff++] = (byte) (chunkLen >>> 24);
-            buf[hdrOff++] = (byte) (chunkLen >>> 16);
+            // seqNum (2 bytes, big-endian)
+            buf[hdrOff++] = (byte) (seqNum >>> 8);
+            buf[hdrOff++] = (byte) (seqNum);
+            // chunkIdx (1 byte)
+            buf[hdrOff++] = (byte) (chunk & 0xFF);
+            // totalChunks (1 byte)
+            buf[hdrOff++] = (byte) (totalChunks & 0xFF);
+            // payloadLen (2 bytes, big-endian)
             buf[hdrOff++] = (byte) (chunkLen >>> 8);
             buf[hdrOff++] = (byte) (chunkLen);
+            // flags (2 bytes, big-endian) — reserved, always 0
+            buf[hdrOff++] = 0;
+            buf[hdrOff++] = 0;
 
             // Copy payload after header
             System.arraycopy(data, chunkOff, buf, 16, chunkLen);
 
             java.net.DatagramPacket packet = new java.net.DatagramPacket(
-                    buf, 16 + chunkLen, mSrtRemoteAddr, mSrtRemotePort);
+                    buf, 16 + chunkLen, remoteAddr, remotePort);
             socket.send(packet);
         }
     }
@@ -4264,12 +4361,20 @@ public class MainActivity extends AppCompatActivity {
                             && mTcpTallyRemoteHost != null
                             && !mTcpTallyRemoteHost.isEmpty()
                             && !mTcpTallyRemoteHost.equals(mSrtRemoteHost)) {
+                        String prevHost = mSrtRemoteHost;
                         mSrtRemoteHost = mTcpTallyRemoteHost;
-                        mSrtRemotePort = mSrtPort > 0 ? mSrtPort : SRT_DEFAULT_PORT;
+                        // Keep the port that was already parsed from the tally message
+                        // (or use default if none was parsed). Do NOT overwrite with mSrtPort.
+                        if (mSrtRemotePort <= 0) {
+                            mSrtRemotePort = mSrtPort > 0 ? mSrtPort : SRT_DEFAULT_PORT;
+                        }
                         try {
                             mSrtRemoteAddr = java.net.InetAddress.getByName(mSrtRemoteHost);
-                            Log.i(TAG, "SRT: learned OBS IP from tally: " + mSrtRemoteHost + ":" + mSrtRemotePort);
-                        } catch (java.net.UnknownHostException ignored) {
+                            Log.i(TAG, "SRT: updated destination from " + prevHost
+                                    + " → " + mSrtRemoteHost + ":" + mSrtRemotePort);
+                        } catch (java.net.UnknownHostException e) {
+                            Log.e(TAG, "SRT: failed to resolve OBS IP " + mSrtRemoteHost
+                                    + " — keeping old address " + mSrtRemoteAddr, e);
                         }
                     }
                 }
