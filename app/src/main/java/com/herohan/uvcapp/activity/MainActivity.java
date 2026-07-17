@@ -52,10 +52,6 @@ import com.herohan.uvcapp.fragment.VideoFormatDialogFragment;
 import com.herohan.uvcapp.utils.SaveHelper;
 import com.herohan.uvcapp.CameraKeepAliveService;
 
-import com.serenegiant.ndi.Ndi;
-import com.serenegiant.ndi.NdiSender;
-import com.serenegiant.ndi.UvcNdiFrameForwarder;
-
 import android.os.SystemClock;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
@@ -100,21 +96,6 @@ public class MainActivity extends AppCompatActivity {
     private static final String TAG = MainActivity.class.getSimpleName();
     private static final boolean DEBUG = true;
 
-    private static final String PREF_NDI_NAME = "pref_ndi_name";
-
-    // remember camera input format used by the current forwarder (always nv12
-    // in this app, but we track it so that we can recreate the forwarder when
-    // renaming the sender).
-    private String mNdiCameraFormat = "nv12";
-
-    // target frame rate for NDI forwarding (0 = passthrough all frames)
-    private int mNdiTargetFps = 0;
-    private long mNdiMinFrameIntervalNs = 0;
-    private long mLastEnqueueFrameTimeNs = 0;
-
-    // cached stream name; defaults to saved preference or device name later
-    private String mNdiSourceName;
-
     private ActivityMainBinding mBinding;
 
     private static final int QUARTER_SECOND = 250;
@@ -153,30 +134,13 @@ public class MainActivity extends AppCompatActivity {
     private int mPreviewRotation = 0;
 
     private ICameraHelper mCameraHelper;
-    private MultiFrameCallback mMultiCallback; // dispatches frames to NDI/RTP
+    private MultiFrameCallback mMultiCallback; // dispatches frames to SRT/TCP
 
     private UsbDevice mUsbDevice;
     private final ICameraHelper.StateCallback mStateCallback = new MyCameraHelperCallback();
 
-    // NDI Streaming
-    private static final String DEFAULT_NDI_FORMAT = "rgba"; // highest-quality, uncompressed
-    private NdiSender mNdiSender;
-    private UvcNdiFrameForwarder mFrameForwarder;
-    private long mNdiStartTime = 0;
-
-    // NDI frame queue + worker thread for NDI frame forwarding.
-    // Uses a larger queue in “high-latency, stable” mode to reduce drops.
-    private final ArrayBlockingQueue<java.nio.ByteBuffer> mNdiFrameQueue = new ArrayBlockingQueue<>(16);
-    private final java.util.concurrent.atomic.AtomicReference<java.nio.ByteBuffer> mNdiReusableBuffer
-            = new java.util.concurrent.atomic.AtomicReference<>();
     private final java.util.concurrent.atomic.AtomicReference<java.nio.ByteBuffer> mTcpReusableBuffer
             = new java.util.concurrent.atomic.AtomicReference<>();
-
-    private volatile boolean mNdiWorkerRunning = false;
-    private Thread mNdiWorkerThread;
-
-    private long mLastQueueFullLog = 0;
-    private static final long QUEUE_FULL_LOG_INTERVAL_MS = 500;
 
     private long mRecordStartTime = 0;
     private Timer mRecordTimer = null;
@@ -185,12 +149,9 @@ public class MainActivity extends AppCompatActivity {
     private boolean mIsRecording = false;
     private boolean mIsCameraConnected = false;
     private boolean mPreviewFillEnabled = false;
-    // start in efficient (NV12) mode instead of RGBA high‑quality; user can toggle later
-    private boolean mNdiHighQuality = false;   // toggle state for NDI mode
-    // RTP streaming removed per request; keep NDI only
 
-    private enum StreamProtocol { NDI, TCP_UDP, SRT }
-    private StreamProtocol mStreamProtocol = StreamProtocol.NDI;
+    private enum StreamProtocol { TCP_UDP, SRT }
+    private StreamProtocol mStreamProtocol = StreamProtocol.SRT;
     private static final String PREF_STREAM_PROTOCOL = "pref_stream_protocol";
     private static final String PREF_STREAM_HOST = "pref_stream_host";
     private static final String PREF_STREAM_PORT = "pref_stream_port";
@@ -341,17 +302,8 @@ public class MainActivity extends AppCompatActivity {
     private final Runnable mTallyPoller = new Runnable() {
         @Override
         public void run() {
-            // Tally for NDI
-            if (mNdiSender != null) {
-                NdiSender.Tally t = mNdiSender.getTally();
-                if (t != null && mTallyIndicator != null) {
-                    if (t.program)       mTallyIndicator.setBackgroundColor(Color.RED);
-                    else if (t.preview) mTallyIndicator.setBackgroundColor(Color.GREEN);
-                    else                mTallyIndicator.setBackgroundColor(Color.GRAY);
-                }
-            }
             // Tally for TCP/UDP or SRT: reflect OBS state sent by plugin (program/preview/none).
-            else if ((mStreamProtocol == StreamProtocol.TCP_UDP && mTcpUdpWorkerRunning)
+            if ((mStreamProtocol == StreamProtocol.TCP_UDP && mTcpUdpWorkerRunning)
                     || (mStreamProtocol == StreamProtocol.SRT && mTcpTallyListenerRunning)) {
                 long nowNs = System.nanoTime();
                 long staleMs = (nowNs - mTcpLastTallyUpdateNs) / 1_000_000;
@@ -368,7 +320,7 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
             // Schedule next poll if any transport is active
-            if (mNdiSender != null || (mStreamProtocol == StreamProtocol.TCP_UDP && mTcpUdpWorkerRunning)
+            if ((mStreamProtocol == StreamProtocol.TCP_UDP && mTcpUdpWorkerRunning)
                     || (mStreamProtocol == StreamProtocol.SRT && mTcpTallyListenerRunning)) {
                 mHandler.postDelayed(this, 50);
             }
@@ -397,8 +349,6 @@ public class MainActivity extends AppCompatActivity {
         // run-time prompt to ignore battery optimizations (optional)
         requestIgnoreBatteryOptimizations();
 
-        // load previously saved NDI name (may be empty)
-        mNdiSourceName = getSavedNdiName();
         mStreamProtocol = getSavedStreamProtocol();
         mStreamHost = getSavedStreamHost();
         mStreamPort = getSavedStreamPort();
@@ -407,14 +357,6 @@ public class MainActivity extends AppCompatActivity {
         mVideoQuality = getSavedVideoQuality();
         mDeviceIp = getLocalIpAddress();
         updateStreamStatus();
-
-        // Initialize NDI
-        try {
-            Ndi.initialize();
-            Log.i(TAG, "✅ NDI initialized. Version: " + Ndi.getNdiVersion());
-        } catch (Exception e) {
-            Log.e(TAG, "❌ Failed to initialize NDI", e);
-        }
     }
 
     @Override
@@ -542,17 +484,14 @@ public class MainActivity extends AppCompatActivity {
                             : getString(R.string.action_preview_mode_fit),
                     Toast.LENGTH_SHORT).show();
         } else if (id == R.id.action_stream_protocol) {
-            // Cycle: NDI → TCP_UDP → SRT → NDI
+            // Cycle: TCP_UDP → SRT → TCP_UDP
             final StreamProtocol nextProtocol;
-            if (mStreamProtocol == StreamProtocol.NDI) {
-                nextProtocol = StreamProtocol.TCP_UDP;
-            } else if (mStreamProtocol == StreamProtocol.TCP_UDP) {
+            if (mStreamProtocol == StreamProtocol.TCP_UDP) {
                 nextProtocol = StreamProtocol.SRT;
             } else {
-                nextProtocol = StreamProtocol.NDI;
+                nextProtocol = StreamProtocol.TCP_UDP;
             }
-            if ((nextProtocol == StreamProtocol.TCP_UDP || nextProtocol == StreamProtocol.SRT)
-                    && !hasCustomTransportDestination()) {
+            if (!hasCustomTransportDestination()) {
                 showSetStreamDestinationDialog();
                 return true;
             }
@@ -562,29 +501,8 @@ public class MainActivity extends AppCompatActivity {
                 if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
                     final Size size = mCameraHelper.getPreviewSize();
                     if (size != null) {
-                        cleanupNdiAndStreaming();
-                        if (nextProtocol == StreamProtocol.NDI) {
-                            mNdiSourceName = getSavedNdiName();
-                            try {
-                                mNdiStartTime = SystemClock.elapsedRealtime();
-                                String sourceName = TextUtils.isEmpty(mNdiSourceName)
-                                        ? getDefaultNdiName(mUsbDevice)
-                                        : mNdiSourceName;
-                                if (TextUtils.isEmpty(mNdiSourceName)) {
-                                    setSavedNdiName(sourceName);
-                                }
-                                mNdiSender = new NdiSender(sourceName);
-                                mHandler.post(mTallyPoller);
-                                mNdiCameraFormat = "nv12";
-                                mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
-                                mFrameForwarder.setFrameDimensions(size.width, size.height);
-                                setNdiTargetFps(25);
-                                setNdiFormat(mNdiHighQuality);
-                                startNdiForwardingThread();
-                            } catch (Exception e) {
-                                Log.e(TAG, "❌ Failed to create NDI sender", e);
-                            }
-                        } else if (nextProtocol == StreamProtocol.TCP_UDP) {
+                        cleanupStreaming();
+                        if (nextProtocol == StreamProtocol.TCP_UDP) {
                             setupTcpUdpForUsbCamera(mUsbDevice, size);
                             mHandler.post(mTallyPoller);
                         } else {
@@ -597,10 +515,8 @@ public class MainActivity extends AppCompatActivity {
                         }
                     }
                 } else if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
-                    cleanupNdiAndStreaming();
-                    if (nextProtocol == StreamProtocol.NDI) {
-                        setupNdiForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
-                    } else if (nextProtocol == StreamProtocol.TCP_UDP) {
+                    cleanupStreaming();
+                    if (nextProtocol == StreamProtocol.TCP_UDP) {
                         setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
                         mHandler.post(mTallyPoller);
                     } else {
@@ -621,9 +537,6 @@ public class MainActivity extends AppCompatActivity {
             }
             final String protocolLabel;
             switch (nextProtocol) {
-                case NDI:
-                    protocolLabel = getString(R.string.action_stream_protocol_ndi);
-                    break;
                 case TCP_UDP:
                     protocolLabel = getString(R.string.action_stream_protocol_tcp_udp);
                     break;
@@ -634,16 +547,6 @@ public class MainActivity extends AppCompatActivity {
             Toast.makeText(this, protocolLabel, Toast.LENGTH_SHORT).show();
         } else if (id == R.id.action_set_stream_destination) {
             showSetStreamDestinationDialog();
-        } else if (id == R.id.action_ndimode) {
-            // toggle NDI format
-            setNdiFormat(!mNdiHighQuality);
-            invalidateOptionsMenu();
-            Toast.makeText(this,
-                    mNdiHighQuality ? getString(R.string.action_ndimode_high)
-                                   : getString(R.string.action_ndimode_low),
-                    Toast.LENGTH_SHORT).show();
-        } else if (id == R.id.action_set_ndi_name) {
-            showSetNdiNameDialog();
         } else if (id == R.id.action_use_internal_camera) {
             switchToInternalCamera();
         } else if (id == R.id.action_use_usb_camera) {
@@ -672,7 +575,6 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_flip_vertically).setVisible(true);
             menu.findItem(R.id.action_preview_fill_toggle).setVisible(true);
             menu.findItem(R.id.action_stream_protocol).setVisible(true);
-            menu.findItem(R.id.action_ndimode).setVisible(mStreamProtocol == StreamProtocol.NDI);
         } else if (mIsCameraConnected && internalMode) {
             menu.findItem(R.id.action_control).setVisible(true);
             menu.findItem(R.id.action_safely_eject).setVisible(false);
@@ -683,7 +585,6 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_flip_vertically).setVisible(false);
             menu.findItem(R.id.action_preview_fill_toggle).setVisible(false);
             menu.findItem(R.id.action_stream_protocol).setVisible(true);
-            menu.findItem(R.id.action_ndimode).setVisible(mStreamProtocol == StreamProtocol.NDI);
         } else {
             menu.findItem(R.id.action_safely_eject).setVisible(false);
             menu.findItem(R.id.action_video_format).setVisible(false);
@@ -693,7 +594,6 @@ public class MainActivity extends AppCompatActivity {
             menu.findItem(R.id.action_flip_vertically).setVisible(false);
             menu.findItem(R.id.action_preview_fill_toggle).setVisible(false);
             menu.findItem(R.id.action_stream_protocol).setVisible(true);
-            menu.findItem(R.id.action_ndimode).setVisible(false);
         }
 
         // internal and USB preview can use control UI toggle
@@ -713,9 +613,6 @@ public class MainActivity extends AppCompatActivity {
         final MenuItem streamProtocolItem = menu.findItem(R.id.action_stream_protocol);
         if (streamProtocolItem != null) {
             switch (mStreamProtocol) {
-                case NDI:
-                    streamProtocolItem.setTitle(R.string.action_stream_protocol_ndi);
-                    break;
                 case TCP_UDP:
                     streamProtocolItem.setTitle(R.string.action_stream_protocol_tcp_udp);
                     break;
@@ -728,17 +625,6 @@ public class MainActivity extends AppCompatActivity {
         final MenuItem destinationItem = menu.findItem(R.id.action_set_stream_destination);
         if (destinationItem != null) {
             destinationItem.setVisible(true);
-        }
-        final MenuItem ndiModeItem = menu.findItem(R.id.action_ndimode);
-        if (ndiModeItem != null) {
-            ndiModeItem.setTitle(mNdiHighQuality
-                    ? R.string.action_ndimode_high
-                    : R.string.action_ndimode_low);
-            ndiModeItem.setVisible(mIsCameraConnected && mStreamProtocol == StreamProtocol.NDI);
-        }
-        MenuItem nameItem = menu.findItem(R.id.action_set_ndi_name);
-        if (nameItem != null) {
-            nameItem.setVisible(mIsCameraConnected && mStreamProtocol == StreamProtocol.NDI);
         }
 
         // ── Internal camera items ────────────────────────────────────────────
@@ -837,35 +723,8 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    /**
-     * Switch between high‑quality RGBA and efficient YUV NDI modes.
-     * This tears down and re‑creates the forwarder and updates callback.
-     */
-    private void setNdiFormat(final boolean highQuality) {
-        // change desired output type without tearing down camera
-        mNdiHighQuality = highQuality;
-        if (mFrameForwarder != null) {
-            mFrameForwarder.setNdiFormat(mNdiHighQuality ? "rgba" : "nv12");
-            Log.i(TAG, "NDI format set to " + (mNdiHighQuality ? "RGBA" : "NV12"));
-        }
-        // re-register combined callback so that the correct frame receiver is used
-        if (mCameraHelper != null && mMultiCallback != null) {
-            mCameraHelper.setFrameCallback(mMultiCallback, UVCCamera.PIXEL_FORMAT_NV12);
-        }
-    }
-
-    private void setNdiTargetFps(final int fps) {
-        // Enforce minimum 25 fps, even for 4K, to keep smooth output at a fixed bound.
-        mNdiTargetFps = Math.max(25, fps);
-        mNdiMinFrameIntervalNs = 1_000_000_000L / mNdiTargetFps;
-        if (mFrameForwarder != null) {
-            mFrameForwarder.setTargetFps(mNdiTargetFps);
-        }
-        Log.i(TAG, "NDI target FPS set to " + mNdiTargetFps);
-    }
-
     // PROMOTE incoming UVC frames to the selected transport.
-    // note: default format will be NV12 (low-latency) since mNdiHighQuality=false
+    // note: default format will be NV12 (low-latency)
     private class MultiFrameCallback implements com.serenegiant.usb.IFrameCallback {
         @Override
         public void onFrame(java.nio.ByteBuffer frame) {
@@ -873,9 +732,7 @@ public class MainActivity extends AppCompatActivity {
                 Log.w(TAG, "MultiFrameCallback: null frame");
                 return;
             }
-            if (mStreamProtocol == StreamProtocol.NDI) {
-                enqueueNdiFrame(frame);
-            } else if (mStreamProtocol == StreamProtocol.SRT) {
+            if (mStreamProtocol == StreamProtocol.SRT) {
                 enqueueSrtFrame(frame, mPreviewWidth, mPreviewHeight);
             } else {
                 enqueueTcpUdpFrame(frame, mPreviewWidth, mPreviewHeight);
@@ -1091,39 +948,7 @@ public class MainActivity extends AppCompatActivity {
             
             // ✅ Step 2: Setup the selected transport layer
             if (size != null) {
-                if (mStreamProtocol == StreamProtocol.NDI) {
-                    try {
-                        mNdiStartTime = SystemClock.elapsedRealtime();
-                        // choose stream name: preference first, otherwise derive it from
-                        // the USB device.  using getProductName()/getManufacturerName
-                        // usually yields the actual camera model rather than the generic
-                        // device path which can look like "/dev/bus/usb/...".
-                        String sourceName = mNdiSourceName;
-                        if (TextUtils.isEmpty(sourceName)) {
-                            sourceName = getDefaultNdiName(device);
-                            // remember this default so future streams reuse it
-                            setSavedNdiName(sourceName);
-                        }
-                        mNdiSender = new NdiSender(sourceName);
-                        Log.i(TAG, "✅ NDI sender created: " + sourceName);
-                        // start polling tally indicator
-                        mHandler.post(mTallyPoller);
-
-                        // create forwarder with known camera format (assume NV12)
-                        mNdiCameraFormat = "nv12";
-                        mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
-                        mFrameForwarder.setFrameDimensions(size.width, size.height);
-                        // Always target 25 fps for stable output (latency may grow, but fluidity is guaranteed).
-                        setNdiTargetFps(25);
-                        // now apply quality mode (will register callback)
-                        setNdiFormat(mNdiHighQuality);
-                        startNdiForwardingThread();
-                    } catch (Exception e) {
-                        Log.e(TAG, "❌ Failed to create NDI sender", e);
-                        mNdiSender = null;
-                        mFrameForwarder = null;
-                    }
-                } else if (mStreamProtocol == StreamProtocol.TCP_UDP) {
+                if (mStreamProtocol == StreamProtocol.TCP_UDP) {
                     setupTcpUdpForUsbCamera(device, size);
                 } else {
                     // SRT: video over SRT, tally/control on TCP
@@ -1149,9 +974,9 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
             
-            // ✅ Step 4: Now start preview (frames will flow to NDI)
+            // ✅ Step 4: Now start preview
             mCameraHelper.startPreview();
-            Log.i(TAG, "✅ Camera preview started, NDI ready to stream");
+            Log.i(TAG, "✅ Camera preview started");
             mBinding.viewMainPreview.postDelayed(() -> {
                 applyPreviewFillTransform();
                 logPreviewDiagnostics("after_start_preview", mCameraHelper != null ? mCameraHelper.getPreviewSize() : size);
@@ -1187,7 +1012,7 @@ public class MainActivity extends AppCompatActivity {
                 mDummySurfaceTexture = null;
             }
 
-            cleanupNdiAndStreaming();
+            cleanupStreaming();
 
             if (mCameraHelper != null && mBinding.viewMainPreview.getSurfaceTexture() != null) {
                 mCameraHelper.removeSurface(mBinding.viewMainPreview.getSurfaceTexture());
@@ -1305,29 +1130,14 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void setSavedNdiName(final String name) {
-        PreferenceManager
-                .getDefaultSharedPreferences(this)
-                .edit()
-                .putString(PREF_NDI_NAME, name)
-                .apply();
-        mNdiSourceName = name;
-    }
-
-    private String getSavedNdiName() {
-        return PreferenceManager
-                .getDefaultSharedPreferences(this)
-                .getString(PREF_NDI_NAME, "");
-    }
-
     private StreamProtocol getSavedStreamProtocol() {
         final String protocol = PreferenceManager
                 .getDefaultSharedPreferences(this)
-                .getString(PREF_STREAM_PROTOCOL, StreamProtocol.NDI.name());
+                .getString(PREF_STREAM_PROTOCOL, StreamProtocol.SRT.name());
         try {
             return StreamProtocol.valueOf(protocol);
         } catch (IllegalArgumentException e) {
-            return StreamProtocol.NDI;
+            return StreamProtocol.SRT;
         }
     }
 
@@ -1521,7 +1331,7 @@ public class MainActivity extends AppCompatActivity {
                     invalidateOptionsMenu();
                     if ((mStreamProtocol == StreamProtocol.TCP_UDP || mStreamProtocol == StreamProtocol.SRT)
                             && mIsCameraConnected) {
-                        cleanupNdiAndStreaming();
+                        cleanupStreaming();
                         if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
                             Size size = mCameraHelper.getPreviewSize();
                             if (size != null) {
@@ -1562,13 +1372,6 @@ public class MainActivity extends AppCompatActivity {
             sb.append(mDeviceIp);
         } else {
             sb.append("no network");
-        }
-
-        if (mStreamProtocol == StreamProtocol.NDI) {
-            sb.append("  NDI");
-            mBinding.tvStreamStatus.setText(sb.toString());
-            mBinding.toolbar.setTitle("UVC Camera · NDI");
-            return;
         }
 
         if (!hasCustomTransportDestination()) {
@@ -1671,72 +1474,6 @@ public class MainActivity extends AppCompatActivity {
                     mTcpEncodeSamples.get() > 0
                             ? (mTcpEncodeTimeNsSum.get() / 1_000_000.0) / (double) mTcpEncodeSamples.get()
                             : 0.0));
-        }
-    }
-
-    /**
-     * Produce the default stream name.  per user request we now prefer the
-     * phone itself (manufacturer/model) rather than the USB peripheral name.
-     * If the build information is missing for some reason we still fall back
-     * to the USB device name or a timestamp.
-     */
-    private String getDefaultNdiName(@Nullable UsbDevice device) {
-        // first try to use the handset identity, since that's what was
-        // requested
-        String phoneName = android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL;
-        if (!TextUtils.isEmpty(phoneName) && !phoneName.trim().isEmpty()) {
-            return phoneName.trim();
-        }
-        // if that somehow fails, try the connected device
-        if (device != null) {
-            String name = device.getProductName();
-            if (!TextUtils.isEmpty(name)) return name;
-            name = device.getManufacturerName();
-            if (!TextUtils.isEmpty(name)) return name;
-            name = device.getDeviceName();
-            if (!TextUtils.isEmpty(name)) return name;
-        }
-        // final fallback
-        return "UVCAndroid-" + mNdiStartTime;
-    }
-
-    private void showSetNdiNameDialog() {
-        String current = getSavedNdiName();
-        if (TextUtils.isEmpty(current) && mUsbDevice != null) {
-            current = mUsbDevice.getDeviceName();
-        }
-        final EditText input = new EditText(this);
-        input.setSingleLine();
-        input.setText(current);
-        new AlertDialog.Builder(this)
-                .setTitle(R.string.action_set_ndi_name)
-                .setView(input)
-                .setPositiveButton(android.R.string.ok, (dialog, which) -> {
-                    String name = input.getText().toString().trim();
-                    if (!TextUtils.isEmpty(name)) {
-                        setSavedNdiName(name);
-                        updateNdiSourceName(name);
-                    }
-                })
-                .setNegativeButton(android.R.string.cancel, null)
-                .show();
-    }
-
-    /**
-     * Recreate the NDI sender with a new name while the camera is active.
-     */
-    private void updateNdiSourceName(final String newName) {
-        if (mNdiSender != null) {
-            try {
-                stopTallyPolling();
-                mNdiSender.close();
-            } catch (Exception ignored) {}
-            mNdiSender = new NdiSender(newName);
-            if (mFrameForwarder != null) {
-                mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
-                mFrameForwarder.setFrameDimensions(mPreviewWidth, mPreviewHeight);
-                setNdiFormat(mNdiHighQuality);
-            }
         }
     }
 
@@ -2787,7 +2524,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void setCustomVideoCaptureConfig() {
-        // this config only affects the recorded file; NDI/preview are independent
+        // this config only affects the recorded file; streaming/preview are independent
         mCameraHelper.setVideoCaptureConfig(
                 mCameraHelper.getVideoCaptureConfig()
 //                        .setAudioCaptureEnable(false) // disable audio if not needed
@@ -3089,7 +2826,7 @@ public class MainActivity extends AppCompatActivity {
 
         if ((fpsChanged || qualityChanged) && mIsCameraConnected) {
             if (mStreamProtocol == StreamProtocol.TCP_UDP) {
-                cleanupNdiAndStreaming();
+                cleanupStreaming();
                 if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
                     setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
                 } else if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
@@ -3099,7 +2836,7 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }
             } else if (mStreamProtocol == StreamProtocol.SRT) {
-                cleanupNdiAndStreaming();
+                cleanupStreaming();
                 if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
                     setupSrtForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
                     startTcpTallyListenerThread();
@@ -3125,8 +2862,8 @@ public class MainActivity extends AppCompatActivity {
     private void openInternalCamera(InternalCameraInfo cameraInfo,
                                     android.util.Size previewSize) {
         // If a camera is already open, close it first and let onClosed() reopen via the
-        // pending mechanism — ensures NDI resources are fully released before the new
-        // NdiSender is created (same name would fail otherwise).
+        // pending mechanism — ensures streaming resources are fully released before the new
+        // transport is created.
         if (mIsCameraConnected && mInternalCameraHelper != null) {
             mPendingOpenCamera = cameraInfo;
             mPendingOpenSize   = previewSize;
@@ -3167,15 +2904,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        if (mStreamProtocol == StreamProtocol.NDI) {
-            mInternalCameraHelper.setFrameListener((nv12Frame, width, height) -> {
-                if (nv12Frame == null) {
-                    return;
-                }
-                enqueueNdiFrame(nv12Frame);
-            });
-            Log.i(TAG, "Internal camera transport set to NDI");
-        } else if (mStreamProtocol == StreamProtocol.SRT) {
+        if (mStreamProtocol == StreamProtocol.SRT) {
             mInternalCameraHelper.setFrameListener((nv12Frame, width, height) -> {
                 if (nv12Frame == null) {
                     return;
@@ -3331,9 +3060,7 @@ public class MainActivity extends AppCompatActivity {
             }
 
             // Set up the selected transport
-            if (mStreamProtocol == StreamProtocol.NDI) {
-                setupNdiForInternalCamera(cameraInfo, previewSize);
-            } else if (mStreamProtocol == StreamProtocol.TCP_UDP) {
+            if (mStreamProtocol == StreamProtocol.TCP_UDP) {
                 setupTcpUdpForInternalCamera(cameraInfo, previewSize);
                 mHandler.post(mTallyPoller);
             } else {
@@ -3364,8 +3091,7 @@ public class MainActivity extends AppCompatActivity {
                 android.util.Size  pendingSize = mPendingOpenSize;
                 mPendingOpenCamera = null;
                 mPendingOpenSize   = null;
-                // Must release old NdiSender before creating a new one
-                cleanupNdiAndStreaming();
+                cleanupStreaming();
                 openInternalCamera(pending, pendingSize);
                 return;
             }
@@ -3375,7 +3101,7 @@ public class MainActivity extends AppCompatActivity {
                 mIsRecording = false;
                 stopRecordTimer();
             }
-            cleanupNdiAndStreaming();
+            cleanupStreaming();
             updateUIControls();
             closeAllDialogFragment();
         }
@@ -3392,43 +3118,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     // =========================================================================
-    //  NDI helpers shared by both USB and internal paths
+    //  Streaming helpers shared by both USB and internal paths
     // =========================================================================
-
-    private void setupNdiForInternalCamera(InternalCameraInfo cameraInfo,
-                                           android.util.Size previewSize) {
-        try {
-            mNdiStartTime = SystemClock.elapsedRealtime();
-            String sourceName = mNdiSourceName;
-            if (TextUtils.isEmpty(sourceName)) {
-                sourceName = android.os.Build.MANUFACTURER
-                        + " " + android.os.Build.MODEL
-                        + " — " + cameraInfo.displayName;
-                setSavedNdiName(sourceName);
-            }
-            mNdiSender = new NdiSender(sourceName);
-            mHandler.post(mTallyPoller);
-
-            mNdiCameraFormat = "nv12";
-            mFrameForwarder = new UvcNdiFrameForwarder(mNdiSender, mNdiCameraFormat, null);
-            mFrameForwarder.setFrameDimensions(previewSize.getWidth(), previewSize.getHeight());
-            setNdiTargetFps(25); // enforce 25 fps minimum for smooth 4K delivery
-            setNdiFormat(mNdiHighQuality); // ensure format mode is applied
-            updateInternalCameraFrameListener();
-            startNdiForwardingThread();
-            Log.i(TAG, "NDI ready for internal camera: " + sourceName);
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to set up NDI for internal camera", e);
-            mNdiSender      = null;
-            mFrameForwarder = null;
-        }
-    }
 
     private void setupTcpUdpForUsbCamera(final UsbDevice device, final Size previewSize) {
         Log.i(TAG, "✅ H.265 TCP stream mode selected for USB camera.");
-        stopNdiForwardingThread();
         stopSrtForwardingThread();
-        cleanupNdiAndStreaming();
+        cleanupStreaming();
         new Thread(() -> {
             if (!hasCustomTransportDestination()) {
                 runOnUiThread(() -> Toast.makeText(this,
@@ -3442,7 +3138,6 @@ public class MainActivity extends AppCompatActivity {
 
     private void setupSrtForUsbCamera(final UsbDevice device, final Size previewSize) {
         Log.i(TAG, "✅ SRT stream mode selected for USB camera (tally/control stay on TCP).");
-        stopNdiForwardingThread();
         stopTcpUdpForwardingThread();
         stopSrtForwardingThread();
         mSrtRemoteHost = null;
@@ -3462,9 +3157,8 @@ public class MainActivity extends AppCompatActivity {
     private void setupTcpUdpForInternalCamera(final InternalCameraInfo cameraInfo,
                                               final android.util.Size previewSize) {
         Log.i(TAG, "✅ H.265 TCP stream mode selected for internal camera.");
-        stopNdiForwardingThread();
         stopSrtForwardingThread();
-        cleanupNdiAndStreaming();
+        cleanupStreaming();
         new Thread(() -> {
             if (!hasCustomTransportDestination()) {
                 runOnUiThread(() -> Toast.makeText(this,
@@ -3480,7 +3174,6 @@ public class MainActivity extends AppCompatActivity {
     private void setupSrtForInternalCamera(final InternalCameraInfo cameraInfo,
                                            final android.util.Size previewSize) {
         Log.i(TAG, "✅ SRT stream mode selected for internal camera (tally/control stay on TCP).");
-        stopNdiForwardingThread();
         stopTcpUdpForwardingThread();
         stopSrtForwardingThread();
         mSrtRemoteHost = null;
@@ -3498,8 +3191,8 @@ public class MainActivity extends AppCompatActivity {
         }, "SrtTransportInit").start();
     }
 
-    /** Tears down NDI sender and frame forwarder — used by both camera paths. */
-    private void cleanupNdiAndStreaming() {
+    /** Tears down streaming — used by both camera paths. */
+    private void cleanupStreaming() {
         try {
             if (mCameraHelper != null) {
                 mCameraHelper.setFrameCallback(null, 0);
@@ -3507,71 +3200,18 @@ public class MainActivity extends AppCompatActivity {
             if (mInternalCameraHelper != null) {
                 mInternalCameraHelper.setFrameListener(null);
             }
-            stopNdiForwardingThread();
-            if (mFrameForwarder != null) {
-                mFrameForwarder = null;
-            }
-            if (mNdiSender != null) {
-                stopTallyPolling();
-                mNdiSender.close();
-                mNdiSender = null;
-            }
             stopTcpUdpForwardingThread();
             stopSrtForwardingThread();
         } catch (Exception e) {
-            Log.e(TAG, "Error stopping NDI", e);
+            Log.e(TAG, "Error stopping streaming", e);
         }
-    }
-
-    private void startNdiForwardingThread() {
-        if (mNdiWorkerRunning) {
-            return;
-        }
-        mNdiWorkerRunning = true;
-        mNdiWorkerThread = new Thread(() -> {
-            while (mNdiWorkerRunning && !Thread.currentThread().isInterrupted()) {
-                try {
-                    java.nio.ByteBuffer frame = mNdiFrameQueue.poll(40, TimeUnit.MILLISECONDS);
-                    if (frame == null) {
-                        continue;
-                    }
-                    if (mFrameForwarder != null) {
-                        mFrameForwarder.onFrame(frame);
-                    }
-                    mNdiReusableBuffer.set(frame);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                } catch (Exception e) {
-                    Log.w(TAG, "Error in NDI forwarding thread", e);
-                }
-            }
-        }, "NdiFrameForwarder");
-        mNdiWorkerThread.setPriority(Thread.MAX_PRIORITY);
-        mNdiWorkerThread.start();
-    }
-
-    private void stopNdiForwardingThread() {
-        mNdiWorkerRunning = false;
-        if (mNdiWorkerThread != null) {
-            mNdiWorkerThread.interrupt();
-            try {
-                mNdiWorkerThread.join(200);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            mNdiWorkerThread = null;
-        }
-        mNdiFrameQueue.clear();
-        mNdiReusableBuffer.set(null);
     }
 
     private void stopTcpUdpForwardingThread() {
         mTcpUdpWorkerRunning = false;
         stopTcpDiscoveryBeaconThread();
         stopTcpTallyListenerThread();
-        if (mNdiSender == null) {
-            stopTallyPolling();
-        }
+        stopTallyPolling();
         // Close the server socket so accept() unblocks immediately
         ServerSocket ss = mH265ServerSocket;
         if (ss != null) {
@@ -4175,10 +3815,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         frame.clear();
-        // Try TCP pool first, then NDI pool — two pooled buffers avoids allocateDirect at 4K
-        if (!mTcpReusableBuffer.compareAndSet(null, frame)) {
-            mNdiReusableBuffer.compareAndSet(null, frame);
-        }
+        mTcpReusableBuffer.compareAndSet(null, frame);
     }
 
     private void clearTcpUdpFrameQueue() {
@@ -4779,53 +4416,14 @@ public class MainActivity extends AppCompatActivity {
         mTcpUdpWorkerThread.start();
     }
 
-    private void enqueueNdiFrame(java.nio.ByteBuffer frame) {
-        if (frame == null || mFrameForwarder == null) {
-            return;
-        }
-
-        long nowNs = System.nanoTime();
-        if (mNdiTargetFps > 0 && mLastEnqueueFrameTimeNs > 0
-                && (nowNs - mLastEnqueueFrameTimeNs) < mNdiMinFrameIntervalNs) {
-            // Throttle incoming frames at the source to reduce queue thrashing
-            return;
-        }
-        mLastEnqueueFrameTimeNs = nowNs;
-
-        java.nio.ByteBuffer frameCopy = copyFrameBuffer(frame);
-        if (frameCopy == null) {
-            return;
-        }
-
-        try {
-            if (!mNdiFrameQueue.offer(frameCopy, 160, TimeUnit.MILLISECONDS)) {
-                // queue is still full after wait; drop newest frame (rare fallback)
-                long now = System.currentTimeMillis();
-                if (now - mLastQueueFullLog > QUEUE_FULL_LOG_INTERVAL_MS) {
-                    Log.w(TAG, "NDI frame queue full after wait: dropped newest frame");
-                    mLastQueueFullLog = now;
-                }
-                mNdiReusableBuffer.set(frameCopy);
-                return;
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            mNdiReusableBuffer.set(frameCopy);
-            return;
-        }
-    }
-
     private java.nio.ByteBuffer copyFrameBuffer(java.nio.ByteBuffer src) {
         if (src == null || src.remaining() <= 0) {
             return null;
         }
 
         int needed = src.remaining();
-        // Try both buffer pools before falling back to expensive allocateDirect
+        // Try buffer pool before falling back to expensive allocateDirect
         java.nio.ByteBuffer dest = mTcpReusableBuffer.getAndSet(null);
-        if (dest == null || dest.capacity() < needed) {
-            dest = mNdiReusableBuffer.getAndSet(null);
-        }
         if (dest == null || dest.capacity() < needed) {
             dest = java.nio.ByteBuffer.allocateDirect(needed);
         }

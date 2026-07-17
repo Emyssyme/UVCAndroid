@@ -65,14 +65,8 @@
         app:showAsAction="never" />
 
     <item
-        android:id="@+id/action_ndimode"
-        android:title="@string/action_ndimode_high"
-        android:visible="false"
-        app:showAsAction="never" />
-
-    <item
         android:id="@+id/action_stream_protocol"
-        android:title="@string/action_stream_protocol_ndi"
+        android:title="@string/action_stream_protocol_tcp_udp"
         android:visible="false"
         app:showAsAction="ifRoom|withText" />
 
@@ -81,13 +75,6 @@
         android:title="@string/action_set_stream_destination"
         android:visible="false"
         app:showAsAction="ifRoom|withText" />
-
-    <!-- allow user to change the NDI source name -->
-    <item
-        android:id="@+id/action_set_ndi_name"
-        android:title="@string/action_set_ndi_name"
-        android:visible="false"
-        app:showAsAction="never" />
 
     <!-- ── Internal (phone) camera ── -->
     <item

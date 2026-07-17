@@ -46,7 +46,7 @@ import java.util.List;
  *   <li>Changing preview resolution</li>
  *   <li>Capturing JPEG photos</li>
  *   <li>Recording video via {@link MediaRecorder}</li>
- *   <li>Delivering raw NV12 frames for NDI streaming</li>
+ *   <li>Delivering raw NV12 frames for SRT/TCP streaming</li>
  * </ul>
  */
 public class InternalCameraHelper {
@@ -79,7 +79,7 @@ public class InternalCameraHelper {
         void onError(InternalCameraInfo cameraInfo, String message);
     }
 
-    /** Delivers individual YUV frames converted to NV12 for external consumers (NDI). */
+    /** Delivers individual YUV frames converted to NV12 for external consumers (SRT/TCP). */
     public interface OnFrameAvailableListener {
         void onFrame(ByteBuffer nv12Frame, int width, int height);
     }
@@ -116,7 +116,7 @@ public class InternalCameraHelper {
     private Surface        mPreviewSurface;
     private Surface        mEncoderSurface;
     private ImageReader    mJpegReader;
-    private ImageReader    mNdiYuvReader;
+    private ImageReader    mStreamYuvReader;
 
     // Recording
     private MediaRecorder  mMediaRecorder;
@@ -335,7 +335,10 @@ public class InternalCameraHelper {
                 mAeCompensationRange = new Range<>(0, 0);
             }
             mCurrentExposureCompensation = 0;
-            Boolean aeLockAvailable = characteristics.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE);
+            Boolean aeLockAvailable = false;
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                aeLockAvailable = characteristics.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE);
+            }
             mAeLockSupported = aeLockAvailable != null && aeLockAvailable;
 
             mMinFocusDistance = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) != null
@@ -528,14 +531,14 @@ public class InternalCameraHelper {
 
         surfaces.add(mJpegReader.getSurface());
 
-        // YUV reader for NDI frame delivery (only if a listener is registered)
+        // YUV reader for frame delivery (only if a listener is registered)
         if (mFrameListener != null) {
-            mNdiYuvReader = ImageReader.newInstance(
+            mStreamYuvReader = ImageReader.newInstance(
                     mPreviewSize.getWidth(), mPreviewSize.getHeight(),
                     ImageFormat.YUV_420_888, 2);
-            mNdiYuvReader.setOnImageAvailableListener(this::onNdiFrameAvailable,
+            mStreamYuvReader.setOnImageAvailableListener(this::onStreamFrameAvailable,
                     mBackgroundHandler);
-            surfaces.add(mNdiYuvReader.getSurface());
+            surfaces.add(mStreamYuvReader.getSurface());
         }
 
         try {
@@ -544,8 +547,8 @@ public class InternalCameraHelper {
             previewBuilder.addTarget(mPreviewSurface);
             if (mEncoderSurface != null)
                 previewBuilder.addTarget(mEncoderSurface);
-            if (mNdiYuvReader != null)
-                previewBuilder.addTarget(mNdiYuvReader.getSurface());
+            if (mStreamYuvReader != null)
+                previewBuilder.addTarget(mStreamYuvReader.getSurface());
 
             applyCameraSettings(previewBuilder);
 
@@ -656,8 +659,8 @@ public class InternalCameraHelper {
             if (mEncoderSurface != null) {
                 builder.addTarget(mEncoderSurface);
             }
-            if (mNdiYuvReader != null) {
-                builder.addTarget(mNdiYuvReader.getSurface());
+            if (mStreamYuvReader != null) {
+                builder.addTarget(mStreamYuvReader.getSurface());
             }
             applyCameraSettings(builder);
             mCaptureSession.setRepeatingRequest(builder.build(), mPreviewCaptureCallback, mBackgroundHandler);
@@ -1099,16 +1102,16 @@ public class InternalCameraHelper {
         if (previewSurface != null) surfaces.add(previewSurface);
         surfaces.add(recorderSurface);
 
-        // Keep NDI frame delivery during recording if requested
-        if (mFrameListener != null && mNdiYuvReader == null) {
-            mNdiYuvReader = ImageReader.newInstance(
+        // Keep frame delivery during recording if requested
+        if (mFrameListener != null && mStreamYuvReader == null) {
+            mStreamYuvReader = ImageReader.newInstance(
                     mPreviewSize.getWidth(), mPreviewSize.getHeight(),
                     ImageFormat.YUV_420_888, 2);
-            mNdiYuvReader.setOnImageAvailableListener(this::onNdiFrameAvailable,
+            mStreamYuvReader.setOnImageAvailableListener(this::onStreamFrameAvailable,
                     mBackgroundHandler);
-            surfaces.add(mNdiYuvReader.getSurface());
-        } else if (mNdiYuvReader != null) {
-            surfaces.add(mNdiYuvReader.getSurface());
+            surfaces.add(mStreamYuvReader.getSurface());
+        } else if (mStreamYuvReader != null) {
+            surfaces.add(mStreamYuvReader.getSurface());
         }
 
         final Surface finalPreviewSurface = previewSurface;
@@ -1125,8 +1128,8 @@ public class InternalCameraHelper {
                                 if (finalPreviewSurface != null)
                                     builder.addTarget(finalPreviewSurface);
                                 builder.addTarget(recorderSurface);
-                                if (mNdiYuvReader != null)
-                                    builder.addTarget(mNdiYuvReader.getSurface());
+                                if (mStreamYuvReader != null)
+                                    builder.addTarget(mStreamYuvReader.getSurface());
 
                                 builder.set(CaptureRequest.CONTROL_MODE,
                                         CaptureRequest.CONTROL_MODE_AUTO);
@@ -1164,10 +1167,10 @@ public class InternalCameraHelper {
     }
 
     // -------------------------------------------------------------------------
-    // NDI frame delivery (YUV_420_888 → NV12)
+    // Frame delivery (YUV_420_888 → NV12)
     // -------------------------------------------------------------------------
 
-    private void onNdiFrameAvailable(ImageReader reader) {
+    private void onStreamFrameAvailable(ImageReader reader) {
         final OnFrameAvailableListener listener = mFrameListener;
         if (mClosed || listener == null) return;
         try (Image image = reader.acquireLatestImage()) {
@@ -1178,7 +1181,7 @@ public class InternalCameraHelper {
             }
         } catch (IllegalStateException e) {
             // Image buffer was invalidated (camera closed mid-frame) — discard silently
-            Log.d(TAG, "onNdiFrameAvailable: buffer inaccessible, skipping frame");
+            Log.d(TAG, "onStreamFrameAvailable: buffer inaccessible, skipping frame");
         }
     }
 
@@ -1289,9 +1292,9 @@ public class InternalCameraHelper {
             mJpegReader.close();
             mJpegReader = null;
         }
-        if (mNdiYuvReader != null) {
-            mNdiYuvReader.close();
-            mNdiYuvReader = null;
+        if (mStreamYuvReader != null) {
+            mStreamYuvReader.close();
+            mStreamYuvReader = null;
         }
         if (mMediaRecorder != null) {
             mMediaRecorder.release();
