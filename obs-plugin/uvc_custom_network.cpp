@@ -414,16 +414,29 @@ static void uvc_custom_network_tally_close_socket(uvc_custom_network *context)
 
 static void uvc_custom_network_send_tally(uvc_custom_network *context, bool force_send)
 {
-    if (!context || !context->tally_addr_valid) {
+    if (!context || !context->host || context->host[0] == '\0') {
         return;
     }
-    /* Only send tally when a receiver is actually connected to Android */
-    if (!context->receiver_running && !context->srt_receiver_running) {
-        return;
+
+    /* Self-heal: if the tally address is stale, rebuild it now.
+     * This catches cases where the host was temporarily blank during
+     * a port-change / reconnect cycle and tally_addr_valid was cleared. */
+    if (!context->tally_addr_valid) {
+        uvc_custom_network_tally_update_addr(context);
     }
+    if (!context->tally_addr_valid) {
+        return; /* still invalid — host resolution failed */
+    }
+
 #ifdef _WIN32
     if (context->tally_socket == INVALID_SOCKET) {
+        uvc_custom_network_tally_open_socket(context);
+    }
+    if (context->tally_socket == INVALID_SOCKET) {
 #else
+    if (context->tally_socket < 0) {
+        uvc_custom_network_tally_open_socket(context);
+    }
     if (context->tally_socket < 0) {
 #endif
         return;
@@ -454,6 +467,11 @@ static void uvc_custom_network_send_tally(uvc_custom_network *context, bool forc
         blog(LOG_INFO, "UVC TALLY -> Android (%s:%d): %s",
              context->host ? context->host : "?",
              CUSTOM_TALLY_PORT, payload);
+    } else if (stale) {
+        /* Periodic heartbeat — log at DEBUG level to confirm tally is alive */
+        blog(LOG_DEBUG, "UVC TALLY heartbeat -> %s:%d  program=%d preview=%d",
+             context->host ? context->host : "?", CUSTOM_TALLY_PORT,
+             program ? 1 : 0, preview ? 1 : 0);
     }
 
 #ifdef _WIN32
@@ -464,13 +482,17 @@ static void uvc_custom_network_send_tally(uvc_custom_network *context, bool forc
                           (const struct sockaddr *)&context->tally_addr, sizeof(context->tally_addr));
 #endif
     if (sent < 0) {
-        blog(LOG_WARNING, "UVC TALLY: sendto() failed (socket=%d, addr_valid=%d)",
+        blog(LOG_WARNING, "UVC TALLY: sendto() to %s:%d failed (socket=%d, addr_valid=%d)",
+             context->host ? context->host : "?", CUSTOM_TALLY_PORT,
 #ifdef _WIN32
              (int)context->tally_socket,
 #else
              context->tally_socket,
 #endif
              context->tally_addr_valid ? 1 : 0);
+        /* One failure may be transient; invalidate the address so the
+         * next tick will re-resolve the host and try again. */
+        context->tally_addr_valid = false;
     }
 
     context->tally_program = program;
@@ -539,17 +561,27 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
              quality,
              context->srt_port);
 
-    blog(LOG_INFO, "UVC CONTROL -> Android: %s", payload);
+    blog(LOG_INFO, "UVC CONTROL -> Android %s:%d: %s", host_copy, CUSTOM_TALLY_PORT, payload);
 
 #ifdef _WIN32
-    sendto(sock, payload, (int)strlen(payload), 0,
+    int sent = sendto(sock, payload, (int)strlen(payload), 0,
            (const struct sockaddr *)&addr, sizeof(addr));
     closesocket(sock);
 #else
-    sendto(sock, payload, strlen(payload), 0,
+    ssize_t sent = sendto(sock, payload, strlen(payload), 0,
            (const struct sockaddr *)&addr, sizeof(addr));
     close(sock);
 #endif
+    if (sent < 0) {
+        blog(LOG_WARNING, "UVC CONTROL: sendto() to %s:%d failed (socket=%d)",
+             host_copy, CUSTOM_TALLY_PORT,
+#ifdef _WIN32
+             (int)sock
+#else
+             sock
+#endif
+        );
+    }
 
     /* Ensure the control-state listener is running so we can receive
      * Android's CONTROL_STATE reply and keep settings in sync. */
