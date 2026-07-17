@@ -2209,33 +2209,44 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
     uvc_custom_network *context = (uvc_custom_network *)data;
     obs_properties_t *props = obs_properties_create();
     obs_property_t *p;
+    obs_properties_t *group;
+    bool is_active = (context && (context->receiver_running || context->srt_receiver_running));
 
-    /* ── Status bar (top of panel, shows connection state + delay) ── */
-    p = obs_properties_add_text(props, "discovery_status", "📡 Status", OBS_TEXT_INFO);
-    UNUSED_PARAMETER(p);
+    /* ── Status bar: connection state + resolution + delay ── */
+    p = obs_properties_add_text(props, "discovery_status", "Status", OBS_TEXT_INFO);
     if (p && context) {
-        if (context->receiver_running || context->srt_receiver_running) {
+        if (is_active) {
             char label[160];
-            snprintf(label, sizeof(label), "✅ Connected — %s:%d  %s  %dx%d",
+            double lat;
+            pthread_mutex_lock(&context->lock);
+            lat = context->latency_ms;
+            pthread_mutex_unlock(&context->lock);
+            snprintf(label, sizeof(label), "Connected  %s:%d  %s  %dx%d  %.0fms",
                      context->host ? context->host : "?",
                      context->use_srt ? context->srt_port : context->port,
                      context->use_srt ? "SRT" : "TCP",
                      (int)(context->width > 0 ? context->width : 1280),
-                     (int)(context->height > 0 ? context->height : 720));
+                     (int)(context->height > 0 ? context->height : 720),
+                     lat);
             obs_property_set_long_description(p, label);
         } else if (context->host && context->host[0] != '\0') {
-            obs_property_set_long_description(p, "⏳ Connecting...");
+            obs_property_set_long_description(p, "Connecting...");
         } else {
-            obs_property_set_long_description(p, "⚫ No device selected — pick from list below");
+            obs_property_set_long_description(p, "Pick a device below then press Activate");
         }
     }
 
-    /* ── Discovery list (per-source binding) ────────────────────── */
-    bool is_active = (context && (context->receiver_running || context->srt_receiver_running));
-    p = obs_properties_add_list(props, "selected_device_index", "📋 Discovered Devices", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    /* ═══════════════════════════════════════════════════════════════
+     * ▸ Connection
+     * ═══════════════════════════════════════════════════════════════ */
+    group = obs_properties_create();
+    obs_properties_add_group(props, "grp_connection", "Connection", OBS_GROUP_NORMAL, group);
+
+    p = obs_properties_add_list(group, "selected_device_index",
+            "Discovered devices", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     if (p) {
         if (is_active) obs_property_set_enabled(p, false);
-        obs_property_list_add_int(p, is_active ? "🔒 Connected — stop first" : "— auto-detect from list —", -1);
+        obs_property_list_add_int(p, is_active ? "(stop first to change)" : "(auto-detect)", -1);
         if (context && context->discovered_device_count > 0) {
             for (int i = 0; i < context->discovered_device_count; i++) {
                 char entry[160];
@@ -2244,7 +2255,7 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
                         && context->port == context->discovered_devices[i].port);
                 snprintf(entry, sizeof(entry), "%s  %s",
                          context->discovered_devices[i].label,
-                         is_this ? "← THIS SOURCE" : "");
+                         is_this ? "(active)" : "");
                 obs_property_list_add_int(p, entry, i);
             }
         } else {
@@ -2253,87 +2264,97 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
         }
     }
 
-    p = obs_properties_add_text(props, "host", "Phone IP", OBS_TEXT_DEFAULT);
-    if (is_active) obs_property_set_enabled(p, false);
-    p = obs_properties_add_int(props, "port", "Stream Port (TCP)", 1024, 65535, 1);
+    p = obs_properties_add_text(group, "host", "Phone IP", OBS_TEXT_DEFAULT);
     if (is_active) obs_property_set_enabled(p, false);
 
-    p = obs_properties_add_bool(props, "use_srt", "Use SRT (UDP) — tally/control stay on TCP");
+    p = obs_properties_add_int(group, "port", "Port", 1024, 65535, 1);
     if (is_active) obs_property_set_enabled(p, false);
 
-    p = obs_properties_add_bool(props, "hw_decode", "Use Hardware Decoding (if available)");
-
-    p = obs_properties_add_int(props, "srt_port", "SRT Port (auto-selects next free if busy)", 1024, 65535, 1);
+    p = obs_properties_add_bool(group, "use_srt", "Use SRT (UDP)");
     if (is_active) obs_property_set_enabled(p, false);
 
-    /* Show the port the SRT receiver actually bound to */
+    p = obs_properties_add_int(group, "srt_port", "SRT port", 1024, 65535, 1);
+    if (is_active) obs_property_set_enabled(p, false);
+
     if (context && context->srt_receiver_running) {
-        p = obs_properties_add_text(props, "srt_bound_port", "📡 Listening SRT Port", OBS_TEXT_INFO);
+        p = obs_properties_add_text(group, "srt_bound_port", "Listening on", OBS_TEXT_INFO);
         if (p) {
             char bound[32];
-            snprintf(bound, sizeof(bound), "%d", context->srt_port);
+            snprintf(bound, sizeof(bound), "UDP :%d", context->srt_port);
             obs_property_set_long_description(p, bound);
         }
     }
 
-    p = obs_properties_add_int(props, "srt_latency_ms", "SRT Latency (ms)", 20, 5000, 10);
-    if (p) {
-        obs_property_set_long_description(p,
-            "Frame buffer latency. Higher = smoother video but more delay.\n"
-            "Recommended: 4 x RTT + jitter (typically 80-200 ms on WiFi).\n"
-            "Max 5000 ms (5 sec) for unstable networks.");
-        if (is_active) obs_property_set_enabled(p, false);
-    }
-
-    p = obs_properties_add_button(props, "activate",
-        (context && (context->receiver_running || context->srt_receiver_running))
-            ? "⏹ Stop" : "▶ Activate",
+    p = obs_properties_add_button(group, "activate",
+        is_active ? "Stop" : "Activate",
         (obs_property_clicked_t)uvc_custom_network_activate_button);
-    UNUSED_PARAMETER(p);
 
-    p = obs_properties_add_button(props, "refresh_discovery", "🔄 Refresh Discovery",
+    p = obs_properties_add_button(group, "refresh_discovery", "Refresh discovery",
                                   (obs_property_clicked_t)uvc_custom_network_refresh_button);
-    UNUSED_PARAMETER(p);
 
-    p = obs_properties_add_list(props, "resolution_index", "Resolution", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    /* ═══════════════════════════════════════════════════════════════
+     * ▸ Video
+     * ═══════════════════════════════════════════════════════════════ */
+    group = obs_properties_create();
+    obs_properties_add_group(props, "grp_video", "Video", OBS_GROUP_NORMAL, group);
+
+    p = obs_properties_add_list(group, "resolution_index", "Resolution",
+            OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     for (int i = 0; i < (int)(sizeof(RESOLUTIONS) / sizeof(RESOLUTIONS[0])); i++) {
         obs_property_list_add_int(p, RESOLUTIONS[i], i);
     }
 
-    obs_properties_add_int(props, "fps", "FPS", 15, 60, 1);
-    obs_properties_add_int(props, "quality", "Quality", 1, 100, 1);
-    obs_properties_add_bool(props, "exposure_lock", "Exposure Lock");
-    obs_properties_add_int(props, "exposure_compensation", "Exposure Compensation", -10, 10, 1);
-    obs_properties_add_bool(props, "focus_lock", "Focus Lock");
-    p = obs_properties_add_list(props, "af_mode", "Autofocus Mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    if (p) {
-        obs_property_list_add_int(p, "Off", 0);
-        obs_property_list_add_int(p, "Auto", 1);
-        obs_property_list_add_int(p, "Continuous", 2);
-        obs_property_list_add_int(p, "Tap", 3);
-        obs_property_list_add_int(p, "Infinity", 4);
-        obs_property_list_add_int(p, "Macro", 5);
-    }
-    obs_properties_add_bool(props, "af_lock", "AF Lock");
-    p = obs_properties_add_list(props, "flash_mode", "Flash Mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    if (p) {
-        obs_property_list_add_int(p, "Auto", 0);
-        obs_property_list_add_int(p, "On", 1);
-        obs_property_list_add_int(p, "Off", 2);
-        obs_property_list_add_int(p, "Torch", 3);
-    }
-    p = obs_properties_add_list(props, "wb_mode", "White Balance", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
-    if (p) {
-        obs_property_list_add_int(p, "Auto", 0);
-        obs_property_list_add_int(p, "Incandescent", 1);
-        obs_property_list_add_int(p, "Fluorescent", 2);
-        obs_property_list_add_int(p, "Daylight", 3);
-        obs_property_list_add_int(p, "Cloudy", 4);
-        obs_property_list_add_int(p, "Shade", 5);
-        obs_property_list_add_int(p, "Kelvin", 6);
-    }
-    obs_properties_add_int(props, "wb_kelvin", "White Balance Kelvin", 1000, 10000, 100);
-    obs_properties_add_bool(props, "discovery_enabled", "Enable Network Discovery");
+    obs_properties_add_int(group, "fps", "FPS", 15, 60, 1);
+    obs_properties_add_int(group, "quality", "Quality", 1, 100, 1);
+    obs_properties_add_bool(group, "hw_decode", "Hardware decoding");
+
+    p = obs_properties_add_int(group, "srt_latency_ms", "SRT buffer (ms)", 20, 5000, 10);
+    obs_property_set_long_description(p, "Higher = smoother, lower = less delay (recommended: 80–200)");
+
+    /* ═══════════════════════════════════════════════════════════════
+     * ▸ Camera
+     * ═══════════════════════════════════════════════════════════════ */
+    group = obs_properties_create();
+    obs_properties_add_group(props, "grp_camera", "Camera", OBS_GROUP_NORMAL, group);
+
+    obs_properties_add_bool(group, "exposure_lock", "Exposure lock");
+    obs_properties_add_int(group, "exposure_compensation", "EV compensation", -10, 10, 1);
+    obs_properties_add_bool(group, "focus_lock", "Focus lock");
+
+    p = obs_properties_add_list(group, "af_mode", "AF mode", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(p, "Off", 0);
+    obs_property_list_add_int(p, "Auto", 1);
+    obs_property_list_add_int(p, "Continuous", 2);
+    obs_property_list_add_int(p, "Tap", 3);
+    obs_property_list_add_int(p, "Infinity", 4);
+    obs_property_list_add_int(p, "Macro", 5);
+
+    obs_properties_add_bool(group, "af_lock", "AF lock");
+
+    p = obs_properties_add_list(group, "flash_mode", "Flash", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(p, "Auto", 0);
+    obs_property_list_add_int(p, "On", 1);
+    obs_property_list_add_int(p, "Off", 2);
+    obs_property_list_add_int(p, "Torch", 3);
+
+    p = obs_properties_add_list(group, "wb_mode", "White balance", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(p, "Auto", 0);
+    obs_property_list_add_int(p, "Incandescent", 1);
+    obs_property_list_add_int(p, "Fluorescent", 2);
+    obs_property_list_add_int(p, "Daylight", 3);
+    obs_property_list_add_int(p, "Cloudy", 4);
+    obs_property_list_add_int(p, "Shade", 5);
+    obs_property_list_add_int(p, "Kelvin", 6);
+
+    obs_properties_add_int(group, "wb_kelvin", "Kelvin", 1000, 10000, 100);
+
+    /* ═══════════════════════════════════════════════════════════════
+     * ▸ Advanced
+     * ═══════════════════════════════════════════════════════════════ */
+    group = obs_properties_create();
+    obs_properties_add_group(props, "grp_advanced", "Advanced", OBS_GROUP_NORMAL, group);
+
+    obs_properties_add_bool(group, "discovery_enabled", "Network discovery");
 
     return props;
 }

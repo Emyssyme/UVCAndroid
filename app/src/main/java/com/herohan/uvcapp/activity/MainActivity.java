@@ -1554,81 +1554,65 @@ public class MainActivity extends AppCompatActivity {
         if (mBinding == null || mBinding.tvStreamStatus == null) {
             return;
         }
-        // always show device IP for easy discovery
-        String ipLine = (mDeviceIp != null && !mDeviceIp.isEmpty())
-                ? "📱 IP: " + mDeviceIp + "\n"
-                : "";
+
+        StringBuilder sb = new StringBuilder();
+
+        /* Device IP — always visible for discovery */
+        if (mDeviceIp != null && !mDeviceIp.isEmpty()) {
+            sb.append(mDeviceIp);
+        } else {
+            sb.append("no network");
+        }
+
         if (mStreamProtocol == StreamProtocol.NDI) {
-            mBinding.tvStreamStatus.setText(ipLine + getString(R.string.stream_status_ndi));
-        } else if (mStreamProtocol == StreamProtocol.TCP_UDP) {
-            if (hasCustomTransportDestination()) {
-                String resolutionLabel = "";
-                if (mInternalPreviewSize != null) {
-                    resolutionLabel = " res=" + mInternalPreviewSize.getWidth() + "x" + mInternalPreviewSize.getHeight();
-                }
-                String base = ipLine + "H.265 TCP server: 0.0.0.0:" + mStreamPort
-                        + resolutionLabel
-                        + " @ " + mVideoTargetFps + " fps"
-                        + " q=" + mVideoQuality;
-                mBinding.tvStreamStatus.setText(base + "\n" + getTcpTelemetryOverlay());
-            } else {
-                mBinding.tvStreamStatus.setText(ipLine + getString(R.string.stream_status_no_destination));
+            sb.append("  NDI");
+            mBinding.tvStreamStatus.setText(sb.toString());
+            mBinding.toolbar.setTitle("UVC Camera · NDI");
+            return;
+        }
+
+        if (!hasCustomTransportDestination()) {
+            sb.append("  ⏻ idle");
+            mBinding.tvStreamStatus.setText(sb.toString());
+            mBinding.toolbar.setTitle("UVC Camera");
+            return;
+        }
+
+        /* Active stream — show protocol, port, resolution */
+        if (mStreamProtocol == StreamProtocol.TCP_UDP) {
+            sb.append("  TCP :").append(mStreamPort);
+            mBinding.toolbar.setTitle("UVC Camera · TCP");
+        } else if (mStreamProtocol == StreamProtocol.SRT) {
+            sb.append("  SRT → ").append(mSrtRemoteHost).append(":").append(mSrtRemotePort);
+            mBinding.toolbar.setTitle("UVC Camera · SRT");
+        }
+
+        if (mInternalPreviewSize != null) {
+            sb.append("  ").append(mInternalPreviewSize.getWidth())
+              .append("×").append(mInternalPreviewSize.getHeight());
+        }
+        sb.append("  ").append(mVideoTargetFps).append("fps");
+
+        /* Live telemetry */
+        if (mStreamProtocol == StreamProtocol.TCP_UDP) {
+            long enc = mTcpFramesEncoded.get();
+            long snt = mTcpPacketsSent.get();
+            if (enc > 0 || snt > 0) {
+                sb.append("  ").append(enc).append("/").append(snt);
             }
         } else if (mStreamProtocol == StreamProtocol.SRT) {
-            if (hasCustomTransportDestination()) {
-                String resolutionLabel = "";
-                if (mInternalPreviewSize != null) {
-                    resolutionLabel = " res=" + mInternalPreviewSize.getWidth() + "x" + mInternalPreviewSize.getHeight();
-                }
-                String base = ipLine + "SRT → " + mSrtRemoteHost + ":" + mSrtRemotePort
-                        + resolutionLabel
-                        + " @ " + mVideoTargetFps + " fps"
-                        + " q=" + mVideoQuality;
-                mBinding.tvStreamStatus.setText(base + "\n" + getSrtTelemetryOverlay());
-            } else {
-                mBinding.tvStreamStatus.setText(ipLine + getString(R.string.stream_status_no_destination));
+            long enc = mSrtFramesEncoded.get();
+            long snt = mSrtPacketsSent.get();
+            if (enc > 0 || snt > 0) {
+                sb.append("  ").append(enc).append("/").append(snt);
             }
-        } else {
-            mBinding.tvStreamStatus.setText(ipLine + getString(R.string.stream_status_inactive));
         }
+
+        mBinding.tvStreamStatus.setText(sb.toString());
     }
 
     private boolean isCustomTransportActive() {
         return mStreamProtocol == StreamProtocol.TCP_UDP || mStreamProtocol == StreamProtocol.SRT;
-    }
-
-    private String getSrtTelemetryOverlay() {
-        long captured = mSrtFramesCaptured.get();
-        long dropped = mSrtFramesDropped.get();
-        long encoded = mSrtFramesEncoded.get();
-        long sent = mSrtPacketsSent.get();
-        return String.format(Locale.US,
-                "cap=%d drop=%d enc=%d sent=%d",
-                captured,
-                dropped,
-                encoded,
-                sent);
-    }
-
-    private String getTcpTelemetryOverlay() {
-        long captured = mTcpFramesCaptured.get();
-        long dropped = mTcpFramesDropped.get();
-        long encoded = mTcpFramesEncoded.get();
-        long sent = mTcpPacketsSent.get();
-        long maxQ = mTcpQueueDepthMax.get();
-        long samples = mTcpEncodeSamples.get();
-        double avgEncMs = samples > 0
-                ? (mTcpEncodeTimeNsSum.get() / 1_000_000.0) / (double) samples
-                : 0.0;
-        return String.format(Locale.US,
-                "cap=%d drop=%d enc=%d sent=%d q=%d/%d encAvg=%.2fms",
-                captured,
-                dropped,
-                encoded,
-                sent,
-                mTcpUdpFrameQueue.size(),
-                Math.max(maxQ, 1),
-                avgEncMs);
     }
 
     private void resetTcpTelemetry() {
