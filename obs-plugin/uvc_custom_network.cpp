@@ -27,6 +27,7 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/hwcontext.h>
 }
 
 #include <stdlib.h>
@@ -124,6 +125,47 @@ static void *uvc_custom_network_srt_receiver_thread(void *data);
 static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *context, const char *msg);
 static void uvc_custom_network_video_tick(void *data, float seconds);
 static void uvc_custom_network_send_tally(uvc_custom_network *context, bool force_send);
+
+/* ── Hardware-accelerated decoder ─────────────────────────────────────────────
+ * Attempts to open an H.265 hardware decoder, falling back to software.
+ * Returns the opened AVCodecContext or NULL on failure.
+ * The caller is responsible for freeing via avcodec_free_context(). */
+static AVCodecContext *try_open_hw_decoder(const char **codec_name_out)
+{
+    static const char *hw_decoders[] = {
+        "hevc_d3d11va",
+        "hevc_dxva2",
+        "hevc_qsv",
+        "hevc_nvdec",
+        "hevc_cuvid",
+        "hevc_amf",
+        "hevc_videotoolbox",
+        NULL
+    };
+
+    for (int i = 0; hw_decoders[i] != NULL; i++) {
+        const AVCodec *hwc = avcodec_find_decoder_by_name(hw_decoders[i]);
+        if (!hwc) continue;
+
+        AVCodecContext *ctx = avcodec_alloc_context3(hwc);
+        if (!ctx) continue;
+
+        ctx->flags       |= AV_CODEC_FLAG_LOW_DELAY;
+        ctx->flags2      |= AV_CODEC_FLAG2_FAST;
+        ctx->thread_type  = FF_THREAD_SLICE;
+        ctx->thread_count = 4;
+
+        if (avcodec_open2(ctx, hwc, NULL) == 0) {
+            blog(LOG_INFO, "UVC HW decode: opened %s", hw_decoders[i]);
+            if (codec_name_out) *codec_name_out = hw_decoders[i];
+            return ctx;
+        }
+        avcodec_free_context(&ctx);
+    }
+
+    if (codec_name_out) *codec_name_out = NULL;
+    return NULL;
+}
 
 static void uvc_custom_network_clear_discovered_devices(uvc_custom_network *context)
 {
@@ -1084,26 +1126,42 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
 
     uvc_custom_network_set_status(context, "SRT listening %s:%d — waiting for video", host, port);
 
-    decoder = avcodec_alloc_context3(codec);
-    decoder->flags |= AV_CODEC_FLAG_LOW_DELAY;
-    decoder->flags2 |= AV_CODEC_FLAG2_FAST;
-    decoder->thread_type = FF_THREAD_SLICE;
-    decoder->thread_count = 4;
-    if (avcodec_open2(decoder, codec, NULL) != 0) {
-        blog(LOG_ERROR, "UVC SRT: avcodec_open2 failed");
-        avcodec_free_context(&decoder);
-        av_packet_free(&pkt);
-        av_frame_free(&frame);
+    bool use_hw = false;
+    pthread_mutex_lock(&context->lock);
+    use_hw = context->hw_decode;
+    pthread_mutex_unlock(&context->lock);
+
+    const char *active_codec_name = NULL;
+    if (use_hw) {
+        decoder = try_open_hw_decoder(&active_codec_name);
+        if (!decoder) {
+            blog(LOG_WARNING, "UVC SRT: HW decoder unavailable — falling back to software");
+        }
+    }
+
+    if (!decoder) {
+        active_codec_name = "hevc (software)";
+        decoder = avcodec_alloc_context3(codec);
+        decoder->flags |= AV_CODEC_FLAG_LOW_DELAY;
+        decoder->flags2 |= AV_CODEC_FLAG2_FAST;
+        decoder->thread_type = FF_THREAD_SLICE;
+        decoder->thread_count = 4;
+        if (avcodec_open2(decoder, codec, NULL) != 0) {
+            blog(LOG_ERROR, "UVC SRT: avcodec_open2 failed");
+            avcodec_free_context(&decoder);
+            av_packet_free(&pkt);
+            av_frame_free(&frame);
 #ifdef _WIN32
-        closesocket(sock);
-        context->srt_receiver_socket = INVALID_SOCKET;
+            closesocket(sock);
+            context->srt_receiver_socket = INVALID_SOCKET;
 #else
-        close(sock);
-        context->srt_receiver_socket = -1;
+            close(sock);
+            context->srt_receiver_socket = -1;
 #endif
-        bfree(host);
-        context->srt_receiver_running = false;
-        return NULL;
+            bfree(host);
+            context->srt_receiver_running = false;
+            return NULL;
+        }
     }
 
     bool logged_first = false;
@@ -1356,8 +1414,9 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
                 }
 
                 if (!logged_first) {
-                    blog(LOG_INFO, "UVC SRT: first decoded frame %dx%d",
-                         frame->width, frame->height);
+                    blog(LOG_INFO, "UVC SRT: first decoded frame %dx%d codec=%s",
+                         frame->width, frame->height,
+                         active_codec_name ? active_codec_name : "sw");
                     logged_first = true;
                 }
             }
@@ -1599,22 +1658,39 @@ static void *uvc_custom_network_receiver_thread(void *data)
 
         /* fresh H.265 decoder for each connection */
         if (decoder) { avcodec_free_context(&decoder); decoder = NULL; }
-        decoder = avcodec_alloc_context3(codec);
-        decoder->flags       |= AV_CODEC_FLAG_LOW_DELAY;
-        decoder->flags2      |= AV_CODEC_FLAG2_FAST;
-        decoder->thread_type  = FF_THREAD_SLICE;
-        decoder->thread_count = 4;  /* parallel slice decode for 4K HEVC */
-        if (avcodec_open2(decoder, codec, NULL) != 0) {
-            blog(LOG_ERROR, "UVC H265 TCP: avcodec_open2 failed");
+
+        bool use_hw = false;
+        pthread_mutex_lock(&context->lock);
+        use_hw = context->hw_decode;
+        pthread_mutex_unlock(&context->lock);
+
+        const char *active_codec_name = NULL;
+        if (use_hw) {
+            decoder = try_open_hw_decoder(&active_codec_name);
+            if (!decoder) {
+                blog(LOG_WARNING, "UVC H265 TCP: HW decoder unavailable — falling back to software");
+            }
+        }
+
+        if (!decoder) {
+            active_codec_name = "hevc (software)";
+            decoder = avcodec_alloc_context3(codec);
+            decoder->flags       |= AV_CODEC_FLAG_LOW_DELAY;
+            decoder->flags2      |= AV_CODEC_FLAG2_FAST;
+            decoder->thread_type  = FF_THREAD_SLICE;
+            decoder->thread_count = 4;  /* parallel slice decode for 4K HEVC */
+            if (avcodec_open2(decoder, codec, NULL) != 0) {
+                blog(LOG_ERROR, "UVC H265 TCP: avcodec_open2 failed");
 #ifdef _WIN32
-            closesocket(sock);
-            context->receiver_socket = INVALID_SOCKET;
+                closesocket(sock);
+                context->receiver_socket = INVALID_SOCKET;
 #else
-            close(sock);
-            context->receiver_socket = -1;
+                close(sock);
+                context->receiver_socket = -1;
 #endif
-            for (int i = 0; i < 40 && context->receiver_running; i++) os_sleep_ms(50);
-            continue;
+                for (int i = 0; i < 40 && context->receiver_running; i++) os_sleep_ms(50);
+                continue;
+            }
         }
 
         bool logged_first = false;
@@ -1817,8 +1893,9 @@ static void *uvc_custom_network_receiver_thread(void *data)
                     }
 
                     if (!logged_first) {
-                        blog(LOG_INFO, "UVC H265 TCP: first decoded frame %dx%d pixfmt=%d",
-                             frame->width, frame->height, frame->format);
+                        blog(LOG_INFO, "UVC H265 TCP: first decoded frame %dx%d pixfmt=%d codec=%s",
+                             frame->width, frame->height, frame->format,
+                             active_codec_name ? active_codec_name : "sw");
                         logged_first = true;
                     }
                 }
@@ -2040,6 +2117,7 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
 #ifdef _WIN32
     context->main_thread_id = GetCurrentThreadId();
 #endif
+    context->hw_decode = obs_data_get_bool(settings, "hw_decode");
     context->discovery_status = bstrdup("Idle");
 
     if (context->discovery_enabled) {
@@ -2150,6 +2228,8 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
 
     p = obs_properties_add_bool(props, "use_srt", "Use SRT (UDP) — tally/control stay on TCP");
     if (is_active) obs_property_set_enabled(p, false);
+
+    p = obs_properties_add_bool(props, "hw_decode", "Use Hardware Decoding (if available)");
 
     p = obs_properties_add_int(props, "srt_port", "SRT Port (auto-selects next free if busy)", 1024, 65535, 1);
     if (is_active) obs_property_set_enabled(p, false);
@@ -2297,6 +2377,11 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     int srt_port = (int)obs_data_get_int(settings, "srt_port");
     bool srt_changed = (use_srt != context->use_srt) || (srt_port != context->configured_srt_port);
     context->use_srt = use_srt;
+
+    bool hw_decode = obs_data_get_bool(settings, "hw_decode");
+    bool hw_decode_changed = (hw_decode != context->hw_decode);
+    context->hw_decode = hw_decode;
+
     if (srt_port > 0 && srt_port <= 65535) {
         context->configured_srt_port = srt_port;
         /* Only overwrite the live port if the receiver is NOT running.
@@ -2361,7 +2446,7 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
         context->discovery = NULL;
     }
 
-    if ((port_changed || host_changed || srt_changed) && (context->receiver_running || context->srt_receiver_running)) {
+    if ((port_changed || host_changed || srt_changed || hw_decode_changed) && (context->receiver_running || context->srt_receiver_running)) {
         need_receiver_restart = true;
     }
 
@@ -2470,6 +2555,7 @@ static uint32_t uvc_custom_network_get_height(void *data)
 static void uvc_custom_network_defaults(obs_data_t *settings)
 {
     obs_data_set_default_bool(settings, "discovery_enabled", true);
+    obs_data_set_default_bool(settings, "hw_decode", true);
     obs_data_set_default_bool(settings, "exposure_lock", false);
     obs_data_set_default_bool(settings, "focus_lock", false);
     obs_data_set_default_int(settings, "exposure_compensation", 0);

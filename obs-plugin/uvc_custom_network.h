@@ -137,6 +137,9 @@ struct uvc_custom_network {
 
     /* Cached main-thread ID for safe OBS API calls. */
     unsigned long main_thread_id;
+
+    /* Hardware decode toggle (on = try DXVA2/D3D11VA/QSV/NVDEC, off = software only) */
+    bool hw_decode;
 };
 
 obs_source_info *get_uvc_custom_network_info();

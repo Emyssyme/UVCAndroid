@@ -114,6 +114,7 @@ public class InternalCameraHelper {
     // Surfaces / readers
     private SurfaceTexture mPreviewSurfaceTexture;
     private Surface        mPreviewSurface;
+    private Surface        mEncoderSurface;
     private ImageReader    mJpegReader;
     private ImageReader    mNdiYuvReader;
 
@@ -297,6 +298,15 @@ public class InternalCameraHelper {
 
     public void setStateCallback(OnCameraStateCallback cb)         { mStateCallback    = cb; }
     public void setFrameListener(OnFrameAvailableListener listener) { mFrameListener    = listener; }
+    public void setEncoderSurface(Surface encoderSurface) {
+        mEncoderSurface = encoderSurface;
+        if (mCameraDevice != null && mPreviewSurfaceTexture != null && mCaptureSession != null) {
+            try { mCaptureSession.stopRepeating(); } catch (Exception ignored) {}
+            try { mCaptureSession.close(); } catch (Exception ignored) {}
+            mCaptureSession = null;
+            startPreviewSession();
+        }
+    }
     public void setPictureTakenListener(OnPictureTakenListener l)  { mPictureListener  = l; }
     public void setRecordingListener(OnRecordingStateListener l)   { mRecordingListener = l; }
 
@@ -507,6 +517,9 @@ public class InternalCameraHelper {
 
         List<Surface> surfaces = new ArrayList<>();
         surfaces.add(mPreviewSurface);
+        if (mEncoderSurface != null) {
+            surfaces.add(mEncoderSurface);
+        }
 
         // JPEG reader for photo capture (always included in preview session)
         mJpegReader = ImageReader.newInstance(
@@ -529,6 +542,8 @@ public class InternalCameraHelper {
             final CaptureRequest.Builder previewBuilder =
                     mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             previewBuilder.addTarget(mPreviewSurface);
+            if (mEncoderSurface != null)
+                previewBuilder.addTarget(mEncoderSurface);
             if (mNdiYuvReader != null)
                 previewBuilder.addTarget(mNdiYuvReader.getSurface());
 
@@ -637,6 +652,9 @@ public class InternalCameraHelper {
             CaptureRequest.Builder builder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             if (mPreviewSurface != null) {
                 builder.addTarget(mPreviewSurface);
+            }
+            if (mEncoderSurface != null) {
+                builder.addTarget(mEncoderSurface);
             }
             if (mNdiYuvReader != null) {
                 builder.addTarget(mNdiYuvReader.getSurface());

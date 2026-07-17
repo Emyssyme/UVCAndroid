@@ -244,8 +244,9 @@ public class MainActivity extends AppCompatActivity {
     private long mLastTcpUdpEnqueueTimeNs = 0;
     private long mNextTcpUdpEnqueueTimeNs = 0;
     private long mLastTcpFlushTimeNs = 0;
-    private static final long TCP_FLUSH_INTERVAL_NS = 8_000_000L;
+    private static final long TCP_FLUSH_INTERVAL_NS = 0L; /* immediate flush — no batching */
     private static final long TCP_DISCOVERY_INTERVAL_MS = 1000L;
+    private static final int LOW_LATENCY_TCP_SEND_BUFFER_BYTES = 64 * 1024;
     private final java.util.concurrent.atomic.AtomicLong mTcpFramesCaptured = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong mTcpFramesDropped = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong mTcpFramesEncoded = new java.util.concurrent.atomic.AtomicLong();
@@ -3679,7 +3680,7 @@ public class MainActivity extends AppCompatActivity {
             // Open UDP socket for SRT-lite (caller-mode, sends directly to OBS listener)
             try {
                 mSrtSocket = new java.net.DatagramSocket();
-                mSrtSocket.setSendBufferSize(1024 * 1024);
+                mSrtSocket.setSendBufferSize(LOW_LATENCY_TCP_SEND_BUFFER_BYTES);
                 mSrtSocket.setBroadcast(true); // needed when destination is a broadcast address
                 // Do NOT connect — destination may change when tally listener learns OBS IP.
                 Log.i(TAG, "SRT: socket ready, sending to " + mSrtRemoteHost + ":" + mSrtRemotePort);
@@ -3992,6 +3993,10 @@ public class MainActivity extends AppCompatActivity {
             // Longer I-frame interval → fewer expensive keyframes → smoother TCP delivery
             fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, is4K ? 5 : 2);
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                fmt.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain);
+                int level = is4K ? MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel51
+                        : MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel4;
+                fmt.setInteger(MediaFormat.KEY_LEVEL, level);
                 // CBR for predictable TCP frame sizes (reduces buffering jitter)
                 fmt.setInteger(MediaFormat.KEY_BITRATE_MODE,
                         MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
@@ -4043,17 +4048,17 @@ public class MainActivity extends AppCompatActivity {
         if (enc == null) return;
         long encodeStartNs = System.nanoTime();
 
-        // Feed NV12 frame directly into encoder input buffer — avoids intermediate byte[] copy
-        int yuvSize = frame.width * frame.height * 3 / 2;
-        int actualYuvSize = Math.min(yuvSize, frame.frame.remaining());
-
         // Phase 1 — drain any already-ready output BEFORE requesting an input buffer.
         // This prevents a deadlock: encoder holds all input slots until its output is consumed.
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         drainEncoderOutput(enc, info, 0);
 
-        // Phase 2 — submit the new frame (short timeout: skip rather than block the pipeline)
-        int inputIndex = enc.dequeueInputBuffer(15_000 /* µs */);
+        // Phase 2 — byte-buffer path: copy NV12 into encoder input with zero timeout.
+        int yuvSize = frame.width * frame.height * 3 / 2;
+        int actualYuvSize = Math.min(yuvSize, frame.frame.remaining());
+
+        // Submit the new frame immediately; drop if encoder is full (zero timeout).
+        int inputIndex = enc.dequeueInputBuffer(0);
         int enqueuedSize = 0;
         if (inputIndex >= 0) {
             java.nio.ByteBuffer inputBuf = enc.getInputBuffer(inputIndex);
@@ -4072,8 +4077,8 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        // Phase 3 — drain output again, short wait to avoid blocking the forwarding loop
-        drainEncoderOutput(enc, info, 10_000);
+        // Phase 3 — drain output without blocking the pipeline
+        drainEncoderOutput(enc, info, 0);
         mTcpEncodeTimeNsSum.addAndGet(System.nanoTime() - encodeStartNs);
         mTcpEncodeSamples.incrementAndGet();
     }
@@ -4138,7 +4143,8 @@ public class MainActivity extends AppCompatActivity {
      */
     private void sendH264Packet(long pts, byte[] data, int offset, int length) throws IOException {
         OutputStream out = mH264OutputStream;
-        if (out == null) return;
+        if (out == null || data == null || length <= 0) return;
+
         byte[] hdr = mH264FrameHeaderBuf;
         // PTS — 8 bytes big-endian
         hdr[0] = (byte) (pts >>> 56);
@@ -4154,8 +4160,10 @@ public class MainActivity extends AppCompatActivity {
         hdr[9]  = (byte) (length >>> 16);
         hdr[10] = (byte) (length >>>  8);
         hdr[11] = (byte) (length);
+
         out.write(hdr, 0, 12);
         out.write(data, offset, length);
+
         if (pts != H264_NO_PTS) {
             mTcpPacketsSent.incrementAndGet();
         }
@@ -4693,10 +4701,10 @@ public class MainActivity extends AppCompatActivity {
                         client = mH265ServerSocket.accept();
                         client.setTcpNoDelay(true);
                         try { client.setKeepAlive(true); } catch (Exception ignored) {}
-                        try { client.setSendBufferSize(1024 * 1024); } catch (Exception ignored) {}
+                        try { client.setSendBufferSize(LOW_LATENCY_TCP_SEND_BUFFER_BYTES); } catch (Exception ignored) {}
                         try { client.setTrafficClass(0x10); } catch (Exception ignored) {}
                         mH264OutputStream = new BufferedOutputStream(
-                                client.getOutputStream(), 256 * 1024);
+                                client.getOutputStream(), LOW_LATENCY_TCP_SEND_BUFFER_BYTES / 4);
                         mLastTcpFlushTimeNs = 0;
                         Log.i(TAG, "OBS connected from " + client.getInetAddress().getHostAddress());
                     } catch (java.net.SocketTimeoutException ignored) {
