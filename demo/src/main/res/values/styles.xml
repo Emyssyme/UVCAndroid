@@ -25,7 +25,7 @@
         <item name="android:layout_height">wrap_content</item>
         <item name="android:layout_marginTop">10dp</item>
         <item name="android:textSize">13sp</item>
-        <item name="android:textColor">@color/gray_600</item>
+        <item name="android:textColor">?android:attr/textColorSecondary</item>
     </style>
 
     <style name="FragmentVideoFormatOptionSpinner" parent="">
@@ -37,7 +37,7 @@
         <item name="android:layout_width">100dp</item>
         <item name="android:layout_height">wrap_content</item>
         <item name="android:layout_gravity">center_vertical</item>
-        <item name="android:textColor">@color/gray_400</item>
+        <item name="android:textColor">?android:attr/textColorPrimary</item>
     </style>
 
     <style name="FragmentCameraControlsSeekBar" parent="">
@@ -58,7 +58,7 @@
         <item name="android:layout_height">wrap_content</item>
         <item name="android:scaleX">0.7</item>
         <item name="android:scaleY">0.7</item>
-        <item name="android:textColor">@color/gray_400</item>
+        <item name="android:textColor">?android:attr/textColorSecondary</item>
     </style>
 
     <style name="FragmentCameraControlsRadioButton" parent="">

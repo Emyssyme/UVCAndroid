@@ -67,6 +67,7 @@ import android.view.ViewParent;
 import android.widget.Toast;
 import android.graphics.Color;
 import android.os.Handler;
+import android.util.TypedValue;
 
 import java.io.BufferedOutputStream;
 import java.io.IOException;
@@ -1574,7 +1575,7 @@ public class MainActivity extends AppCompatActivity {
 
             if (mIsCameraConnected) {
                 mBinding.viewMainPreview.setVisibility(View.VISIBLE);
-                mBinding.tvConnectUSBCameraTip.setVisibility(View.GONE);
+                mBinding.emptyStateContainer.setVisibility(View.GONE);
 
                 mBinding.fabPicture.setVisibility(View.VISIBLE);
                 mBinding.fabVideo.setVisibility(View.VISIBLE);
@@ -1589,7 +1590,7 @@ public class MainActivity extends AppCompatActivity {
 
             } else {
                 mBinding.viewMainPreview.setVisibility(View.GONE);
-                mBinding.tvConnectUSBCameraTip.setVisibility(View.VISIBLE);
+                mBinding.emptyStateContainer.setVisibility(View.VISIBLE);
 
                 mBinding.fabPicture.setVisibility(View.GONE);
                 mBinding.fabVideo.setVisibility(View.GONE);
@@ -1830,8 +1831,7 @@ public class MainActivity extends AppCompatActivity {
         mBinding.btnInternalAwbToggle.setText(awbAuto ? getString(R.string.internal_camera_awb_auto) : getString(R.string.internal_camera_awb_off));
         mBinding.btnQuickAwb.setText(awbAuto ? "AWB Auto" : "AWB Manual");
         mBinding.btnBottomWhiteBalance.setText("WB");
-        mBinding.tvInternalKelvinValue.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
-        mBinding.seekbarInternalKelvin.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
+        mBinding.rowInternalKelvin.setVisibility(awbAuto ? View.GONE : View.VISIBLE);
         if (!awbAuto) {
             int kelvin = mInternalCameraHelper.getAwbTemperatureKelvin();
             mBinding.tvInternalKelvinValue.setText("Kelvin: " + kelvin + "K");
@@ -1879,14 +1879,32 @@ public class MainActivity extends AppCompatActivity {
         mBinding.btnBottomFocusLock.setSelected(mInternalFocusLock);
         mBinding.btnBottomExposure.setEnabled(!mInternalExposureLock);
         mBinding.btnBottomAfMode.setEnabled(!mInternalAfLock);
-        int activeColor = Color.parseColor("#FFD54F");
-        int inactiveColor = Color.parseColor("#FFFFFF");
-        int activeBackground = Color.parseColor("#88FFC107");
-        int inactiveBackground = Color.parseColor("#55000000");
+
+        TypedValue typedValue = new TypedValue();
+        getTheme().resolveAttribute(com.google.android.material.R.attr.colorPrimary, typedValue, true);
+        int activeColor = typedValue.data;
+        getTheme().resolveAttribute(com.google.android.material.R.attr.colorOnSurface, typedValue, true);
+        int inactiveColor = typedValue.data;
+
+        // Active background: use primary color with 25% alpha
+        int activeBackground = (activeColor & 0x00FFFFFF) | 0x40000000;
+        int inactiveBackground = Color.TRANSPARENT;
+
         mBinding.btnBottomExposureLock.setTextColor(mInternalExposureLock ? activeColor : inactiveColor);
         mBinding.btnBottomFocusLock.setTextColor(mInternalFocusLock ? activeColor : inactiveColor);
-        mBinding.btnBottomExposureLock.setBackgroundTintList(android.content.res.ColorStateList.valueOf(mInternalExposureLock ? activeBackground : inactiveBackground));
-        mBinding.btnBottomFocusLock.setBackgroundTintList(android.content.res.ColorStateList.valueOf(mInternalFocusLock ? activeBackground : inactiveBackground));
+
+        mBinding.btnBottomExposureLock.setBackgroundTintList(ColorStateList.valueOf(mInternalExposureLock ? activeBackground : inactiveBackground));
+        mBinding.btnBottomFocusLock.setBackgroundTintList(ColorStateList.valueOf(mInternalFocusLock ? activeBackground : inactiveBackground));
+
+        if (mBinding.btnBottomExposureLock instanceof com.google.android.material.button.MaterialButton) {
+            ((com.google.android.material.button.MaterialButton)mBinding.btnBottomExposureLock).setStrokeColor(
+                    ColorStateList.valueOf(mInternalExposureLock ? activeColor : inactiveColor));
+        }
+        if (mBinding.btnBottomFocusLock instanceof com.google.android.material.button.MaterialButton) {
+            ((com.google.android.material.button.MaterialButton)mBinding.btnBottomFocusLock).setStrokeColor(
+                    ColorStateList.valueOf(mInternalFocusLock ? activeColor : inactiveColor));
+        }
+        
         maybeSendTcpControlStateToObs();
     }
 
@@ -1912,7 +1930,9 @@ public class MainActivity extends AppCompatActivity {
 
         TextView label = new TextView(this);
         label.setText(getString(R.string.internal_camera_exposure_label, current));
-        label.setTextColor(getResources().getColor(R.color.white));
+        TypedValue tv = new TypedValue();
+        getTheme().resolveAttribute(android.R.attr.textColorPrimary, tv, true);
+        label.setTextColor(tv.data);
         label.setLayoutParams(new android.widget.LinearLayout.LayoutParams(android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.WRAP_CONTENT));
         layout.addView(label);
 
@@ -2053,7 +2073,9 @@ public class MainActivity extends AppCompatActivity {
 
         TextView label = new TextView(this);
         label.setText("Kelvin: " + mInternalWbKelvin + "K");
-        label.setTextColor(getResources().getColor(R.color.white));
+        TypedValue tv = new TypedValue();
+        getTheme().resolveAttribute(android.R.attr.textColorPrimary, tv, true);
+        label.setTextColor(tv.data);
         layout.addView(label);
 
         SeekBar seekBar = new SeekBar(this);

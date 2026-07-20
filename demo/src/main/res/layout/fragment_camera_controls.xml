@@ -7,7 +7,8 @@
     android:layout_marginTop="60dp"
     android:layout_marginRight="10dp"
     android:layout_marginBottom="60dp"
-    android:background="#77000000">
+    android:background="?attr/colorSurface"
+    android:alpha="0.95">
 
     <ScrollView
         android:id="@+id/svCameraControlsContent"
