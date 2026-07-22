@@ -14,6 +14,10 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- allow mediaPlayback-type FGS without runtime approval -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- satisfies the hardware permission requirement for connectedDevice FGS type -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <!-- keep CPU awake when screen is off -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- optional if you want to ask users to disable battery optimizations -->
@@ -55,7 +59,7 @@
         <service
             android:name="com.herohan.uvcapp.CameraKeepAliveService"
             android:exported="false"
-            android:foregroundServiceType="mediaPlayback" />
+            android:foregroundServiceType="mediaPlayback|camera|connectedDevice" />
     </application>
 
 </manifest>

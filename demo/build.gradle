@@ -4,12 +4,12 @@ plugins {
 
 android {
     namespace 'com.herohan.uvcdemo'
-    compileSdkVersion 34
+    compileSdkVersion versionCompiler
 
     defaultConfig {
         applicationId "com.herohan.uvcdemo"
-        minSdkVersion 21
-        targetSdkVersion 34
+        minSdkVersion versionMin
+        targetSdkVersion versionTarget
         versionCode 2
         versionName "1.0.1"
 

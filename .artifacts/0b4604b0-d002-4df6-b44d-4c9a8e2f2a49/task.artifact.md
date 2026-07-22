@@ -1,0 +1,12 @@
+- `[ ]` Add RootEncoder dependency to `app/build.gradle`
+- `[ ]` Update `AndroidManifest.xml` foreground service types
+- `[ ]` Add RTMP strings to `strings.xml`
+- `[/]` Update `MainActivity.java`
+    - `[ ]` Add `RTMP` to `StreamProtocol` enum
+    - `[ ]` Add RTMP preference keys and constants
+    - `[ ]` Implement RTMP lifecycle methods (`startRtmp`, `stopRtmp`, `setupRtmp`)
+    - `[ ]` Integrate RTMP into `MultiFrameCallback`
+    - `[ ]` Update stream destination dialog to handle RTMP URL
+    - `[ ]` Update protocol switching logic in `onOptionsItemSelected`
+    - `[ ]` Update `updateStreamStatus` for RTMP telemetry
+- `[ ]` Verify build and functionality

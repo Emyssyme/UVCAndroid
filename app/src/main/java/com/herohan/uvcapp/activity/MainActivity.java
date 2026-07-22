@@ -19,6 +19,7 @@ import android.view.MenuItem;
 import android.view.Surface;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import android.util.Range;
@@ -92,6 +93,13 @@ import java.util.TimerTask;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
+import com.pedro.library.rtmp.RtmpStream;
+import com.pedro.common.ConnectChecker;
+import com.pedro.encoder.input.sources.video.BufferVideoSource;
+import com.pedro.encoder.input.sources.audio.MicrophoneSource;
+import com.pedro.encoder.input.sources.audio.NoAudioSource;
+import com.pedro.encoder.input.sources.video.NoVideoSource;
+
 public class MainActivity extends AppCompatActivity {
 
     private static final String TAG = MainActivity.class.getSimpleName();
@@ -151,13 +159,16 @@ public class MainActivity extends AppCompatActivity {
     private boolean mIsCameraConnected = false;
     private boolean mPreviewFillEnabled = false;
 
-    private enum StreamProtocol { TCP_UDP, SRT }
+    private enum StreamProtocol { TCP_UDP, SRT, RTMP }
     private StreamProtocol mStreamProtocol = StreamProtocol.SRT;
     private static final String PREF_STREAM_PROTOCOL = "pref_stream_protocol";
     private static final String PREF_STREAM_HOST = "pref_stream_host";
     private static final String PREF_STREAM_PORT = "pref_stream_port";
+    private static final String PREF_RTMP_URL = "pref_rtmp_url";
+    private static final String PREF_RTMP_KEY = "pref_rtmp_key";
     private static final String PREF_VIDEO_TARGET_FPS = "pref_video_target_fps";
     private static final String PREF_VIDEO_QUALITY = "pref_video_quality";
+    private static final String PREF_VIDEO_BITRATE = "pref_video_bitrate";
     private static final int DEFAULT_STREAM_PORT = 5600;
     private static final int DISCOVERY_PORT = 8866;
     private static final int TCP_TALLY_PORT = 8867;
@@ -255,6 +266,18 @@ public class MainActivity extends AppCompatActivity {
     private final java.util.concurrent.atomic.AtomicLong mSrtFramesDropped = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong mSrtFramesEncoded = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong mSrtPacketsSent = new java.util.concurrent.atomic.AtomicLong();
+
+    // RTMP streaming
+    private RtmpStream mRtmpStream;
+    private String mRtmpUrl;
+    private String mRtmpKey;
+    private volatile boolean mRtmpWorkerRunning = false;
+    private volatile boolean mRtmpConnecting = false; // true between startStream() and onConnectionSuccess/Failed
+    private final java.util.concurrent.atomic.AtomicLong mRtmpFramesCaptured = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mRtmpFramesDropped = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mRtmpFramesEncoded = new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong mRtmpPacketsSent = new java.util.concurrent.atomic.AtomicLong();
+    private Thread mRtmpWorkerThread;
 
     private Thread mTcpDiscoveryThread;
     private volatile boolean mTcpDiscoveryRunning = false;
@@ -356,6 +379,8 @@ public class MainActivity extends AppCompatActivity {
         mSrtPort = getSavedSrtPort();
         mVideoTargetFps = getSavedVideoTargetFps();
         mVideoQuality = getSavedVideoQuality();
+        mRtmpUrl = getSavedRtmpUrl();
+        mRtmpKey = getSavedRtmpKey();
         mDeviceIp = getLocalIpAddress();
         updateStreamStatus();
     }
@@ -485,67 +510,7 @@ public class MainActivity extends AppCompatActivity {
                             : getString(R.string.action_preview_mode_fit),
                     Toast.LENGTH_SHORT).show();
         } else if (id == R.id.action_stream_protocol) {
-            // Cycle: TCP_UDP → SRT → TCP_UDP
-            final StreamProtocol nextProtocol;
-            if (mStreamProtocol == StreamProtocol.TCP_UDP) {
-                nextProtocol = StreamProtocol.SRT;
-            } else {
-                nextProtocol = StreamProtocol.TCP_UDP;
-            }
-            if (!hasCustomTransportDestination()) {
-                showSetStreamDestinationDialog();
-                return true;
-            }
-            setSavedStreamProtocol(nextProtocol);
-            invalidateOptionsMenu();
-            if (mIsCameraConnected) {
-                if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
-                    final Size size = mCameraHelper.getPreviewSize();
-                    if (size != null) {
-                        cleanupStreaming();
-                        if (nextProtocol == StreamProtocol.TCP_UDP) {
-                            setupTcpUdpForUsbCamera(mUsbDevice, size);
-                            mHandler.post(mTallyPoller);
-                        } else {
-                            // SRT: video over SRT, tally/control stay on TCP
-                            setupSrtForUsbCamera(mUsbDevice, size);
-                            // keep TCP tally/control alive
-                            startTcpTallyListenerThread();
-                            startTcpDiscoveryBeaconThread();
-                            mHandler.post(mTallyPoller);
-                        }
-                    }
-                } else if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
-                    cleanupStreaming();
-                    if (nextProtocol == StreamProtocol.TCP_UDP) {
-                        setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
-                        mHandler.post(mTallyPoller);
-                    } else {
-                        // SRT: video over SRT, tally/control stay on TCP
-                        setupSrtForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
-                        startTcpTallyListenerThread();
-                        startTcpDiscoveryBeaconThread();
-                        mHandler.post(mTallyPoller);
-                    }
-                }
-                if (mCameraHelper != null && mMultiCallback != null) {
-                    try {
-                        mCameraHelper.setFrameCallback(mMultiCallback, UVCCamera.PIXEL_FORMAT_NV12);
-                    } catch (Exception e) {
-                        Log.e(TAG, "Failed to restore frame callback after protocol switch", e);
-                    }
-                }
-            }
-            final String protocolLabel;
-            switch (nextProtocol) {
-                case TCP_UDP:
-                    protocolLabel = getString(R.string.action_stream_protocol_tcp_udp);
-                    break;
-                default:
-                    protocolLabel = "SRT (video) + TCP (tally)";
-                    break;
-            }
-            Toast.makeText(this, protocolLabel, Toast.LENGTH_SHORT).show();
+            showStreamProtocolDialog();
         } else if (id == R.id.action_set_stream_destination) {
             showSetStreamDestinationDialog();
         } else if (id == R.id.action_use_internal_camera) {
@@ -616,6 +581,9 @@ public class MainActivity extends AppCompatActivity {
             switch (mStreamProtocol) {
                 case TCP_UDP:
                     streamProtocolItem.setTitle(R.string.action_stream_protocol_tcp_udp);
+                    break;
+                case RTMP:
+                    streamProtocolItem.setTitle(R.string.action_stream_protocol_rtmp);
                     break;
                 default:
                     streamProtocolItem.setTitle("SRT (video) + TCP (tally)");
@@ -735,6 +703,8 @@ public class MainActivity extends AppCompatActivity {
             }
             if (mStreamProtocol == StreamProtocol.SRT) {
                 enqueueSrtFrame(frame, mPreviewWidth, mPreviewHeight);
+            } else if (mStreamProtocol == StreamProtocol.RTMP) {
+                // RTMP uses Surface-based streaming, no manual enqueue needed
             } else {
                 enqueueTcpUdpFrame(frame, mPreviewWidth, mPreviewHeight);
             }
@@ -951,11 +921,13 @@ public class MainActivity extends AppCompatActivity {
             if (size != null) {
                 if (mStreamProtocol == StreamProtocol.TCP_UDP) {
                     setupTcpUdpForUsbCamera(device, size);
-                } else {
-                    // SRT: video over SRT, tally/control on TCP
+                } else if (mStreamProtocol == StreamProtocol.SRT) {
+                    // SRT: video over SRT, tally/control on TCP.
+                    // Beacon and tally are started inside startSrtForwardingThread after socket is ready.
                     setupSrtForUsbCamera(device, size);
-                    startTcpTallyListenerThread();
-                    startTcpDiscoveryBeaconThread();
+                    mHandler.post(mTallyPoller);
+                } else if (mStreamProtocol == StreamProtocol.RTMP) {
+                    setupRtmpForUsbCamera(device, size);
                     mHandler.post(mTallyPoller);
                 }
             }
@@ -1177,10 +1149,46 @@ public class MainActivity extends AppCompatActivity {
                 .getInt(PREF_VIDEO_QUALITY, DEFAULT_VIDEO_QUALITY);
     }
 
+    private int getSavedVideoBitrate() {
+        return PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getInt(PREF_VIDEO_BITRATE, 0);
+    }
+
     private int getSavedSrtPort() {
         return PreferenceManager
                 .getDefaultSharedPreferences(this)
                 .getInt(PREF_SRT_PORT, SRT_DEFAULT_PORT);
+    }
+
+    private String getSavedRtmpUrl() {
+        return PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getString(PREF_RTMP_URL, "");
+    }
+
+    private void setSavedRtmpUrl(String url) {
+        PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .edit()
+                .putString(PREF_RTMP_URL, url)
+                .apply();
+        mRtmpUrl = url;
+    }
+
+    private String getSavedRtmpKey() {
+        return PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getString(PREF_RTMP_KEY, "");
+    }
+
+    private void setSavedRtmpKey(String key) {
+        PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .edit()
+                .putString(PREF_RTMP_KEY, key)
+                .apply();
+        mRtmpKey = key;
     }
 
     private void setSavedVideoTargetFps(int fps) {
@@ -1200,6 +1208,14 @@ public class MainActivity extends AppCompatActivity {
                 .putInt(PREF_VIDEO_QUALITY, quality)
                 .apply();
         mVideoQuality = quality;
+    }
+
+    private void setSavedVideoBitrate(int bitrateKbps) {
+        PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .edit()
+                .putInt(PREF_VIDEO_BITRATE, bitrateKbps)
+                .apply();
     }
 
     private String getLocalIpAddress() {
@@ -1262,7 +1278,102 @@ public class MainActivity extends AppCompatActivity {
         updateStreamStatus();
     }
 
+    private void showStreamProtocolDialog() {
+        final String[] protocols = {
+                getString(R.string.protocol_tcp_udp),
+                getString(R.string.protocol_srt),
+                getString(R.string.protocol_rtmp)
+        };
+        final StreamProtocol[] protocolValues = {
+                StreamProtocol.TCP_UDP,
+                StreamProtocol.SRT,
+                StreamProtocol.RTMP
+        };
+
+        int checkedItem = 0;
+        for (int i = 0; i < protocolValues.length; i++) {
+            if (mStreamProtocol == protocolValues[i]) {
+                checkedItem = i;
+                break;
+            }
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.dialog_select_stream_protocol_title)
+                .setSingleChoiceItems(protocols, checkedItem, (dialog, which) -> {
+                    StreamProtocol selected = protocolValues[which];
+                    dialog.dismiss();
+
+                    if (selected == mStreamProtocol) return;
+
+                    // If RTMP selected and no URL, force destination dialog
+                    if (selected == StreamProtocol.RTMP && TextUtils.isEmpty(getSavedRtmpUrl())) {
+                        setSavedStreamProtocol(selected);
+                        showSetStreamDestinationDialog();
+                        return;
+                    }
+                    // If others selected and no port, force destination dialog
+                    if (selected != StreamProtocol.RTMP && !hasCustomTransportDestination()) {
+                        setSavedStreamProtocol(selected);
+                        showSetStreamDestinationDialog();
+                        return;
+                    }
+
+                    setSavedStreamProtocol(selected);
+                    invalidateOptionsMenu();
+                    updateStreamStatus();
+                    restartStreaming();
+
+                    Toast.makeText(this, protocols[which], Toast.LENGTH_SHORT).show();
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void restartStreaming() {
+        if (!mIsCameraConnected) return;
+
+        if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
+            final Size size = mCameraHelper.getPreviewSize();
+            if (size != null) {
+                cleanupStreaming();
+                if (mStreamProtocol == StreamProtocol.TCP_UDP) {
+                    setupTcpUdpForUsbCamera(mUsbDevice, size);
+                } else if (mStreamProtocol == StreamProtocol.SRT) {
+                    // Beacon and tally are started inside startSrtForwardingThread after socket is ready.
+                    setupSrtForUsbCamera(mUsbDevice, size);
+                } else if (mStreamProtocol == StreamProtocol.RTMP) {
+                    setupRtmpForUsbCamera(mUsbDevice, size);
+                }
+                mHandler.post(mTallyPoller);
+            }
+        } else if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
+            cleanupStreaming();
+            if (mStreamProtocol == StreamProtocol.TCP_UDP) {
+                setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+            } else if (mStreamProtocol == StreamProtocol.SRT) {
+                // Beacon and tally are started inside startSrtForwardingThread after socket is ready.
+                setupSrtForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+            } else if (mStreamProtocol == StreamProtocol.RTMP) {
+                setupRtmpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+            }
+            mHandler.post(mTallyPoller);
+        }
+
+        // Re-register frame callback
+        if (mCameraHelper != null && mMultiCallback != null) {
+            try {
+                mCameraHelper.setFrameCallback(mMultiCallback, UVCCamera.PIXEL_FORMAT_NV12);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to restore frame callback after protocol restart", e);
+            }
+        }
+    }
+
     private boolean hasCustomTransportDestination() {
+        if (mStreamProtocol == StreamProtocol.RTMP) {
+            return !TextUtils.isEmpty(getSavedRtmpUrl());
+        }
         return mStreamPort > 0;
     }
 
@@ -1272,20 +1383,59 @@ public class MainActivity extends AppCompatActivity {
         int padding = (int) (getResources().getDisplayMetrics().density * 16);
         container.setPadding(padding, padding, padding, padding);
 
+        final boolean isRtmp = (mStreamProtocol == StreamProtocol.RTMP);
+
+        // --- Guide Section ---
+        final TextView guideText = new TextView(this);
+        guideText.setPadding(0, 0, 0, padding / 2);
+        if (isRtmp) {
+            guideText.setText(R.string.stream_guide_rtmp);
+        } else {
+            guideText.setText(R.string.stream_guide_network);
+        }
+        container.addView(guideText);
+
+        // --- IP Info Section (for TCP/SRT) ---
+        if (!isRtmp) {
+            final TextView ipInfo = new TextView(this);
+            ipInfo.setText(getString(R.string.stream_guide_network_obs_info,
+                    mDeviceIp != null ? mDeviceIp : "127.0.0.1", mStreamPort));
+            ipInfo.setTypeface(null, android.graphics.Typeface.BOLD);
+            ipInfo.setPadding(0, 0, 0, padding);
+            container.addView(ipInfo);
+        }
+
+        // --- RTMP URL and Key Input ---
+        final EditText rtmpUrlInput = new EditText(this);
+        final EditText rtmpKeyInput = new EditText(this);
+        if (isRtmp) {
+            rtmpUrlInput.setHint(getString(R.string.stream_destination_rtmp_url_hint));
+            rtmpUrlInput.setText(getSavedRtmpUrl());
+            container.addView(rtmpUrlInput);
+
+            rtmpKeyInput.setHint(getString(R.string.stream_destination_rtmp_key_hint));
+            rtmpKeyInput.setText(getSavedRtmpKey());
+            container.addView(rtmpKeyInput);
+        }
+
+        // --- Host/Port Section (for TCP/SRT) ---
         final EditText hostInput = new EditText(this);
-        hostInput.setHint(getString(R.string.stream_destination_host_hint));
-        hostInput.setText(mDeviceIp != null ? mDeviceIp : "");
-        hostInput.setEnabled(false);
-        hostInput.setFocusable(false);
-        hostInput.setFocusableInTouchMode(false);
-        container.addView(hostInput);
-
         final EditText portInput = new EditText(this);
-        portInput.setHint(getString(R.string.stream_destination_port_hint));
-        portInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
-        portInput.setText(String.valueOf(mStreamPort));
-        container.addView(portInput);
+        if (!isRtmp) {
+            hostInput.setHint(getString(R.string.stream_destination_host_hint));
+            hostInput.setText(mDeviceIp != null ? mDeviceIp : "");
+            hostInput.setEnabled(false);
+            hostInput.setFocusable(false);
+            hostInput.setFocusableInTouchMode(false);
+            container.addView(hostInput);
 
+            portInput.setHint(getString(R.string.stream_destination_port_hint));
+            portInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+            portInput.setText(String.valueOf(mStreamPort));
+            container.addView(portInput);
+        }
+
+        // --- Common settings ---
         final EditText fpsInput = new EditText(this);
         fpsInput.setHint("Target FPS (24-60)");
         fpsInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
@@ -1298,17 +1448,31 @@ public class MainActivity extends AppCompatActivity {
         qualityInput.setText(String.valueOf(mVideoQuality));
         container.addView(qualityInput);
 
+        final EditText bitrateInput = new EditText(this);
+        bitrateInput.setHint(getString(R.string.stream_destination_bitrate_hint));
+        bitrateInput.setInputType(android.text.InputType.TYPE_CLASS_NUMBER);
+        bitrateInput.setText(String.valueOf(getSavedVideoBitrate()));
+        container.addView(bitrateInput);
+
+        final ScrollView scrollView = new ScrollView(this);
+        scrollView.addView(container);
+
         new AlertDialog.Builder(this)
-                .setTitle(R.string.stream_destination_title)
-                .setView(container)
+                .setTitle(isRtmp ? R.string.protocol_rtmp : R.string.stream_destination_title)
+                .setView(scrollView)
                 .setPositiveButton(R.string.stream_destination_set, (dialog, which) -> {
                     String host = mDeviceIp != null ? mDeviceIp : "";
                     int port = DEFAULT_STREAM_PORT;
                     int targetFps = DEFAULT_VIDEO_TARGET_FPS;
                     int quality = DEFAULT_VIDEO_QUALITY;
-                    try {
-                        port = Integer.parseInt(portInput.getText().toString().trim());
-                    } catch (NumberFormatException ignored) {
+                    int bitrateKbps = 0;
+                    String rtmpUrl = rtmpUrlInput.getText().toString().trim();
+                    String rtmpKey = rtmpKeyInput.getText().toString().trim();
+                    if (!isRtmp) {
+                        try {
+                            port = Integer.parseInt(portInput.getText().toString().trim());
+                        } catch (NumberFormatException ignored) {
+                        }
                     }
                     try {
                         targetFps = Integer.parseInt(fpsInput.getText().toString().trim());
@@ -1318,44 +1482,36 @@ public class MainActivity extends AppCompatActivity {
                         quality = Integer.parseInt(qualityInput.getText().toString().trim());
                     } catch (NumberFormatException ignored) {
                     }
+                    try {
+                        bitrateKbps = Integer.parseInt(bitrateInput.getText().toString().trim());
+                    } catch (NumberFormatException ignored) {
+                    }
                     targetFps = Math.max(24, Math.min(60, targetFps));
                     quality = Math.max(10, Math.min(100, quality));
+                    bitrateKbps = Math.max(0, bitrateKbps);
 
-                    if (TextUtils.isEmpty(host) || port <= 0 || port > 65535) {
+                    if (!isRtmp && (TextUtils.isEmpty(host) || port <= 0 || port > 65535)) {
                         Toast.makeText(this, R.string.stream_destination_error, Toast.LENGTH_SHORT).show();
                         return;
                     }
+                    if (isRtmp && TextUtils.isEmpty(rtmpUrl)) {
+                        Toast.makeText(this, "RTMP URL is required", Toast.LENGTH_SHORT).show();
+                        return;
+                    }
+
                     setSavedStreamDestination(host, port);
                     setSavedVideoTargetFps(targetFps);
                     setSavedVideoQuality(quality);
-                    Toast.makeText(this, String.format("%s:%d fps=%d quality=%d", host, port, targetFps, quality), Toast.LENGTH_SHORT).show();
+                    setSavedVideoBitrate(bitrateKbps);
+                    setSavedRtmpUrl(rtmpUrl);
+                    setSavedRtmpKey(rtmpKey);
+
+                    String summary = isRtmp ? (TextUtils.isEmpty(rtmpKey) ? rtmpUrl : rtmpUrl + "/****") : String.format("%s:%d", host, port);
+                    Toast.makeText(this, String.format("%s fps=%d quality=%d bitrate=%d", summary, targetFps, quality, bitrateKbps), Toast.LENGTH_SHORT).show();
+                    
                     invalidateOptionsMenu();
-                    if ((mStreamProtocol == StreamProtocol.TCP_UDP || mStreamProtocol == StreamProtocol.SRT)
-                            && mIsCameraConnected) {
-                        cleanupStreaming();
-                        if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
-                            Size size = mCameraHelper.getPreviewSize();
-                            if (size != null) {
-                                if (mStreamProtocol == StreamProtocol.SRT) {
-                                    setupSrtForUsbCamera(mUsbDevice, size);
-                                    startTcpTallyListenerThread();
-                                    startTcpDiscoveryBeaconThread();
-                                    mHandler.post(mTallyPoller);
-                                } else {
-                                    setupTcpUdpForUsbCamera(mUsbDevice, size);
-                                }
-                            }
-                        } else if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
-                            if (mStreamProtocol == StreamProtocol.SRT) {
-                                setupSrtForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
-                                startTcpTallyListenerThread();
-                                startTcpDiscoveryBeaconThread();
-                                mHandler.post(mTallyPoller);
-                            } else {
-                                setupTcpUdpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
-                            }
-                        }
-                    }
+                    updateStreamStatus();
+                    restartStreaming();
                 })
                 .setNegativeButton(android.R.string.cancel, null)
                 .show();
@@ -1389,6 +1545,17 @@ public class MainActivity extends AppCompatActivity {
         } else if (mStreamProtocol == StreamProtocol.SRT) {
             sb.append("  SRT → ").append(mSrtRemoteHost).append(":").append(mSrtRemotePort);
             mBinding.toolbar.setTitle("UVC Camera · SRT");
+        } else if (mStreamProtocol == StreamProtocol.RTMP) {
+            if (mRtmpConnecting) {
+                sb.append("  ⏳ RTMP connecting...");
+                mBinding.toolbar.setTitle("UVC Camera · RTMP");
+            } else if (mRtmpStream != null && mRtmpStream.isStreaming()) {
+                sb.append("  🔴 RTMP live");
+                mBinding.toolbar.setTitle("UVC Camera · RTMP");
+            } else {
+                sb.append("  RTMP");
+                mBinding.toolbar.setTitle("UVC Camera · RTMP");
+            }
         }
 
         if (mInternalPreviewSize != null) {
@@ -1410,13 +1577,19 @@ public class MainActivity extends AppCompatActivity {
             if (enc > 0 || snt > 0) {
                 sb.append("  ").append(enc).append("/").append(snt);
             }
+        } else if (mStreamProtocol == StreamProtocol.RTMP) {
+            long enc = mRtmpFramesEncoded.get();
+            long snt = mRtmpPacketsSent.get();
+            if (enc > 0 || snt > 0) {
+                sb.append("  ").append(enc).append("/").append(snt);
+            }
         }
 
         mBinding.tvStreamStatus.setText(sb.toString());
     }
 
     private boolean isCustomTransportActive() {
-        return mStreamProtocol == StreamProtocol.TCP_UDP || mStreamProtocol == StreamProtocol.SRT;
+        return mStreamProtocol == StreamProtocol.TCP_UDP || mStreamProtocol == StreamProtocol.SRT || mStreamProtocol == StreamProtocol.RTMP;
     }
 
     private void resetTcpTelemetry() {
@@ -2123,6 +2296,7 @@ public class MainActivity extends AppCompatActivity {
         int parsedResolutionIndex = mapCurrentPreviewToObsResolutionIndex();
         int parsedTargetFps = mVideoTargetFps;
         int parsedQuality = mVideoQuality;
+        int parsedBitrateKbps = getSavedVideoBitrate();
 
         String[] parts = msg.split(";");
         for (String part : parts) {
@@ -2166,6 +2340,11 @@ public class MainActivity extends AppCompatActivity {
                     parsedQuality = Integer.parseInt(part.substring(part.indexOf('=') + 1));
                 } catch (NumberFormatException ignored) {
                 }
+            } else if (part.startsWith("bitrate=")) {
+                try {
+                    parsedBitrateKbps = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                } catch (NumberFormatException ignored) {
+                }
             } else if (part.startsWith("srt_port=")) {
                 try {
                     int p = Integer.parseInt(part.substring(part.indexOf('=') + 1));
@@ -2193,6 +2372,7 @@ public class MainActivity extends AppCompatActivity {
         final int resolutionIndex = parsedResolutionIndex;
         final int targetFps = parsedTargetFps;
         final int quality = parsedQuality;
+        final int bitrateKbps = parsedBitrateKbps;
 
         runOnUiThread(() -> {
             mInternalExposureLock = exposureLock;
@@ -2288,7 +2468,7 @@ public class MainActivity extends AppCompatActivity {
                 mInternalFocusLock = focusLock;
                 mInternalAfLock = afLock;
             }
-            applyRemoteStreamSettings(resolutionIndex, targetFps, quality);
+            applyRemoteStreamSettings(resolutionIndex, targetFps, quality, bitrateKbps);
         });
     }
 
@@ -2506,6 +2686,13 @@ public class MainActivity extends AppCompatActivity {
             if (!mIsCameraConnected || mInternalCameraHelper == null
                     || mInternalCameraHelper.isRecording()) return;
 
+            int manualBitrateKbps = getSavedVideoBitrate();
+            if (manualBitrateKbps > 0) {
+                mInternalCameraHelper.setVideoBitrate(manualBitrateKbps * 1000);
+            } else {
+                mInternalCameraHelper.setVideoBitrate(10_000_000); // default
+            }
+
             File file = new File(SaveHelper.getSaveVideoPath());
             int displayRotation = getWindowManager().getDefaultDisplay().getRotation();
             mInternalCameraHelper.startRecording(file, displayRotation,
@@ -2547,11 +2734,14 @@ public class MainActivity extends AppCompatActivity {
 
     private void setCustomVideoCaptureConfig() {
         // this config only affects the recorded file; streaming/preview are independent
+        int manualBitrateKbps = getSavedVideoBitrate();
+        int bitrate = manualBitrateKbps > 0 ? manualBitrateKbps * 1000 : 30 * 1024 * 1024;
+
         mCameraHelper.setVideoCaptureConfig(
                 mCameraHelper.getVideoCaptureConfig()
 //                        .setAudioCaptureEnable(false) // disable audio if not needed
                         // bump bitrate up to max allowed by your device/network for best image quality
-                        .setBitRate(30 * 1024 * 1024)   // ~30 Mbps
+                        .setBitRate(bitrate)   // ~30 Mbps or manual
                         .setVideoFrameRate(30)
                         .setIFrameInterval(1));
     }
@@ -2808,20 +2998,26 @@ public class MainActivity extends AppCompatActivity {
         return best;
     }
 
-    private void applyRemoteStreamSettings(int resolutionIndex, int targetFps, int quality) {
+    private void applyRemoteStreamSettings(int resolutionIndex, int targetFps, int quality, int bitrateKbps) {
         int clampedResolutionIndex = clampObsResolutionIndex(resolutionIndex);
         int clampedTargetFps = Math.max(24, Math.min(60, targetFps));
         int clampedQuality = Math.max(10, Math.min(100, quality));
+        int clampedBitrateKbps = Math.max(0, bitrateKbps);
         Log.i(TAG, "Applying OBS stream settings: resolution_index=" + clampedResolutionIndex
-            + " fps=" + clampedTargetFps + " quality=" + clampedQuality);
+            + " fps=" + clampedTargetFps + " quality=" + clampedQuality + " bitrate=" + clampedBitrateKbps);
 
         boolean fpsChanged = clampedTargetFps != mVideoTargetFps;
         boolean qualityChanged = clampedQuality != mVideoQuality;
+        boolean bitrateChanged = clampedBitrateKbps != getSavedVideoBitrate();
+
         if (fpsChanged) {
             setSavedVideoTargetFps(clampedTargetFps);
         }
         if (qualityChanged) {
             setSavedVideoQuality(clampedQuality);
+        }
+        if (bitrateChanged) {
+            setSavedVideoBitrate(clampedBitrateKbps);
         }
 
         boolean resolutionChanged = false;
@@ -2846,7 +3042,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        if ((fpsChanged || qualityChanged) && mIsCameraConnected) {
+        if ((fpsChanged || qualityChanged || bitrateChanged) && mIsCameraConnected) {
             if (mStreamProtocol == StreamProtocol.TCP_UDP) {
                 cleanupStreaming();
                 if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
@@ -2860,16 +3056,26 @@ public class MainActivity extends AppCompatActivity {
             } else if (mStreamProtocol == StreamProtocol.SRT) {
                 cleanupStreaming();
                 if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
+                    // Beacon and tally are started inside startSrtForwardingThread after socket is ready.
                     setupSrtForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
-                    startTcpTallyListenerThread();
-                    startTcpDiscoveryBeaconThread();
                     mHandler.post(mTallyPoller);
                 } else if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
                     Size usbSize = mCameraHelper.getPreviewSize();
                     if (usbSize != null) {
+                        // Beacon and tally are started inside startSrtForwardingThread after socket is ready.
                         setupSrtForUsbCamera(mUsbDevice, usbSize);
-                        startTcpTallyListenerThread();
-                        startTcpDiscoveryBeaconThread();
+                        mHandler.post(mTallyPoller);
+                    }
+                }
+            } else if (mStreamProtocol == StreamProtocol.RTMP) {
+                cleanupStreaming();
+                if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
+                    setupRtmpForInternalCamera(mCurrentInternalCamera, mInternalPreviewSize);
+                    mHandler.post(mTallyPoller);
+                } else if (mCameraMode == CameraMode.USB && mUsbDevice != null && mCameraHelper != null) {
+                    Size usbSize = mCameraHelper.getPreviewSize();
+                    if (usbSize != null) {
+                        setupRtmpForUsbCamera(mUsbDevice, usbSize);
                         mHandler.post(mTallyPoller);
                     }
                 }
@@ -2936,6 +3142,12 @@ public class MainActivity extends AppCompatActivity {
                 enqueueSrtFrame(nv12Frame, width, height);
             });
             Log.i(TAG, "Internal camera transport set to SRT");
+        } else if (mStreamProtocol == StreamProtocol.RTMP) {
+            // RTMP uses Surface-based streaming via setEncoderSurface — no frame listener needed.
+            // Clearing the listener avoids unnecessary YUV ImageReader overhead and prevents
+            // duplicate session restarts that delay the encoder surface from being attached.
+            mInternalCameraHelper.setFrameListener(null);
+            Log.i(TAG, "Internal camera transport set to RTMP (Surface-based, no frame listener)");
         } else {
             mInternalCameraHelper.setFrameListener((nv12Frame, width, height) -> {
                 if (nv12Frame == null) {
@@ -3085,11 +3297,13 @@ public class MainActivity extends AppCompatActivity {
             if (mStreamProtocol == StreamProtocol.TCP_UDP) {
                 setupTcpUdpForInternalCamera(cameraInfo, previewSize);
                 mHandler.post(mTallyPoller);
-            } else {
-                // SRT: video over SRT, tally/control on TCP
+            } else if (mStreamProtocol == StreamProtocol.SRT) {
+                // SRT: video over SRT, tally/control on TCP.
+                // Beacon and tally are started inside startSrtForwardingThread after socket is ready.
                 setupSrtForInternalCamera(cameraInfo, previewSize);
-                startTcpTallyListenerThread();
-                startTcpDiscoveryBeaconThread();
+                mHandler.post(mTallyPoller);
+            } else if (mStreamProtocol == StreamProtocol.RTMP) {
+                setupRtmpForInternalCamera(cameraInfo, previewSize);
                 mHandler.post(mTallyPoller);
             }
 
@@ -3145,8 +3359,9 @@ public class MainActivity extends AppCompatActivity {
 
     private void setupTcpUdpForUsbCamera(final UsbDevice device, final Size previewSize) {
         Log.i(TAG, "✅ H.265 TCP stream mode selected for USB camera.");
+        stopTcpUdpForwardingThread();
         stopSrtForwardingThread();
-        cleanupStreaming();
+        stopRtmpForwardingThread();
         new Thread(() -> {
             if (!hasCustomTransportDestination()) {
                 runOnUiThread(() -> Toast.makeText(this,
@@ -3179,8 +3394,9 @@ public class MainActivity extends AppCompatActivity {
     private void setupTcpUdpForInternalCamera(final InternalCameraInfo cameraInfo,
                                               final android.util.Size previewSize) {
         Log.i(TAG, "✅ H.265 TCP stream mode selected for internal camera.");
+        stopTcpUdpForwardingThread();
         stopSrtForwardingThread();
-        cleanupStreaming();
+        stopRtmpForwardingThread();
         new Thread(() -> {
             if (!hasCustomTransportDestination()) {
                 runOnUiThread(() -> Toast.makeText(this,
@@ -3198,6 +3414,7 @@ public class MainActivity extends AppCompatActivity {
         Log.i(TAG, "✅ SRT stream mode selected for internal camera (tally/control stay on TCP).");
         stopTcpUdpForwardingThread();
         stopSrtForwardingThread();
+        stopRtmpForwardingThread();
         mSrtRemoteHost = null;
         mSrtRemoteAddr = null;
         mSrtRemotePort = 0;
@@ -3213,6 +3430,42 @@ public class MainActivity extends AppCompatActivity {
         }, "SrtTransportInit").start();
     }
 
+    private void setupRtmpForUsbCamera(final UsbDevice device, final Size previewSize) {
+        Log.i(TAG, "✅ RTMP stream mode selected for USB camera.");
+        stopTcpUdpForwardingThread();
+        stopSrtForwardingThread();
+        stopRtmpForwardingThread();
+        new Thread(() -> {
+            mRtmpUrl = getSavedRtmpUrl();
+            if (TextUtils.isEmpty(mRtmpUrl)) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "RTMP URL not configured — tap the stream protocol button to set it",
+                        Toast.LENGTH_SHORT).show());
+                return;
+            }
+            startRtmpForwardingThread();
+        }, "RtmpTransportInit").start();
+    }
+
+    private void setupRtmpForInternalCamera(final InternalCameraInfo cameraInfo,
+                                            final android.util.Size previewSize) {
+        Log.i(TAG, "✅ RTMP stream mode selected for internal camera.");
+        stopTcpUdpForwardingThread();
+        stopSrtForwardingThread();
+        stopRtmpForwardingThread();
+        new Thread(() -> {
+            mRtmpUrl = getSavedRtmpUrl();
+            if (TextUtils.isEmpty(mRtmpUrl)) {
+                runOnUiThread(() -> Toast.makeText(this,
+                        "RTMP URL not configured — tap the stream protocol button to set it",
+                        Toast.LENGTH_SHORT).show());
+                return;
+            }
+            updateInternalCameraFrameListener();
+            startRtmpForwardingThread();
+        }, "RtmpTransportInit").start();
+    }
+
     /** Tears down streaming — used by both camera paths. */
     private void cleanupStreaming() {
         try {
@@ -3224,6 +3477,7 @@ public class MainActivity extends AppCompatActivity {
             }
             stopTcpUdpForwardingThread();
             stopSrtForwardingThread();
+            stopRtmpForwardingThread();
         } catch (Exception e) {
             Log.e(TAG, "Error stopping streaming", e);
         }
@@ -3283,6 +3537,242 @@ public class MainActivity extends AppCompatActivity {
         runOnUiThread(this::updateStreamStatus);
     }
 
+    private void stopRtmpForwardingThread() {
+        mRtmpWorkerRunning = false;
+        mRtmpConnecting = false;
+        RtmpStream stream = mRtmpStream;
+        // Only null mRtmpStream if it hasn't been replaced by a new stream already.
+        // This prevents a race where the old worker's cleanup nullifies the new stream.
+        if (mRtmpStream == stream) {
+            mRtmpStream = null;
+        }
+        if (stream != null) {
+            try {
+                Surface rtmpSurface = stream.getGlInterface().getSurface();
+                if (mCameraMode == CameraMode.USB && mCameraHelper != null) {
+                    mCameraHelper.removeSurface(rtmpSurface);
+                } else if (mCameraMode == CameraMode.INTERNAL && mInternalCameraHelper != null) {
+                    mInternalCameraHelper.setEncoderSurface(null);
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "Error removing RTMP surface", e);
+            }
+
+            if (stream.isStreaming()) {
+                stream.stopStream();
+            }
+        }
+        if (mRtmpWorkerThread != null) {
+            mRtmpWorkerThread.interrupt();
+            try {
+                mRtmpWorkerThread.join(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            mRtmpWorkerThread = null;
+        }
+        // Clear RTMP queue is not needed anymore
+        runOnUiThread(this::updateStreamStatus);
+    }
+
+    private void startRtmpForwardingThread() {
+        if (mRtmpWorkerRunning) return;
+        mRtmpUrl = getSavedRtmpUrl();
+        mRtmpKey = getSavedRtmpKey();
+        if (TextUtils.isEmpty(mRtmpUrl)) {
+            runOnUiThread(() -> Toast.makeText(this, "RTMP URL not configured", Toast.LENGTH_SHORT).show());
+            return;
+        }
+
+        // YouTube requires an audio track — check microphone permission before starting
+        final boolean hasAudioPermission = androidx.core.content.ContextCompat.checkSelfPermission(
+                this, Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED;
+        if (!hasAudioPermission) {
+            Log.w(TAG, "RTMP: RECORD_AUDIO permission not granted — requesting now");
+            runOnUiThread(() -> {
+                XXPermissions.with(this)
+                        .permission(Manifest.permission.RECORD_AUDIO)
+                        .request((permissions, all) -> {
+                            if (all) {
+                                Log.i(TAG, "RTMP: Audio permission granted, starting stream");
+                                startRtmpForwardingThread();
+                            } else {
+                                Toast.makeText(this,
+                                        "Microphone permission required for YouTube RTMP streaming",
+                                        Toast.LENGTH_LONG).show();
+                            }
+                        });
+            });
+            return;
+        }
+
+        final String fullRtmpUrl;
+        if (!TextUtils.isEmpty(mRtmpKey)) {
+            if (mRtmpUrl.endsWith("/")) {
+                fullRtmpUrl = mRtmpUrl + mRtmpKey;
+            } else {
+                fullRtmpUrl = mRtmpUrl + "/" + mRtmpKey;
+            }
+        } else {
+            fullRtmpUrl = mRtmpUrl;
+        }
+
+        mRtmpFramesCaptured.set(0);
+        mRtmpFramesDropped.set(0);
+        mRtmpFramesEncoded.set(0);
+        mRtmpPacketsSent.set(0);
+
+        mRtmpWorkerRunning = true;
+        mRtmpWorkerThread = new Thread(() -> {
+            Log.i(TAG, "RTMP: Starting stream to " + (fullRtmpUrl.length() > 20 ? fullRtmpUrl.substring(0, 20) + "..." : "URL"));
+            ConnectChecker checker = new ConnectChecker() {
+                @Override public void onConnectionStarted(@NonNull String url) {
+                    Log.i(TAG, "⏳ RTMP Connecting to: " + url);
+                    mRtmpConnecting = true;
+                    runOnUiThread(() -> updateStreamStatus());
+                }
+                @Override public void onConnectionSuccess() {
+                    Log.i(TAG, "✅ RTMP Connected");
+                    mRtmpConnecting = false;
+                    runOnUiThread(() -> updateStreamStatus());
+                }
+                @Override public void onConnectionFailed(@NonNull String reason) {
+                    Log.e(TAG, "❌ RTMP Connection failed: " + reason);
+                    mRtmpConnecting = false;
+                    mRtmpWorkerRunning = false;
+                    runOnUiThread(() -> {
+                        updateStreamStatus();
+                        Toast.makeText(MainActivity.this,
+                                "RTMP: " + reason, Toast.LENGTH_LONG).show();
+                    });
+                }
+                @Override public void onDisconnect() {
+                    Log.i(TAG, "RTMP Disconnected");
+                    mRtmpConnecting = false;
+                    runOnUiThread(() -> updateStreamStatus());
+                }
+                @Override public void onAuthError() {
+                    Log.e(TAG, "RTMP Auth Error");
+                    mRtmpConnecting = false;
+                    runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                            "RTMP: Authentication error", Toast.LENGTH_LONG).show());
+                }
+                @Override public void onAuthSuccess() { Log.i(TAG, "RTMP Auth Success"); }
+                @Override public void onNewBitrate(long bitrate) { Log.d(TAG, "RTMP Bitrate: " + bitrate); }
+            };
+
+            int manualBitrateKbps = getSavedVideoBitrate();
+            int bitrate;
+            if (manualBitrateKbps > 0) {
+                bitrate = manualBitrateKbps * 1000;
+            } else {
+                bitrate = (int) (mPreviewWidth * mPreviewHeight * mVideoTargetFps * 0.1 * (mVideoQuality / 100.0));
+            }
+            MicrophoneSource microphoneSource = new MicrophoneSource();
+            mRtmpStream = new RtmpStream(this, checker, new NoVideoSource(), microphoneSource);
+
+            if (mRtmpStream.prepareVideo(mPreviewWidth, mPreviewHeight, bitrate, mVideoTargetFps) &&
+                mRtmpStream.prepareAudio(44100, true, 128 * 1024)) {
+
+                // Disable pedro library's per-packet "wrote Video/Audio packet" spam
+                mRtmpStream.getStreamClient().setLogs(false);
+
+                // 1. Start stream — this starts the GL thread and makes the encoder surface valid.
+                mRtmpConnecting = true;
+                runOnUiThread(() -> updateStreamStatus());
+
+                // Mute audio initially to wait for video SPS/PPS to be established.
+                // This keeps the audio track present for probing but delays actual audio data.
+                microphoneSource.mute();
+                mRtmpStream.startStream(fullRtmpUrl);
+
+                // 2. Short wait to let the GL thread fully initialize its input surface
+                try { Thread.sleep(200); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+
+                // 3. Now get the live GL surface and attach it to the camera
+                Surface rtmpSurface = mRtmpStream.getGlInterface().getSurface();
+
+                // 4. Attach encoder surface and WAIT for Camera2 session to be reconfigured
+                final java.util.concurrent.CountDownLatch surfaceReadyLatch = new java.util.concurrent.CountDownLatch(1);
+                if (mCameraMode == CameraMode.USB && mCameraHelper != null) {
+                    mCameraHelper.addSurface(rtmpSurface, false);
+                    surfaceReadyLatch.countDown();
+                } else if (mCameraMode == CameraMode.INTERNAL && mInternalCameraHelper != null) {
+                    mInternalCameraHelper.setEncoderSurface(rtmpSurface, surfaceReadyLatch::countDown);
+                } else {
+                    surfaceReadyLatch.countDown();
+                }
+
+                // Wait up to 3 seconds for the Camera2 session to be reconfigured with the encoder surface
+                try {
+                    if (!surfaceReadyLatch.await(3000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                        Log.w(TAG, "RTMP: Timed out waiting for encoder surface to be attached — forcing render anyway");
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+
+                // 5. Force GL engine to render frames at the target FPS — only AFTER the surface is confirmed
+                mRtmpStream.getGlInterface().setForceRender(true, mVideoTargetFps);
+
+                // 6. Wait for video SPS/PPS to be sent, THEN enable audio.
+                //    This ensures datarhei's ffmpeg sees BOTH streams simultaneously when probing.
+                try { Thread.sleep(800); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+                microphoneSource.unMute();
+
+                // 7. Single concise startup log
+                Log.i(TAG, "RTMP live: " + mPreviewWidth + "x" + mPreviewHeight
+                        + "@" + mVideoTargetFps + "fps " + (bitrate / 1000) + "kbps → "
+                        + (fullRtmpUrl.length() > 50 ? fullRtmpUrl.substring(0, 47) + "..." : fullRtmpUrl));
+
+            } else {
+                Log.e(TAG, "Failed to prepare RTMP video or audio");
+                mRtmpWorkerRunning = false;
+                return;
+            }
+
+            long lastLogTime = System.currentTimeMillis();
+            boolean wasInterrupted = false;
+            while (mRtmpWorkerRunning) {
+                try {
+                    Thread.sleep(100);
+                    if (System.currentTimeMillis() - lastLogTime > 5000) {
+                        Log.d(TAG, String.format("RTMP Stats: Streaming=%b",
+                                mRtmpStream != null && mRtmpStream.isStreaming()));
+                        lastLogTime = System.currentTimeMillis();
+                    }
+                } catch (InterruptedException e) {
+                    wasInterrupted = true;
+                    break;
+                }
+            }
+            // Only call stopRtmpForwardingThread if we exited naturally (not interrupted).
+            // If interrupted externally, the caller already handles cleanup via stopRtmpForwardingThread.
+            if (!wasInterrupted) {
+                stopRtmpForwardingThread();
+            } else {
+                // Just clean up our local stream — don't touch globals (they may be a new stream)
+                RtmpStream myStream = mRtmpStream;
+                if (myStream != null) {
+                    // Only null if it hasn't been replaced
+                    if (mRtmpStream == myStream) {
+                        mRtmpStream = null;
+                    }
+                    try {
+                        if (myStream.isStreaming()) {
+                            myStream.stopStream();
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "Error stopping interrupted RTMP stream", e);
+                    }
+                }
+                runOnUiThread(this::updateStreamStatus);
+            }
+        }, "RtmpWorker");
+        mRtmpWorkerThread.start();
+    }
+
     private void startSrtForwardingThread() {
         if (mSrtWorkerRunning) {
             Log.w(TAG, "SRT: thread already running, not starting a new one");
@@ -3335,6 +3825,12 @@ public class MainActivity extends AppCompatActivity {
                 mSrtWorkerRunning = false;
                 return;
             }
+
+            // Start discovery beacon and tally listener only AFTER the socket is ready.
+            startTcpDiscoveryBeaconThread();
+            startTcpTallyListenerThread();
+            mHandler.removeCallbacks(mTallyPoller);
+            mHandler.post(mTallyPoller);
 
             // Main frame draining loop
             boolean srtFirstFrame = true;
@@ -3624,11 +4120,17 @@ public class MainActivity extends AppCompatActivity {
                 targetFps = Math.min(targetFps, 30);
             }
             int quality = Math.max(10, Math.min(100, mVideoQuality));
-            // H.265 needs ~50% the bitrate of H.264; scale but cap aggressively for TCP stability
-            long baseBitrate = 3_000_000L + (17_000_000L * quality / 100L);
-            long scaledBitrate = baseBitrate * pixels / (1920 * 1080);
-            long maxBitrate = is4K ? 25_000_000L : 20_000_000L;
-            long bitrate = Math.min(maxBitrate, Math.max(2_000_000L, scaledBitrate));
+            int manualBitrateKbps = getSavedVideoBitrate();
+            long bitrate;
+            if (manualBitrateKbps > 0) {
+                bitrate = manualBitrateKbps * 1000L;
+            } else {
+                // H.265 needs ~50% the bitrate of H.264; scale but cap aggressively for TCP stability
+                long baseBitrate = 3_000_000L + (17_000_000L * quality / 100L);
+                long scaledBitrate = baseBitrate * pixels / (1920 * 1080);
+                long maxBitrate = is4K ? 25_000_000L : 20_000_000L;
+                bitrate = Math.min(maxBitrate, Math.max(2_000_000L, scaledBitrate));
+            }
             MediaCodec enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC);
             MediaFormat fmt = MediaFormat.createVideoFormat(
                     MediaFormat.MIMETYPE_VIDEO_HEVC, width, height);
@@ -3674,6 +4176,7 @@ public class MainActivity extends AppCompatActivity {
         mH264Encoder = null;
         mH264EncoderWidth = 0;
         mH264EncoderHeight = 0;
+        mH264SpsPps = null; // Clear stale SPS/PPS — new encoder will produce fresh config
         if (enc != null) {
             try { enc.stop(); } catch (Exception ignored) {}
             try { enc.release(); } catch (Exception ignored) {}
@@ -4146,7 +4649,7 @@ public class MainActivity extends AppCompatActivity {
             exposureCompensation = mInternalCameraHelper.getCurrentExposureCompensation();
         }
         return String.format(java.util.Locale.US,
-                "CONTROL_STATE;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d",
+                "CONTROL_STATE;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d;bitrate=%d",
                 mInternalExposureLock ? 1 : 0,
                 mInternalFocusLock ? 1 : 0,
                 exposureCompensation,
@@ -4157,7 +4660,8 @@ public class MainActivity extends AppCompatActivity {
                 mInternalWbKelvin,
                 mapCurrentPreviewToObsResolutionIndex(),
                 mVideoTargetFps,
-                mVideoQuality);
+                mVideoQuality,
+                getSavedVideoBitrate());
     }
 
     private void maybeSendTcpControlStateToObs() {
@@ -4305,6 +4809,8 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
+
+
     private void startTcpUdpForwardingThread() {
         if (mTcpUdpWorkerRunning) {
             return;
@@ -4313,11 +4819,6 @@ public class MainActivity extends AppCompatActivity {
         mTcpObsProgram = false;
         mTcpObsPreview = false;
         mTcpLastTallyUpdateNs = 0;
-        mHandler.removeCallbacks(mTallyPoller);
-        mHandler.post(mTallyPoller);
-        startTcpDiscoveryBeaconThread();
-        startTcpTallyListenerThread();
-        mHandler.post(mTallyPoller);
         mTcpUdpWorkerRunning = true;
         mTcpUdpWorkerThread = new Thread(() -> {
             Log.i(TAG, "H.265 TCP forwarding thread started, port=" + mStreamPort);
@@ -4334,6 +4835,13 @@ public class MainActivity extends AppCompatActivity {
                 mTcpUdpWorkerRunning = false;
                 return;
             }
+
+            // Start discovery beacon and tally listener ONLY after the server socket is ready.
+            // This prevents OBS from receiving a beacon and trying to connect before we can accept.
+            startTcpDiscoveryBeaconThread();
+            startTcpTallyListenerThread();
+            mHandler.removeCallbacks(mTallyPoller);
+            mHandler.post(mTallyPoller);
 
             // Outer loop: accept/reconnect
             while (mTcpUdpWorkerRunning) {

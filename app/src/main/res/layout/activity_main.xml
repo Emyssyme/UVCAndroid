@@ -6,6 +6,7 @@
     android:layout_height="match_parent"
     android:background="?android:attr/colorBackground"
     android:orientation="vertical"
+    android:fitsSystemWindows="true"
     tools:context="com.herohan.uvcapp.activity.MainActivity">
 
     <com.google.android.material.appbar.AppBarLayout

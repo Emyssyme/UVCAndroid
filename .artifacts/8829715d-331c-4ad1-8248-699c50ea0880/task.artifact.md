@@ -1,0 +1,8 @@
+- [x] `InternalCameraHelper.java` refactoring
+    - [x] Move `closeCamera` cleanup to background thread
+    - [x] Synchronize `setEncoderSurface`, `setFrameListener`, `startPreview`, `stopPreview` via background handler
+    - [x] Update `startPreviewSession` with `isValid()` checks and defensive `createCaptureSession` call
+    - [x] Fix `closeImageReaders` and `stopPreview` to run on background thread
+- [x] Verification
+    - [ ] Build project
+    - [ ] Manual verification (stress test)

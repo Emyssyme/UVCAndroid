@@ -1,0 +1,12 @@
+- `[x]` Add bitrate string resource to `strings.xml`
+- `[x]` Define `PREF_VIDEO_BITRATE` and helper methods in `MainActivity.java`
+- `[x]` Update `showStreamDestinationDialog` to include Bitrate input (with ScrollView support)
+- `[x]` Update `startH264Encoder` to use manual bitrate if provided
+- `[x]` Update RTMP streaming setup to use manual bitrate
+- `[x]` Update video recording config (`setCustomVideoCaptureConfig`)
+- `[x]` Update remote control logic (`processTcpControlMessage` and `applyRemoteStreamSettings`)
+- `[x]` **OBS Plugin Integration**
+    - `[x]` Update `buildTcpControlStatePayload` in `MainActivity.java` to include bitrate
+    - `[x]` Update `uvc_custom_network.h` with bitrate fields
+    - `[x]` Update `uvc_custom_network.cpp` (defaults, properties, send/recv logic)
+- `[x]` Verify changes with a build and manual check (mocked)

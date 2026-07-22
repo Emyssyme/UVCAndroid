@@ -114,7 +114,7 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
                                             bool exposure_lock, bool focus_lock,
                                             int exposure_compensation, int af_mode, bool af_lock,
                                             int flash_mode, int wb_mode, int wb_kelvin,
-                                            int resolution_index, int fps, int quality);
+                                            int resolution_index, int fps, int quality, int bitrate);
 static void *uvc_custom_network_receiver_thread(void *data);
 static void *uvc_custom_network_control_state_thread(void *data);
 static void uvc_custom_network_control_state_start(uvc_custom_network *context);
@@ -507,7 +507,7 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
                                             bool exposure_lock, bool focus_lock,
                                             int exposure_compensation, int af_mode, bool af_lock,
                                             int flash_mode, int wb_mode, int wb_kelvin,
-                                            int resolution_index, int fps, int quality)
+                                            int resolution_index, int fps, int quality, int bitrate)
 {
     if (!context || !context->host || context->host[0] == '\0') {
         blog(LOG_WARNING, "UVC CONTROL: skipped — host is empty");
@@ -547,7 +547,7 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
 
     char payload[384];
     snprintf(payload, sizeof(payload),
-             "CONTROL;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d;srt_port=%d",
+             "CONTROL;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d;bitrate=%d;srt_port=%d",
              exposure_lock ? 1 : 0,
              focus_lock ? 1 : 0,
              exposure_compensation,
@@ -559,6 +559,7 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
              resolution_index,
              fps,
              quality,
+             bitrate,
              context->srt_port);
 
     blog(LOG_INFO, "UVC CONTROL -> Android %s:%d: %s", host_copy, CUSTOM_TALLY_PORT, payload);
@@ -611,11 +612,13 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
     int resolution_index = 1;
     int fps = 30;
     int quality = 50;
+    int bitrate = 0;
 
     pthread_mutex_lock(&context->lock);
     resolution_index = context->resolution_index;
     fps = context->fps;
     quality = context->quality;
+    bitrate = context->bitrate;
     pthread_mutex_unlock(&context->lock);
 
     int matched = sscanf(msg,
@@ -635,6 +638,7 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
     parse_message_int(msg, "resolution_index=", &resolution_index);
     parse_message_int(msg, "fps=", &fps);
     parse_message_int(msg, "quality=", &quality);
+    parse_message_int(msg, "bitrate=", &bitrate);
 
     /* Ignore noisy EV drift when AE lock is off to avoid sync churn/freeze loops. */
     if (exposure_lock == 0) {
@@ -660,7 +664,8 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
         || context->control_wb_kelvin != wb_kelvin
         || context->resolution_index != resolution_index
         || context->fps != fps
-        || context->quality != quality) {
+        || context->quality != quality
+        || context->bitrate != bitrate) {
         context->pending_remote_control_state = true;
         context->pending_exposure_lock = (exposure_lock != 0);
         context->pending_focus_lock = (focus_lock != 0);
@@ -673,6 +678,7 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
         context->pending_resolution_index = resolution_index;
         context->pending_fps = fps;
         context->pending_quality = quality;
+        context->pending_bitrate = bitrate;
         changed = true;
     }
     pthread_mutex_unlock(&context->lock);
@@ -707,6 +713,7 @@ static void uvc_custom_network_apply_pending_state_to_source(uvc_custom_network 
     obs_data_set_int(settings, "resolution_index", context->resolution_index);
     obs_data_set_int(settings, "fps", context->fps);
     obs_data_set_int(settings, "quality", context->quality);
+    obs_data_set_int(settings, "bitrate", context->bitrate);
     obs_data_release(settings);
 }
 
@@ -791,6 +798,7 @@ static void uvc_custom_network_video_tick(void *data, float seconds)
     context->resolution_index             = context->pending_resolution_index;
     context->fps                          = context->pending_fps;
     context->quality                      = context->pending_quality;
+    context->bitrate                      = context->pending_bitrate;
     context->pending_remote_control_state = false;
     context->pending_ui_refresh = true;  /* trigger dialog rebuild so UI reflects remote changes */
     pthread_mutex_unlock(&context->lock);
@@ -1136,7 +1144,7 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
      * to start sending before we wait for the first packet. */
     {
         bool exp_lock, fcs_lock, af_lock;
-        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual;
+        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual, bitr;
         pthread_mutex_lock(&context->lock);
         exp_lock = context->control_exposure_lock;
         fcs_lock = context->control_focus_lock;
@@ -1149,11 +1157,12 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
         res_idx  = context->resolution_index;
         fps_v    = context->fps;
         qual     = context->quality;
+        bitr     = context->bitrate;
         pthread_mutex_unlock(&context->lock);
         uvc_custom_network_send_control(context,
             exp_lock, fcs_lock, exp_comp,
             af_md, af_lock, fl_md, wb_md, wb_k,
-            res_idx, fps_v, qual);
+            res_idx, fps_v, qual, bitr);
     }
 
     uvc_custom_network_set_status(context, "SRT listening %s:%d — waiting for video", host, port);
@@ -2029,7 +2038,7 @@ static void uvc_custom_network_start_receiver(uvc_custom_network *context)
      * before any FFmpeg/socket setup delay in the background thread. */
     {
         bool exp_lock, fcs_lock, af_lock;
-        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual;
+        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual, bitr;
         pthread_mutex_lock(&context->lock);
         exp_lock = context->control_exposure_lock;
         fcs_lock = context->control_focus_lock;
@@ -2042,11 +2051,12 @@ static void uvc_custom_network_start_receiver(uvc_custom_network *context)
         res_idx  = context->resolution_index;
         fps_v    = context->fps;
         qual     = context->quality;
+        bitr     = context->bitrate;
         pthread_mutex_unlock(&context->lock);
         uvc_custom_network_send_control(context,
             exp_lock, fcs_lock, exp_comp,
             af_md, af_lock, fl_md, wb_md, wb_k,
-            res_idx, fps_v, qual);
+            res_idx, fps_v, qual, bitr);
     }
 
     context->receiver_running = true;
@@ -2072,6 +2082,7 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
     context->resolution_index = (int)obs_data_get_int(settings, "resolution_index");
     context->fps = (int)obs_data_get_int(settings, "fps");
     context->quality = (int)obs_data_get_int(settings, "quality");
+    context->bitrate = (int)obs_data_get_int(settings, "bitrate");
     context->discovery_enabled = obs_data_get_bool(settings, "discovery_enabled");
     context->control_exposure_lock = obs_data_get_bool(settings, "exposure_lock");
     context->control_focus_lock = obs_data_get_bool(settings, "focus_lock");
@@ -2094,6 +2105,7 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
     context->pending_resolution_index = context->resolution_index;
     context->pending_fps = context->fps;
     context->pending_quality = context->quality;
+    context->pending_bitrate = context->bitrate;
     context->discovery = NULL;
 #ifdef _WIN32
     context->receiver_socket = INVALID_SOCKET;
@@ -2306,6 +2318,7 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
 
     obs_properties_add_int(group, "fps", "FPS", 15, 60, 1);
     obs_properties_add_int(group, "quality", "Quality", 1, 100, 1);
+    obs_properties_add_int(group, "bitrate", "Bitrate (kbps, 0=auto)", 0, 100000, 100);
     obs_properties_add_bool(group, "hw_decode", "Hardware decoding");
 
     p = obs_properties_add_int(group, "srt_latency_ms", "SRT buffer (ms)", 20, 5000, 10);
@@ -2452,12 +2465,15 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     int resolution_index = (int)obs_data_get_int(settings, "resolution_index");
     int fps = (int)obs_data_get_int(settings, "fps");
     int quality = (int)obs_data_get_int(settings, "quality");
+    int bitrate = (int)obs_data_get_int(settings, "bitrate");
     bool stream_settings_changed = resolution_index != context->resolution_index
         || fps != context->fps
-        || quality != context->quality;
+        || quality != context->quality
+        || bitrate != context->bitrate;
     context->resolution_index = resolution_index;
     context->fps = fps;
     context->quality = quality;
+    context->bitrate = bitrate;
     bool exposure_lock = obs_data_get_bool(settings, "exposure_lock");
     bool focus_lock = obs_data_get_bool(settings, "focus_lock");
     int exposure_compensation = (int)obs_data_get_int(settings, "exposure_compensation");
@@ -2560,7 +2576,7 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
                                         exposure_lock, focus_lock,
                                         exposure_compensation, af_mode, af_lock,
                                         flash_mode, wb_mode, wb_kelvin,
-                                        resolution_index, fps, quality);
+                                        resolution_index, fps, quality, bitrate);
     } else if (send_control && suppress_control_send) {
         blog(LOG_INFO, "UVC CONTROL skipped because suppress_next_control_send was set");
     } else if (send_control) {
@@ -2623,6 +2639,7 @@ static void uvc_custom_network_defaults(obs_data_t *settings)
     obs_data_set_default_int(settings, "srt_latency_ms", 120);
     obs_data_set_default_int(settings, "fps", 30);
     obs_data_set_default_int(settings, "quality", 50);
+    obs_data_set_default_int(settings, "bitrate", 0);
     obs_data_set_default_int(settings, "resolution_index", 1);
     obs_data_set_default_int(settings, "selected_device_index", -1);
 }

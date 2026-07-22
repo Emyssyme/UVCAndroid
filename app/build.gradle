@@ -4,12 +4,12 @@ plugins {
 
 android {
     namespace 'com.herohan.uvcapp'
-    compileSdkVersion 34
+    compileSdkVersion versionCompiler
 
     defaultConfig {
         applicationId "com.herohan.uvcapp"
-        minSdkVersion 21
-        targetSdkVersion 34
+        minSdkVersion versionMin
+        targetSdkVersion versionTarget
         versionCode 3
         versionName "1.0.2"
 
@@ -44,6 +44,8 @@ dependencies {
     implementation 'com.github.getActivity:XXPermissions:13.5'
 //    implementation 'com.github.warkiz.widget:indicatorseekbar:2.1.2'
     implementation 'com.github.warkiz:IndicatorSeekBar:v2.1.1'
+
+    implementation 'com.github.pedroSG94.RootEncoder:library:2.7.5'
 
     releaseImplementation 'jp.wasabeef:takt-no-op:2.1.1'
     debugImplementation 'jp.wasabeef:takt:2.1.1'

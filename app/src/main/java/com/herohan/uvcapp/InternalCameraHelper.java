@@ -28,6 +28,7 @@ import android.util.SparseIntArray;
 import android.view.Surface;
 
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import java.io.File;
 import java.io.IOException;
@@ -128,6 +129,7 @@ public class InternalCameraHelper {
     private float  mMaxDigitalZoom = 1.0f;
     private int    mCurrentExposureCompensation = 0;
     private Range<Integer> mAeCompensationRange = new Range<>(0, 0);
+    private int    mVideoBitrate = 10_000_000;
     private int    mAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
 
     private boolean mAeAuto = true;
@@ -297,14 +299,53 @@ public class InternalCameraHelper {
     // -------------------------------------------------------------------------
 
     public void setStateCallback(OnCameraStateCallback cb)         { mStateCallback    = cb; }
-    public void setFrameListener(OnFrameAvailableListener listener) { mFrameListener    = listener; }
+    public void setFrameListener(OnFrameAvailableListener listener) {
+        setFrameListener(listener, null);
+    }
+
+    public void setFrameListener(OnFrameAvailableListener listener, @Nullable Runnable onComplete) {
+        if (mBackgroundHandler != null) {
+            mBackgroundHandler.post(() -> {
+                if (mFrameListener != listener) {
+                    mFrameListener = listener;
+                    if (mCameraDevice != null && mPreviewSurfaceTexture != null && mCaptureSession != null && !mIsRecording) {
+                        closeCaptureSession();
+                        startPreviewSession();
+                    }
+                }
+                if (onComplete != null) {
+                    onComplete.run();
+                }
+            });
+        } else {
+            mFrameListener = listener;
+            if (onComplete != null) {
+                onComplete.run();
+            }
+        }
+    }
+
     public void setEncoderSurface(Surface encoderSurface) {
-        mEncoderSurface = encoderSurface;
-        if (mCameraDevice != null && mPreviewSurfaceTexture != null && mCaptureSession != null) {
-            try { mCaptureSession.stopRepeating(); } catch (Exception ignored) {}
-            try { mCaptureSession.close(); } catch (Exception ignored) {}
-            mCaptureSession = null;
-            startPreviewSession();
+        setEncoderSurface(encoderSurface, null);
+    }
+
+    public void setEncoderSurface(Surface encoderSurface, @Nullable Runnable onComplete) {
+        if (mBackgroundHandler != null) {
+            mBackgroundHandler.post(() -> {
+                mEncoderSurface = encoderSurface;
+                if (mCameraDevice != null && mPreviewSurfaceTexture != null && mCaptureSession != null) {
+                    closeCaptureSession();
+                    startPreviewSession();
+                }
+                if (onComplete != null) {
+                    onComplete.run();
+                }
+            });
+        } else {
+            mEncoderSurface = encoderSurface;
+            if (onComplete != null) {
+                onComplete.run();
+            }
         }
     }
     public void setPictureTakenListener(OnPictureTakenListener l)  { mPictureListener  = l; }
@@ -448,30 +489,74 @@ public class InternalCameraHelper {
      * Safe to call before or after {@link #openCamera} - whichever comes last triggers the session.
      */
     public void startPreview(SurfaceTexture surfaceTexture) {
-        mPreviewSurfaceTexture = surfaceTexture;
-        if (mPreviewSurface != null) {
-            mPreviewSurface.release();
-            mPreviewSurface = null;
+        if (mBackgroundHandler != null) {
+            mBackgroundHandler.post(() -> {
+                mPreviewSurfaceTexture = surfaceTexture;
+                if (mPreviewSurface != null) {
+                    mPreviewSurface.release();
+                    mPreviewSurface = null;
+                }
+                if (mCameraDevice != null && mCameraReadyForPreview) {
+                    startPreviewSession();
+                }
+            });
+        } else {
+            mPreviewSurfaceTexture = surfaceTexture;
         }
-        if (mCameraDevice != null && mCameraReadyForPreview) {
-            startPreviewSession();
-        }
-        // else: will be triggered from onOpened()
     }
 
     public void stopPreview() {
-        mPreviewSurfaceTexture = null;
-        closeCaptureSession();
-        if (mPreviewSurface != null) {
-            mPreviewSurface.release();
-            mPreviewSurface = null;
+        if (mBackgroundHandler != null) {
+            mBackgroundHandler.post(() -> {
+                mPreviewSurfaceTexture = null;
+                closeCaptureSession();
+                if (mPreviewSurface != null) {
+                    mPreviewSurface.release();
+                    mPreviewSurface = null;
+                }
+            });
+        } else {
+            mPreviewSurfaceTexture = null;
         }
     }
 
     public void closeCamera() {
         mClosed = true;
         mCameraReadyForPreview = false;
-        try {
+
+        final HandlerThread oldThread = mBackgroundThread;
+        final Handler oldHandler = mBackgroundHandler;
+
+        mBackgroundThread = null;
+        mBackgroundHandler = null;
+
+        if (oldHandler != null) {
+            oldHandler.post(() -> {
+                try {
+                    if (mIsRecording) {
+                        stopRecordingInternal(false);
+                    }
+                    closeCaptureSession();
+                    if (mCameraDevice != null) {
+                        mCameraDevice.close();
+                        mCameraDevice = null;
+                    }
+                    closeImageReaders();
+                } finally {
+                    // Schedule the quit 300 ms out — Camera2's post typically arrives in < 50 ms.
+                    if (oldThread != null) {
+                        mMainHandler.postDelayed(oldThread::quitSafely, 300);
+                    }
+                    InternalCameraInfo closed = mCurrentCameraInfo;
+                    mCurrentCameraInfo = null;
+                    mMainHandler.post(() -> {
+                        if (mStateCallback != null && closed != null)
+                            mStateCallback.onClosed(closed);
+                    });
+                }
+            });
+        } else {
+            // Fallback if background thread was never started or already dead
             if (mIsRecording) {
                 stopRecordingInternal(false);
             }
@@ -481,21 +566,7 @@ public class InternalCameraHelper {
                 mCameraDevice = null;
             }
             closeImageReaders();
-        } finally {
-            // Null our references NOW so openCamera() can create a fresh HandlerThread.
-            // Do NOT call quitSafely() yet: Camera2 posts an internal ClientStateCallback
-            // .onClosed notification to our background handler AFTER camera.close() returns.
-            // Killing the thread synchronously makes that post throw
-            //   "Handler sending message to a Handler on a dead thread"
-            // which prevents Camera2's state machine from reaching CLOSED, causing the
-            // camera service to refuse the next openCamera() call on the same camera ID.
-            // Schedule the quit 300 ms out — Camera2's post typically arrives in < 50 ms.
-            final HandlerThread oldThread = mBackgroundThread;
-            mBackgroundThread  = null;
-            mBackgroundHandler = null;
-            if (oldThread != null) {
-                mMainHandler.postDelayed(oldThread::quitSafely, 300);
-            }
+
             InternalCameraInfo closed = mCurrentCameraInfo;
             mCurrentCameraInfo = null;
             mMainHandler.post(() -> {
@@ -510,7 +581,10 @@ public class InternalCameraHelper {
     // -------------------------------------------------------------------------
 
     private void startPreviewSession() {
-        if (mCameraDevice == null || mPreviewSurfaceTexture == null) return;
+        if (mCameraDevice == null || mPreviewSurfaceTexture == null || mClosed) return;
+
+        // Ensure ImageReaders are ready and of the correct size
+        prepareImageReaders(mPreviewSize.getWidth(), mPreviewSize.getHeight());
 
         mPreviewSurfaceTexture.setDefaultBufferSize(
                 mPreviewSize.getWidth(), mPreviewSize.getHeight());
@@ -519,35 +593,49 @@ public class InternalCameraHelper {
         }
 
         List<Surface> surfaces = new ArrayList<>();
-        surfaces.add(mPreviewSurface);
+        if (mPreviewSurface.isValid()) {
+            surfaces.add(mPreviewSurface);
+        } else {
+            Log.w(TAG, "startPreviewSession: Preview surface is invalid");
+            return;
+        }
+
         if (mEncoderSurface != null) {
-            surfaces.add(mEncoderSurface);
+            if (mEncoderSurface.isValid()) {
+                surfaces.add(mEncoderSurface);
+            } else {
+                Log.w(TAG, "startPreviewSession: Encoder surface is invalid");
+            }
         }
 
         // JPEG reader for photo capture (always included in preview session)
-        mJpegReader = ImageReader.newInstance(
-                mPreviewSize.getWidth(), mPreviewSize.getHeight(),
-                ImageFormat.JPEG, 2);
-
-        surfaces.add(mJpegReader.getSurface());
+        if (mJpegReader != null) {
+            Surface s = mJpegReader.getSurface();
+            if (s.isValid()) {
+                surfaces.add(s);
+            }
+        }
 
         // YUV reader for frame delivery (only if a listener is registered)
-        if (mFrameListener != null) {
-            mStreamYuvReader = ImageReader.newInstance(
-                    mPreviewSize.getWidth(), mPreviewSize.getHeight(),
-                    ImageFormat.YUV_420_888, 2);
-            mStreamYuvReader.setOnImageAvailableListener(this::onStreamFrameAvailable,
-                    mBackgroundHandler);
-            surfaces.add(mStreamYuvReader.getSurface());
+        if (mFrameListener != null && mStreamYuvReader != null) {
+            Surface s = mStreamYuvReader.getSurface();
+            if (s.isValid()) {
+                surfaces.add(s);
+            }
+        }
+
+        if (surfaces.isEmpty()) {
+            Log.w(TAG, "startPreviewSession: No valid surfaces to configure");
+            return;
         }
 
         try {
             final CaptureRequest.Builder previewBuilder =
                     mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             previewBuilder.addTarget(mPreviewSurface);
-            if (mEncoderSurface != null)
+            if (mEncoderSurface != null && mEncoderSurface.isValid())
                 previewBuilder.addTarget(mEncoderSurface);
-            if (mStreamYuvReader != null)
+            if (mStreamYuvReader != null && mFrameListener != null && mStreamYuvReader.getSurface().isValid())
                 previewBuilder.addTarget(mStreamYuvReader.getSurface());
 
             applyCameraSettings(previewBuilder);
@@ -569,7 +657,7 @@ public class InternalCameraHelper {
                             try {
                                 session.setRepeatingRequest(
                                         previewBuilder.build(), mPreviewCaptureCallback, mBackgroundHandler);
-                            } catch (CameraAccessException | IllegalStateException e) {
+                            } catch (CameraAccessException | IllegalStateException | IllegalArgumentException e) {
                                 Log.e(TAG, "setRepeatingRequest failed", e);
                             }
                         }
@@ -579,7 +667,7 @@ public class InternalCameraHelper {
                             Log.e(TAG, "Preview session configure failed");
                         }
                     }, mBackgroundHandler);
-        } catch (CameraAccessException e) {
+        } catch (CameraAccessException | IllegalStateException | IllegalArgumentException e) {
             Log.e(TAG, "startPreviewSession failed", e);
         }
     }
@@ -650,23 +738,30 @@ public class InternalCameraHelper {
     }
 
     private void tryUpdatePreviewRequest() {
-        if (mCaptureSession == null || mCameraDevice == null) return;
+        if (mCaptureSession == null || mCameraDevice == null || mClosed) return;
         try {
             CaptureRequest.Builder builder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            if (mPreviewSurface != null) {
+            if (mPreviewSurface != null && mPreviewSurface.isValid()) {
                 builder.addTarget(mPreviewSurface);
             }
-            if (mEncoderSurface != null) {
+            if (mEncoderSurface != null && mEncoderSurface.isValid()) {
                 builder.addTarget(mEncoderSurface);
             }
-            if (mStreamYuvReader != null) {
-                builder.addTarget(mStreamYuvReader.getSurface());
+            if (mStreamYuvReader != null && mFrameListener != null) {
+                Surface s = mStreamYuvReader.getSurface();
+                if (s.isValid()) {
+                    builder.addTarget(s);
+                }
             }
             applyCameraSettings(builder);
             mCaptureSession.setRepeatingRequest(builder.build(), mPreviewCaptureCallback, mBackgroundHandler);
-        } catch (CameraAccessException | IllegalStateException e) {
+        } catch (CameraAccessException | IllegalStateException | IllegalArgumentException e) {
             Log.w(TAG, "tryUpdatePreviewRequest failed", e);
         }
+    }
+
+    public void setVideoBitrate(int bitrate) {
+        this.mVideoBitrate = bitrate;
     }
 
     public void setPreviewUpdatesSuspended(boolean suspended) {
@@ -864,30 +959,38 @@ public class InternalCameraHelper {
     }
 
     public void triggerTapToFocus(float x, float y, int viewWidth, int viewHeight) {
-        if (!mTapToFocusMode || mCameraDevice == null || mCaptureSession == null || mPreviewSurfaceTexture == null) return;
-        try {
-            CaptureRequest.Builder builder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
-            mPreviewSurfaceTexture.setDefaultBufferSize(mPreviewSize.getWidth(), mPreviewSize.getHeight());
-            builder.addTarget(new Surface(mPreviewSurfaceTexture));
-            applyCameraSettings(builder);
-            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
-            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
-
-            mCaptureSession.capture(builder.build(), new CameraCaptureSession.CaptureCallback() {
-                @Override
-                public void onCaptureCompleted(@NonNull CameraCaptureSession session,
-                                               @NonNull CaptureRequest request,
-                                               @NonNull TotalCaptureResult result) {
-                    // return to continuous video after AF run
-                    if (mTapToFocusMode) {
-                        mAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
-                        schedulePreviewUpdate();
+        if (mBackgroundHandler != null) {
+            mBackgroundHandler.post(() -> {
+                if (!mTapToFocusMode || mCameraDevice == null || mCaptureSession == null || mPreviewSurface == null || mClosed)
+                    return;
+                try {
+                    CaptureRequest.Builder builder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                    if (mPreviewSurface.isValid()) {
+                        builder.addTarget(mPreviewSurface);
+                    } else {
+                        return;
                     }
-                }
-            }, mBackgroundHandler);
+                    applyCameraSettings(builder);
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
+                    builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
 
-        } catch (CameraAccessException e) {
-            Log.w(TAG, "triggerTapToFocus: failed", e);
+                    mCaptureSession.capture(builder.build(), new CameraCaptureSession.CaptureCallback() {
+                        @Override
+                        public void onCaptureCompleted(@NonNull CameraCaptureSession session,
+                                                       @NonNull CaptureRequest request,
+                                                       @NonNull TotalCaptureResult result) {
+                            // return to continuous video after AF run
+                            if (mTapToFocusMode) {
+                                mAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+                                schedulePreviewUpdate();
+                            }
+                        }
+                    }, mBackgroundHandler);
+
+                } catch (CameraAccessException | IllegalStateException | IllegalArgumentException e) {
+                    Log.w(TAG, "triggerTapToFocus: failed", e);
+                }
+            });
         }
     }
 
@@ -947,43 +1050,58 @@ public class InternalCameraHelper {
     // -------------------------------------------------------------------------
 
     public void takePicture(File outputFile, OnPictureTakenListener listener) {
-        if (mCaptureSession == null || mJpegReader == null) {
-            if (listener != null) listener.onError("Camera not ready for capture");
-            return;
-        }
-        mPictureListener = listener;
-
-        mJpegReader.setOnImageAvailableListener(reader -> {
-            try (Image image = reader.acquireLatestImage()) {
-                if (image == null) return;
-                ByteBuffer buffer = image.getPlanes()[0].getBuffer();
-                byte[] bytes = new byte[buffer.remaining()];
-                buffer.get(bytes);
-                try (java.io.FileOutputStream fos = new java.io.FileOutputStream(outputFile)) {
-                    fos.write(bytes);
+        if (mBackgroundHandler != null) {
+            mBackgroundHandler.post(() -> {
+                if (mCaptureSession == null || mJpegReader == null || mClosed) {
                     mMainHandler.post(() -> {
-                        if (mPictureListener != null) mPictureListener.onSuccess(outputFile);
+                        if (listener != null) listener.onError("Camera not ready for capture");
                     });
-                } catch (IOException e) {
+                    return;
+                }
+                mPictureListener = listener;
+
+                mJpegReader.setOnImageAvailableListener(reader -> {
+                    try (Image image = reader.acquireLatestImage()) {
+                        if (image == null) return;
+                        ByteBuffer buffer = image.getPlanes()[0].getBuffer();
+                        byte[] bytes = new byte[buffer.remaining()];
+                        buffer.get(bytes);
+                        try (java.io.FileOutputStream fos = new java.io.FileOutputStream(outputFile)) {
+                            fos.write(bytes);
+                            mMainHandler.post(() -> {
+                                if (mPictureListener != null) mPictureListener.onSuccess(outputFile);
+                            });
+                        } catch (IOException e) {
+                            mMainHandler.post(() -> {
+                                if (mPictureListener != null) mPictureListener.onError(e.getMessage());
+                            });
+                        }
+                    }
+                }, mBackgroundHandler);
+
+                try {
+                    CaptureRequest.Builder captureBuilder =
+                            mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+                    Surface s = mJpegReader.getSurface();
+                    if (s.isValid()) {
+                        captureBuilder.addTarget(s);
+                        captureBuilder.set(CaptureRequest.CONTROL_AF_MODE,
+                                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+                        captureBuilder.set(CaptureRequest.JPEG_QUALITY, (byte) 92);
+                        mCaptureSession.capture(captureBuilder.build(), null, mBackgroundHandler);
+                    } else {
+                        mMainHandler.post(() -> {
+                            if (mPictureListener != null) mPictureListener.onError("JPEG Surface abandoned");
+                        });
+                    }
+                } catch (CameraAccessException | IllegalStateException | IllegalArgumentException e) {
                     mMainHandler.post(() -> {
                         if (mPictureListener != null) mPictureListener.onError(e.getMessage());
                     });
                 }
-            }
-        }, mBackgroundHandler);
-
-        try {
-            CaptureRequest.Builder captureBuilder =
-                    mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-            captureBuilder.addTarget(mJpegReader.getSurface());
-            captureBuilder.set(CaptureRequest.CONTROL_AF_MODE,
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-            captureBuilder.set(CaptureRequest.JPEG_QUALITY, (byte) 92);
-            mCaptureSession.capture(captureBuilder.build(), null, mBackgroundHandler);
-        } catch (CameraAccessException e) {
-            mMainHandler.post(() -> {
-                if (mPictureListener != null) mPictureListener.onError(e.getMessage());
             });
+        } else {
+            if (listener != null) listener.onError("Background thread not available");
         }
     }
 
@@ -997,28 +1115,40 @@ public class InternalCameraHelper {
      */
     public void startRecording(File outputFile, int displayRotation,
                                OnRecordingStateListener listener) {
-        if (mCameraDevice == null) {
-            if (listener != null) listener.onError("Camera not open");
-            return;
-        }
-        mRecordingListener = listener;
-        mRecordingFile     = outputFile;
+        if (mBackgroundHandler != null) {
+            mBackgroundHandler.post(() -> {
+                if (mCameraDevice == null || mClosed) {
+                    mMainHandler.post(() -> {
+                        if (listener != null) listener.onError("Camera not open");
+                    });
+                    return;
+                }
+                mRecordingListener = listener;
+                mRecordingFile = outputFile;
 
-        try {
-            setUpMediaRecorder(outputFile, displayRotation);
-        } catch (IOException e) {
-            Log.e(TAG, "MediaRecorder prepare failed", e);
-            if (listener != null) listener.onError(e.getMessage());
-            return;
-        }
+                try {
+                    setUpMediaRecorder(outputFile, displayRotation);
+                } catch (IOException e) {
+                    Log.e(TAG, "MediaRecorder prepare failed", e);
+                    mMainHandler.post(() -> {
+                        if (listener != null) listener.onError(e.getMessage());
+                    });
+                    return;
+                }
 
-        // Close preview session and open a recording session
-        closeCaptureSession();
-        startRecordingSession();
+                // Close preview session and open a recording session
+                closeCaptureSession();
+                startRecordingSession();
+            });
+        } else {
+            if (listener != null) listener.onError("Background thread not available");
+        }
     }
 
     public void stopRecording() {
-        stopRecordingInternal(true);
+        if (mBackgroundHandler != null) {
+            mBackgroundHandler.post(() -> stopRecordingInternal(true));
+        }
     }
 
     private void stopRecordingInternal(boolean restartPreview) {
@@ -1067,7 +1197,7 @@ public class InternalCameraHelper {
         mMediaRecorder.setVideoSource(MediaRecorder.VideoSource.SURFACE);
         mMediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
         mMediaRecorder.setOutputFile(outputFile.getAbsolutePath());
-        mMediaRecorder.setVideoEncodingBitRate(10_000_000);
+        mMediaRecorder.setVideoEncodingBitRate(mVideoBitrate);
         mMediaRecorder.setVideoFrameRate(30);
         mMediaRecorder.setVideoSize(mPreviewSize.getWidth(), mPreviewSize.getHeight());
         mMediaRecorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264);
@@ -1103,14 +1233,8 @@ public class InternalCameraHelper {
         surfaces.add(recorderSurface);
 
         // Keep frame delivery during recording if requested
-        if (mFrameListener != null && mStreamYuvReader == null) {
-            mStreamYuvReader = ImageReader.newInstance(
-                    mPreviewSize.getWidth(), mPreviewSize.getHeight(),
-                    ImageFormat.YUV_420_888, 2);
-            mStreamYuvReader.setOnImageAvailableListener(this::onStreamFrameAvailable,
-                    mBackgroundHandler);
-            surfaces.add(mStreamYuvReader.getSurface());
-        } else if (mStreamYuvReader != null) {
+        prepareImageReaders(mPreviewSize.getWidth(), mPreviewSize.getHeight());
+        if (mFrameListener != null && mStreamYuvReader != null) {
             surfaces.add(mStreamYuvReader.getSurface());
         }
 
@@ -1128,7 +1252,7 @@ public class InternalCameraHelper {
                                 if (finalPreviewSurface != null)
                                     builder.addTarget(finalPreviewSurface);
                                 builder.addTarget(recorderSurface);
-                                if (mStreamYuvReader != null)
+                                if (mStreamYuvReader != null && mFrameListener != null)
                                     builder.addTarget(mStreamYuvReader.getSurface());
 
                                 builder.set(CaptureRequest.CONTROL_MODE,
@@ -1281,9 +1405,30 @@ public class InternalCameraHelper {
     private void closeCaptureSession() {
         if (mCaptureSession != null) {
             try {
+                mCaptureSession.stopRepeating();
+                mCaptureSession.abortCaptures();
                 mCaptureSession.close();
             } catch (Exception ignored) {}
             mCaptureSession = null;
+        }
+    }
+
+    private void prepareImageReaders(int width, int height) {
+        if (mJpegReader != null && (mJpegReader.getWidth() != width || mJpegReader.getHeight() != height)) {
+            mJpegReader.close();
+            mJpegReader = null;
+        }
+        if (mJpegReader == null) {
+            mJpegReader = ImageReader.newInstance(width, height, ImageFormat.JPEG, 2);
+        }
+
+        if (mStreamYuvReader != null && (mStreamYuvReader.getWidth() != width || mStreamYuvReader.getHeight() != height)) {
+            mStreamYuvReader.close();
+            mStreamYuvReader = null;
+        }
+        if (mStreamYuvReader == null) {
+            mStreamYuvReader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 2);
+            mStreamYuvReader.setOnImageAvailableListener(this::onStreamFrameAvailable, mBackgroundHandler);
         }
     }
 

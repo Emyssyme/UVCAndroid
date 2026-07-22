@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.os.Build;
 import android.os.IBinder;
 
@@ -32,8 +33,15 @@ public class CameraKeepAliveService extends Service {
                 .setSmallIcon(R.mipmap.ic_launcher_round)
                 .setOngoing(true)
                 .build();
-        // simple call is fine; manifest already declares a benign type
-        startForeground(NOTIF_ID, notif);
+        // explicit call for API 34+ to include required types
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIF_ID, notif,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK |
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA |
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE);
+        } else {
+            startForeground(NOTIF_ID, notif);
+        }
     }
 
     @Override

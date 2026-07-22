@@ -1,0 +1,8 @@
+- [x] Add new strings to `strings.xml` for the protocol selection dialog
+- [x] Implement `showStreamProtocolDialog()` in `MainActivity.java`
+- [x] Implement `restartStreaming()` helper in `MainActivity.java`
+- [x] Update `onOptionsItemSelected` in `MainActivity.java` to use the new dialog
+- [x] Refactor `showSetStreamDestinationDialog()` for context-aware settings
+    - [x] Add guide strings to `strings.xml`
+    - [x] Update `showSetStreamDestinationDialog()` logic in `MainActivity.java`
+- [x] Verify build and functionality
