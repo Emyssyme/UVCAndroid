@@ -109,6 +109,7 @@ static void uvc_custom_network_receiver_stop(uvc_custom_network *context);
 static void uvc_custom_network_set_status(uvc_custom_network *context, const char *format, ...);
 static bool uvc_custom_network_activate_button(obs_properties_t *props, obs_property_t *property, void *data);
 static bool uvc_custom_network_refresh_button(obs_properties_t *props, obs_property_t *property, void *data);
+static bool uvc_custom_network_device_selected(obs_properties_t *props, obs_property_t *property, void *data);
 static void uvc_custom_network_discovery_callback(const char *host, int port, void *userdata);
 static void uvc_custom_network_send_control(uvc_custom_network *context,
                                             bool exposure_lock, bool focus_lock,
@@ -305,6 +306,18 @@ static bool uvc_custom_network_refresh_button(obs_properties_t *props, obs_prope
     }
     pthread_mutex_unlock(&context->lock);
 
+    return true;
+}
+
+/* Called when the user picks a device from the "Discovered devices" dropdown.
+ * Returning true tells OBS to refresh the properties dialog, which triggers
+ * update() — and update() already contains the logic to autofill Phone IP
+ * and Port from the selected device index. */
+static bool uvc_custom_network_device_selected(obs_properties_t *props, obs_property_t *property, void *data)
+{
+    UNUSED_PARAMETER(props);
+    UNUSED_PARAMETER(property);
+    UNUSED_PARAMETER(data);
     return true;
 }
 
@@ -2257,6 +2270,7 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
     p = obs_properties_add_list(group, "selected_device_index",
             "Discovered devices", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
     if (p) {
+        obs_property_set_modified_callback(p, uvc_custom_network_device_selected);
         if (is_active) obs_property_set_enabled(p, false);
         obs_property_list_add_int(p, is_active ? "(stop first to change)" : "(auto-detect)", -1);
         if (context && context->discovered_device_count > 0) {
@@ -2297,12 +2311,12 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
         }
     }
 
-    p = obs_properties_add_button(group, "activate",
+    p = obs_properties_add_button2(group, "activate",
         is_active ? "Stop" : "Activate",
-        (obs_property_clicked_t)uvc_custom_network_activate_button);
+        (obs_property_clicked_t)uvc_custom_network_activate_button, context);
 
-    p = obs_properties_add_button(group, "refresh_discovery", "Refresh discovery",
-                                  (obs_property_clicked_t)uvc_custom_network_refresh_button);
+    p = obs_properties_add_button2(group, "refresh_discovery", "Refresh discovery",
+                                   (obs_property_clicked_t)uvc_custom_network_refresh_button, context);
 
     /* ═══════════════════════════════════════════════════════════════
      * ▸ Video

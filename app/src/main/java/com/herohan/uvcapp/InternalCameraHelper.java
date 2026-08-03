@@ -3,6 +3,7 @@ package com.herohan.uvcapp;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.graphics.ImageFormat;
+import android.graphics.Matrix;
 import android.graphics.Rect;
 import android.graphics.SurfaceTexture;
 import android.hardware.camera2.CameraAccessException;
@@ -13,6 +14,7 @@ import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
+import android.hardware.camera2.params.MeteringRectangle;
 import android.hardware.camera2.params.RggbChannelVector;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
@@ -151,6 +153,8 @@ public class InternalCameraHelper {
     private Range<Long>    mExposureTimeRange = new Range<>(100000L, 100000L);
     private long           mCurrentExposureTime = 100000L;
     private boolean        mTapToFocusMode = false;
+    private MeteringRectangle[] mAfRegions;
+    private MeteringRectangle[] mAeRegions;
 
     private boolean        mPreviewUpdatesSuspended = false;
     private boolean        mPreviewUpdatePending = false;
@@ -705,6 +709,13 @@ public class InternalCameraHelper {
         }
 
         builder.set(CaptureRequest.CONTROL_AF_MODE, mAfMode);
+        if (mAfRegions != null) {
+            builder.set(CaptureRequest.CONTROL_AF_REGIONS, mAfRegions);
+        }
+        if (mAeRegions != null) {
+            builder.set(CaptureRequest.CONTROL_AE_REGIONS, mAeRegions);
+        }
+
         if (mAfMode == CaptureRequest.CONTROL_AF_MODE_OFF && mMinFocusDistance > 0f) {
             float clampedFocus = Math.max(0f, Math.min(mMinFocusDistance, mCurrentFocusDistance));
             builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, clampedFocus);
@@ -940,6 +951,8 @@ public class InternalCameraHelper {
             // keep AF idle until tap event
             mAfMode = CaptureRequest.CONTROL_AF_MODE_OFF;
         } else {
+            mAfRegions = null;
+            mAeRegions = null;
             if (mAfMode == CaptureRequest.CONTROL_AF_MODE_OFF) {
                 mAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
             }
@@ -964,6 +977,59 @@ public class InternalCameraHelper {
                 if (!mTapToFocusMode || mCameraDevice == null || mCaptureSession == null || mPreviewSurface == null || mClosed)
                     return;
                 try {
+                    CameraCharacteristics characteristics = mCameraManager.getCameraCharacteristics(mCurrentCameraInfo.cameraId);
+                    Rect activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+                    Integer sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+                    Integer lensFacing = characteristics.get(CameraCharacteristics.LENS_FACING);
+
+                    if (activeArray == null || sensorOrientation == null || lensFacing == null) return;
+
+                    // 1. Get current crop region (zoom)
+                    float zoomRatio = Math.min(mCurrentZoom, mMaxDigitalZoom);
+                    int cropW = Math.round(activeArray.width() / zoomRatio);
+                    int cropH = Math.round(activeArray.height() / zoomRatio);
+                    int cropX = (activeArray.width() - cropW) / 2;
+                    int cropY = (activeArray.height() - cropH) / 2;
+                    Rect cropRegion = new Rect(cropX, cropY, cropX + cropW, cropY + cropH);
+
+                    // 2. Map view coordinates to sensor coordinates
+                    int displayRotation = Surface.ROTATION_0;
+                    android.view.WindowManager wm = (android.view.WindowManager) mContext.getSystemService(Context.WINDOW_SERVICE);
+                    if (wm != null) {
+                        displayRotation = wm.getDefaultDisplay().getRotation();
+                    }
+                    int displayDegrees = displayRotation * 90;
+
+                    boolean isFront = (lensFacing == CameraCharacteristics.LENS_FACING_FRONT);
+                    int rotationNeeded;
+                    if (isFront) {
+                        rotationNeeded = (sensorOrientation + displayDegrees) % 360;
+                    } else {
+                        rotationNeeded = (sensorOrientation - displayDegrees + 360) % 360;
+                    }
+
+                    Matrix matrix = new Matrix();
+                    if (isFront) {
+                        matrix.postScale(-1, 1, 0.5f, 0.5f);
+                    }
+                    matrix.postRotate(-rotationNeeded, 0.5f, 0.5f);
+
+                    float[] points = new float[]{x / viewWidth, y / viewHeight};
+                    matrix.mapPoints(points);
+
+                    int sensorX = (int) (cropRegion.left + points[0] * cropRegion.width());
+                    int sensorY = (int) (cropRegion.top + points[1] * cropRegion.height());
+
+                    int areaSizeW = cropRegion.width() / 10;
+                    int areaSizeH = cropRegion.height() / 10;
+                    int left = clamp(cropRegion.left, cropRegion.right - areaSizeW, sensorX - areaSizeW / 2);
+                    int top = clamp(cropRegion.top, cropRegion.bottom - areaSizeH, sensorY - areaSizeH / 2);
+
+                    MeteringRectangle rect = new MeteringRectangle(left, top, areaSizeW, areaSizeH, MeteringRectangle.METERING_WEIGHT_MAX);
+                    mAfRegions = new MeteringRectangle[]{rect};
+                    mAeRegions = new MeteringRectangle[]{rect};
+
+                    // 3. Trigger AF
                     CaptureRequest.Builder builder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
                     if (mPreviewSurface.isValid()) {
                         builder.addTarget(mPreviewSurface);
@@ -973,15 +1039,15 @@ public class InternalCameraHelper {
                     applyCameraSettings(builder);
                     builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
                     builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
+                    builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START);
 
                     mCaptureSession.capture(builder.build(), new CameraCaptureSession.CaptureCallback() {
                         @Override
                         public void onCaptureCompleted(@NonNull CameraCaptureSession session,
                                                        @NonNull CaptureRequest request,
                                                        @NonNull TotalCaptureResult result) {
-                            // return to continuous video after AF run
                             if (mTapToFocusMode) {
-                                mAfMode = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO;
+                                mAfMode = CaptureRequest.CONTROL_AF_MODE_AUTO;
                                 schedulePreviewUpdate();
                             }
                         }

@@ -94,6 +94,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
 import com.pedro.library.rtmp.RtmpStream;
+import com.pedro.library.util.BitrateAdapter;
 import com.pedro.common.ConnectChecker;
 import com.pedro.encoder.input.sources.video.BufferVideoSource;
 import com.pedro.encoder.input.sources.audio.MicrophoneSource;
@@ -169,6 +170,7 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREF_VIDEO_TARGET_FPS = "pref_video_target_fps";
     private static final String PREF_VIDEO_QUALITY = "pref_video_quality";
     private static final String PREF_VIDEO_BITRATE = "pref_video_bitrate";
+    private static final String PREF_DYNAMIC_BITRATE = "pref_dynamic_bitrate";
     private static final int DEFAULT_STREAM_PORT = 5600;
     private static final int DISCOVERY_PORT = 8866;
     private static final int TCP_TALLY_PORT = 8867;
@@ -273,6 +275,7 @@ public class MainActivity extends AppCompatActivity {
     private String mRtmpKey;
     private volatile boolean mRtmpWorkerRunning = false;
     private volatile boolean mRtmpConnecting = false; // true between startStream() and onConnectionSuccess/Failed
+    private int mRtmpEncoderBitrate = 0;
     private final java.util.concurrent.atomic.AtomicLong mRtmpFramesCaptured = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong mRtmpFramesDropped = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong mRtmpFramesEncoded = new java.util.concurrent.atomic.AtomicLong();
@@ -429,8 +432,8 @@ public class MainActivity extends AppCompatActivity {
                 markerW = (int) getResources().getDisplayMetrics().density * 48;
                 markerH = markerW;
             }
-            mBinding.tapFocusMarker.setX(x - markerW / 2f);
-            mBinding.tapFocusMarker.setY(y - markerH / 2f);
+            mBinding.tapFocusMarker.setX(x - markerW / 2f + mBinding.viewMainPreview.getX());
+            mBinding.tapFocusMarker.setY(y - markerH / 2f + mBinding.viewMainPreview.getY());
             mBinding.tapFocusMarker.setVisibility(View.VISIBLE);
             mHandler.removeCallbacks(mHideTapFocusMarker);
             mHandler.postDelayed(mHideTapFocusMarker, 700);
@@ -1155,6 +1158,20 @@ public class MainActivity extends AppCompatActivity {
                 .getInt(PREF_VIDEO_BITRATE, 0);
     }
 
+    private boolean isDynamicBitrateEnabled() {
+        return PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getBoolean(PREF_DYNAMIC_BITRATE, false);
+    }
+
+    private void setDynamicBitrateEnabled(boolean enabled) {
+        PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .edit()
+                .putBoolean(PREF_DYNAMIC_BITRATE, enabled)
+                .apply();
+    }
+
     private int getSavedSrtPort() {
         return PreferenceManager
                 .getDefaultSharedPreferences(this)
@@ -1454,6 +1471,13 @@ public class MainActivity extends AppCompatActivity {
         bitrateInput.setText(String.valueOf(getSavedVideoBitrate()));
         container.addView(bitrateInput);
 
+        final android.widget.CheckBox dynamicBitrateCheckBox = new android.widget.CheckBox(this);
+        if (isRtmp) {
+            dynamicBitrateCheckBox.setText(R.string.stream_dynamic_bitrate);
+            dynamicBitrateCheckBox.setChecked(isDynamicBitrateEnabled());
+            container.addView(dynamicBitrateCheckBox);
+        }
+
         final ScrollView scrollView = new ScrollView(this);
         scrollView.addView(container);
 
@@ -1505,6 +1529,9 @@ public class MainActivity extends AppCompatActivity {
                     setSavedVideoBitrate(bitrateKbps);
                     setSavedRtmpUrl(rtmpUrl);
                     setSavedRtmpKey(rtmpKey);
+                    if (isRtmp) {
+                        setDynamicBitrateEnabled(dynamicBitrateCheckBox.isChecked());
+                    }
 
                     String summary = isRtmp ? (TextUtils.isEmpty(rtmpKey) ? rtmpUrl : rtmpUrl + "/****") : String.format("%s:%d", host, port);
                     Toast.makeText(this, String.format("%s fps=%d quality=%d bitrate=%d", summary, targetFps, quality, bitrateKbps), Toast.LENGTH_SHORT).show();
@@ -3625,6 +3652,10 @@ public class MainActivity extends AppCompatActivity {
         mRtmpWorkerRunning = true;
         mRtmpWorkerThread = new Thread(() -> {
             Log.i(TAG, "RTMP: Starting stream to " + (fullRtmpUrl.length() > 20 ? fullRtmpUrl.substring(0, 20) + "..." : "URL"));
+
+            final boolean dynamicBitrate = isDynamicBitrateEnabled();
+            final BitrateAdapter[] adapterArr = new BitrateAdapter[1];
+
             ConnectChecker checker = new ConnectChecker() {
                 @Override public void onConnectionStarted(@NonNull String url) {
                     Log.i(TAG, "⏳ RTMP Connecting to: " + url);
@@ -3635,11 +3666,44 @@ public class MainActivity extends AppCompatActivity {
                     Log.i(TAG, "✅ RTMP Connected");
                     mRtmpConnecting = false;
                     runOnUiThread(() -> updateStreamStatus());
+
+                    if (dynamicBitrate && mRtmpStream != null) {
+                        adapterArr[0] = new BitrateAdapter(bitrate1 -> {
+                            RtmpStream stream = mRtmpStream;
+                            if (stream != null && stream.isStreaming()) {
+                                // Only update if significantly different (e.g. > 5% change)
+                                if (Math.abs(bitrate1 - mRtmpEncoderBitrate) > mRtmpEncoderBitrate * 0.05) {
+                                    Log.i(TAG, String.format("RTMP: Adapting bitrate %d -> %d kbps", 
+                                            mRtmpEncoderBitrate / 1000, bitrate1 / 1000));
+                                    try {
+                                        stream.setVideoBitrateOnFly(bitrate1);
+                                        mRtmpEncoderBitrate = bitrate1;
+                                    } catch (Exception e) {
+                                        Log.e(TAG, "RTMP: Failed to set bitrate on fly", e);
+                                    }
+                                }
+                            }
+                        });
+                        
+                        // Use conservative 10% steps to avoid stressing the encoder/network spikes
+                        adapterArr[0].setDecreaseRange(10f);
+                        adapterArr[0].setIncreaseRange(10f);
+
+                        // manualBitrateKbps might be 0 (auto), so we use the calculated bitrate
+                        int initialBitrate = (int) (mPreviewWidth * mPreviewHeight * mVideoTargetFps * 0.1 * (mVideoQuality / 100.0));
+                        int manualBitrateKbps = getSavedVideoBitrate();
+                        if (manualBitrateKbps > 0) {
+                            initialBitrate = manualBitrateKbps * 1000;
+                        }
+                        adapterArr[0].setMaxBitrate(initialBitrate);
+                        mRtmpEncoderBitrate = initialBitrate;
+                    }
                 }
                 @Override public void onConnectionFailed(@NonNull String reason) {
                     Log.e(TAG, "❌ RTMP Connection failed: " + reason);
                     mRtmpConnecting = false;
                     mRtmpWorkerRunning = false;
+                    adapterArr[0] = null;
                     runOnUiThread(() -> {
                         updateStreamStatus();
                         Toast.makeText(MainActivity.this,
@@ -3649,6 +3713,7 @@ public class MainActivity extends AppCompatActivity {
                 @Override public void onDisconnect() {
                     Log.i(TAG, "RTMP Disconnected");
                     mRtmpConnecting = false;
+                    adapterArr[0] = null;
                     runOnUiThread(() -> updateStreamStatus());
                 }
                 @Override public void onAuthError() {
@@ -3658,7 +3723,18 @@ public class MainActivity extends AppCompatActivity {
                             "RTMP: Authentication error", Toast.LENGTH_LONG).show());
                 }
                 @Override public void onAuthSuccess() { Log.i(TAG, "RTMP Auth Success"); }
-                @Override public void onNewBitrate(long bitrate) { Log.d(TAG, "RTMP Bitrate: " + bitrate); }
+                @Override public void onNewBitrate(long bitrate) {
+                    if (adapterArr[0] != null && mRtmpStream != null) {
+                        // Increase stabilization time: don't adapt for the first ~10 seconds
+                        // getSentVideoFrames() at 30fps means 300 frames is 10 seconds.
+                        if (mRtmpStream.getStreamClient().getSentVideoFrames() > 300) {
+                            // Use hasCongestion(20%) to provide hint to adapter
+                            boolean hasCongestion = mRtmpStream.getStreamClient().hasCongestion(20f);
+                            adapterArr[0].adaptBitrate(bitrate, hasCongestion);
+                        }
+                    }
+                    if (DEBUG) Log.d(TAG, "RTMP Bitrate: " + bitrate);
+                }
             };
 
             int manualBitrateKbps = getSavedVideoBitrate();
@@ -3681,9 +3757,10 @@ public class MainActivity extends AppCompatActivity {
                 mRtmpConnecting = true;
                 runOnUiThread(() -> updateStreamStatus());
 
-                // Mute audio initially to wait for video SPS/PPS to be established.
-                // This keeps the audio track present for probing but delays actual audio data.
+                // Mute audio initially and start FORCE rendering black frames.
+                // This ensures Restreamer/FFmpeg sees both Video and Audio streams from DTS 0.
                 microphoneSource.mute();
+                mRtmpStream.getGlInterface().setForceRender(true, mVideoTargetFps);
                 mRtmpStream.startStream(fullRtmpUrl);
 
                 // 2. Short wait to let the GL thread fully initialize its input surface
@@ -3706,22 +3783,19 @@ public class MainActivity extends AppCompatActivity {
                 // Wait up to 3 seconds for the Camera2 session to be reconfigured with the encoder surface
                 try {
                     if (!surfaceReadyLatch.await(3000, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-                        Log.w(TAG, "RTMP: Timed out waiting for encoder surface to be attached — forcing render anyway");
+                        Log.w(TAG, "RTMP: Timed out waiting for encoder surface to be attached — continuing with force render");
                     }
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     return;
                 }
 
-                // 5. Force GL engine to render frames at the target FPS — only AFTER the surface is confirmed
-                mRtmpStream.getGlInterface().setForceRender(true, mVideoTargetFps);
-
-                // 6. Wait for video SPS/PPS to be sent, THEN enable audio.
-                //    This ensures datarhei's ffmpeg sees BOTH streams simultaneously when probing.
-                try { Thread.sleep(800); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
+                // 5. Wait a bit more for video SPS/PPS to be sent with camera data, THEN enable audio.
+                //    This ensures probe sees BOTH streams simultaneously with valid data.
+                try { Thread.sleep(600); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return; }
                 microphoneSource.unMute();
 
-                // 7. Single concise startup log
+                // 6. Single concise startup log
                 Log.i(TAG, "RTMP live: " + mPreviewWidth + "x" + mPreviewHeight
                         + "@" + mVideoTargetFps + "fps " + (bitrate / 1000) + "kbps → "
                         + (fullRtmpUrl.length() > 50 ? fullRtmpUrl.substring(0, 47) + "..." : fullRtmpUrl));
@@ -3737,9 +3811,13 @@ public class MainActivity extends AppCompatActivity {
             while (mRtmpWorkerRunning) {
                 try {
                     Thread.sleep(100);
+                    if (mRtmpStream != null) {
+                        mRtmpPacketsSent.set(mRtmpStream.getStreamClient().getSentVideoFrames());
+                    }
                     if (System.currentTimeMillis() - lastLogTime > 5000) {
-                        Log.d(TAG, String.format("RTMP Stats: Streaming=%b",
-                                mRtmpStream != null && mRtmpStream.isStreaming()));
+                        Log.d(TAG, String.format("RTMP Stats: Streaming=%b, Sent=%d",
+                                mRtmpStream != null && mRtmpStream.isStreaming(),
+                                mRtmpPacketsSent.get()));
                         lastLogTime = System.currentTimeMillis();
                     }
                 } catch (InterruptedException e) {

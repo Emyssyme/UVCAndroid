@@ -25,6 +25,7 @@
     <string name="stream_destination_rtmp_url_hint">RTMP URL (e.g. rtmp://server/live or rtmp://server/live/key)</string>
     <string name="stream_destination_rtmp_key_hint">Stream Key (optional — leave empty if key is in URL)</string>
     <string name="stream_destination_bitrate_hint">Bitrate (kbps, 0=auto)</string>
+    <string name="stream_dynamic_bitrate">Dynamic Bitrate (RTMP)</string>
     <string name="stream_destination_set">Set</string>
     <string name="stream_destination_error">Invalid host or port</string>
     <string name="stream_destination_summary">%1$s:%2$d</string>
