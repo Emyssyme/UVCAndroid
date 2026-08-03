@@ -50,8 +50,8 @@ public class MediaVideoEncoder extends MediaEncoder implements IVideoEncoder {
     private final int mWidth, mHeight;
     protected int mColorFormat;
     private static final int FRAME_RATE = 25;
-    private static final int I_FRAME_INTERVAL = 10;
-    private static final float BPP = 0.25f;
+    private static final int I_FRAME_INTERVAL = 2;
+    private static final float BPP = 0.20f;
 
     private RenderHandler mRenderHandler;
 
@@ -104,6 +104,14 @@ public class MediaVideoEncoder extends MediaEncoder implements IVideoEncoder {
         format.setInteger(MediaFormat.KEY_BIT_RATE, calcBitRate());
         format.setInteger(MediaFormat.KEY_FRAME_RATE, FRAME_RATE);
         format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL);
+        // Optimization for Low Latency and Motion
+        format.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+            format.setInteger(MediaFormat.KEY_PRIORITY, 0); // Realtime priority
+        }
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            format.setInteger(MediaFormat.KEY_LATENCY, 1); // Low latency mode
+        }
         if (DEBUG) Log.i(TAG, "format: " + format);
 
         mMediaCodec = MediaCodec.createEncoderByType(MIME_TYPE);

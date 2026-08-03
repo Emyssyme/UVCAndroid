@@ -109,7 +109,7 @@ static void uvc_custom_network_receiver_stop(uvc_custom_network *context);
 static void uvc_custom_network_set_status(uvc_custom_network *context, const char *format, ...);
 static bool uvc_custom_network_activate_button(obs_properties_t *props, obs_property_t *property, void *data);
 static bool uvc_custom_network_refresh_button(obs_properties_t *props, obs_property_t *property, void *data);
-static bool uvc_custom_network_device_selected(obs_properties_t *props, obs_property_t *property, void *data);
+static bool uvc_custom_network_device_selected(obs_properties_t *props, obs_property_t *property, obs_data_t *settings);
 static void uvc_custom_network_discovery_callback(const char *host, int port, void *userdata);
 static void uvc_custom_network_send_control(uvc_custom_network *context,
                                             bool exposure_lock, bool focus_lock,
@@ -313,11 +313,11 @@ static bool uvc_custom_network_refresh_button(obs_properties_t *props, obs_prope
  * Returning true tells OBS to refresh the properties dialog, which triggers
  * update() — and update() already contains the logic to autofill Phone IP
  * and Port from the selected device index. */
-static bool uvc_custom_network_device_selected(obs_properties_t *props, obs_property_t *property, void *data)
+static bool uvc_custom_network_device_selected(obs_properties_t *props, obs_property_t *property, obs_data_t *settings)
 {
     UNUSED_PARAMETER(props);
     UNUSED_PARAMETER(property);
-    UNUSED_PARAMETER(data);
+    UNUSED_PARAMETER(settings);
     return true;
 }
 
@@ -1763,7 +1763,6 @@ static void *uvc_custom_network_receiver_thread(void *data)
 
             uint64_t pts = read_u64be(header);
             uint32_t len = read_u32be(header + 8);
-            uint64_t recv_time_ns = os_gettime_ns(); /* time when header was received */
 
             if (len == 0 || len > H264_MAX_SIZE) {
                 blog(LOG_WARNING, "UVC H265 TCP: bad packet length %u, reconnecting", len);
@@ -1783,6 +1782,12 @@ static void *uvc_custom_network_receiver_thread(void *data)
                     blog(LOG_INFO, "UVC H265 TCP: connection lost reading payload");
                 break;
             }
+
+            /* Capture receive time AFTER the full payload has arrived — not after the 12-byte
+             * header. On congested or slow networks the payload can take additional time to
+             * arrive; using the post-header time would under-estimate latency and could make
+             * OBS think a frame is "in the future", causing a visible stall. */
+            uint64_t recv_time_ns = os_gettime_ns();
 
             pkt->pts = (pts == H264_NO_PTS) ? AV_NOPTS_VALUE : (int64_t)pts;
 
@@ -2650,7 +2655,7 @@ static void uvc_custom_network_defaults(obs_data_t *settings)
     obs_data_set_default_int(settings, "port", 5600);
     obs_data_set_default_bool(settings, "use_srt", false);
     obs_data_set_default_int(settings, "srt_port", SRT_DEFAULT_PORT);
-    obs_data_set_default_int(settings, "srt_latency_ms", 120);
+    obs_data_set_default_int(settings, "srt_latency_ms", 60);
     obs_data_set_default_int(settings, "fps", 30);
     obs_data_set_default_int(settings, "quality", 50);
     obs_data_set_default_int(settings, "bitrate", 0);

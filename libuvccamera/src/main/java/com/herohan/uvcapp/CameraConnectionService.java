@@ -134,7 +134,7 @@ class CameraConnectionService {
                         if (!cameraKey.equals(mLastCameraKey)) {
                             Log.i(TAG, "wait for service is ready");
                             try {
-                                mConnectionSync.wait();
+                                mConnectionSync.wait(2000);
                             } catch (InterruptedException e) {
                                 e.printStackTrace();
                             }
@@ -208,8 +208,12 @@ class CameraConnectionService {
          */
         @Override
         public void selectDevice(final UsbDevice device) throws Exception {
+            if (device == null) {
+                throw new IllegalArgumentException("device is null");
+            }
+
             if (DEBUG)
-                Log.d(TAG, LOG_PREFIX + "selectDevice:device=" + (device != null ? device.getDeviceName() : null));
+                Log.d(TAG, LOG_PREFIX + "selectDevice:device=" + device.getDeviceName());
             final String cameraKey = getCameraKey(device);
             CameraInternal cameraInternal = null;
             synchronized (mConnectionSync) {
@@ -219,14 +223,14 @@ class CameraConnectionService {
                 if (cameraInternal == null) {
                     Log.i(TAG, "wait for getting permission");
                     try {
-                        mConnectionSync.wait();
+                        mConnectionSync.wait(2000);
                     } catch (Exception e) {
                         Log.e(TAG, "selectDevice:", e);
                     }
                     Log.i(TAG, "check CameraInternal again");
                     cameraInternal = mCameras.get(cameraKey);
                     if (cameraInternal == null) {
-                        throw new RuntimeException("failed to open USB device(has no permission)");
+                        throw new RuntimeException("failed to open USB device(has no permission or timeout)");
                     }
                 }
             }

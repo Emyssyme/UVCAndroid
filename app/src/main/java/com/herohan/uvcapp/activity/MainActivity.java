@@ -209,12 +209,15 @@ public class MainActivity extends AppCompatActivity {
     private volatile int mH264EncoderHeight = 0;
     private volatile byte[] mH264SpsPps;
     private volatile boolean mH264SyncFrameRequested = false;
+    // Adaptive FPS throttle for low-end devices — counts consecutive encoder input drops
+    private int mEncoderConsecutiveDrops = 0;
+    private static final int ENCODER_DROP_THRESHOLD = 15; // reduce FPS after N consecutive drops
     private final byte[] mH264FrameHeaderBuf = new byte[12];
     private byte[] mH264EncodeBuffer;          // reused NV12 input — allocated once per resolution
     private byte[] mH264OutputBuffer = new byte[2 * 1024 * 1024]; // reused encoded-packet buffer
     private Thread mTcpUdpWorkerThread;
     private volatile boolean mTcpUdpWorkerRunning = false;
-    private final java.util.concurrent.ArrayBlockingQueue<CustomUdpFrame> mTcpUdpFrameQueue = new java.util.concurrent.ArrayBlockingQueue<>(12);
+    private final java.util.concurrent.ArrayBlockingQueue<CustomUdpFrame> mTcpUdpFrameQueue = new java.util.concurrent.ArrayBlockingQueue<>(2);
     private int mTcpUdpTargetFps = 30;
     private long mTcpUdpMinFrameIntervalNs = 0;
     private long mLastTcpUdpEnqueueTimeNs = 0;
@@ -282,6 +285,10 @@ public class MainActivity extends AppCompatActivity {
     private final java.util.concurrent.atomic.AtomicLong mRtmpFramesEncoded = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong mRtmpPacketsSent = new java.util.concurrent.atomic.AtomicLong();
     private Thread mRtmpWorkerThread;
+    // Reconnect state — reset each time startRtmpForwardingThread() is called
+    private volatile int mRtmpReconnectAttempts = 0;
+    private static final int RTMP_MAX_RECONNECT_ATTEMPTS = 10;
+    private static final long RTMP_RECONNECT_BASE_DELAY_MS = 3000L;
 
     private Thread mTcpDiscoveryThread;
     private volatile boolean mTcpDiscoveryRunning = false;
@@ -860,7 +867,11 @@ public class MainActivity extends AppCompatActivity {
      * @param device
      */
     protected void selectDevice(UsbDevice device) {
-        if (DEBUG) Log.v(TAG, "selectDevice:device=" + device.getDeviceName());
+        if (DEBUG) Log.v(TAG, "selectDevice:device=" + (device != null ? device.getDeviceName() : null));
+
+        if (device == null) {
+            return;
+        }
 
         XXPermissions.with(this)
                 .permission(Manifest.permission.CAMERA)
@@ -3652,6 +3663,7 @@ public class MainActivity extends AppCompatActivity {
         mRtmpFramesDropped.set(0);
         mRtmpFramesEncoded.set(0);
         mRtmpPacketsSent.set(0);
+        mRtmpReconnectAttempts = 0; // reset on fresh start
 
         mRtmpWorkerRunning = true;
         mRtmpWorkerThread = new Thread(() -> {
@@ -3706,19 +3718,75 @@ public class MainActivity extends AppCompatActivity {
                 @Override public void onConnectionFailed(@NonNull String reason) {
                     Log.e(TAG, "❌ RTMP Connection failed: " + reason);
                     mRtmpConnecting = false;
-                    mRtmpWorkerRunning = false;
                     adapterArr[0] = null;
-                    runOnUiThread(() -> {
-                        updateStreamStatus();
-                        Toast.makeText(MainActivity.this,
-                                "RTMP: " + reason, Toast.LENGTH_LONG).show();
-                    });
+                    mRtmpReconnectAttempts++;
+                    if (mRtmpWorkerRunning && mRtmpReconnectAttempts <= RTMP_MAX_RECONNECT_ATTEMPTS) {
+                        long delayMs = Math.min(30_000L,
+                                RTMP_RECONNECT_BASE_DELAY_MS * (1L << Math.min(mRtmpReconnectAttempts - 1, 4)));
+                        int attempt = mRtmpReconnectAttempts;
+                        Log.w(TAG, "RTMP: reconnecting in " + delayMs + " ms (attempt " + attempt
+                                + "/" + RTMP_MAX_RECONNECT_ATTEMPTS + ")");
+                        runOnUiThread(() -> {
+                            updateStreamStatus();
+                            Toast.makeText(MainActivity.this,
+                                    "RTMP: reconectare... (" + attempt + "/"
+                                            + RTMP_MAX_RECONNECT_ATTEMPTS + ")",
+                                    Toast.LENGTH_SHORT).show();
+                        });
+                        // Schedule reconnect on background thread — cannot block the callback thread
+                        new Thread(() -> {
+                            try { Thread.sleep(delayMs); } catch (InterruptedException ie) { return; }
+                            if (mRtmpWorkerRunning) {
+                                // Re-create the full RTMP stream (pedro library cannot recover after failure)
+                                RtmpStream old = mRtmpStream;
+                                mRtmpStream = null;
+                                if (old != null) {
+                                    try { if (old.isStreaming()) old.stopStream(); } catch (Exception ignored) {}
+                                }
+                                startRtmpForwardingThread();
+                            }
+                        }, "RtmpReconnect").start();
+                    } else {
+                        mRtmpWorkerRunning = false;
+                        runOnUiThread(() -> {
+                            updateStreamStatus();
+                            Toast.makeText(MainActivity.this,
+                                    "RTMP: conexiune eșuată — " + reason, Toast.LENGTH_LONG).show();
+                        });
+                    }
                 }
                 @Override public void onDisconnect() {
                     Log.i(TAG, "RTMP Disconnected");
                     mRtmpConnecting = false;
                     adapterArr[0] = null;
-                    runOnUiThread(() -> updateStreamStatus());
+                    // Auto-reconnect on unexpected disconnects (e.g. broken pipe / server restart)
+                    if (mRtmpWorkerRunning) {
+                        mRtmpReconnectAttempts++;
+                        if (mRtmpReconnectAttempts <= RTMP_MAX_RECONNECT_ATTEMPTS) {
+                            long delayMs = Math.min(30_000L,
+                                    RTMP_RECONNECT_BASE_DELAY_MS * (1L << Math.min(mRtmpReconnectAttempts - 1, 4)));
+                            int attempt = mRtmpReconnectAttempts;
+                            Log.w(TAG, "RTMP: deconectat — reconectare în " + delayMs + " ms (attempt "
+                                    + attempt + "/" + RTMP_MAX_RECONNECT_ATTEMPTS + ")");
+                            runOnUiThread(() -> updateStreamStatus());
+                            new Thread(() -> {
+                                try { Thread.sleep(delayMs); } catch (InterruptedException ie) { return; }
+                                if (mRtmpWorkerRunning) {
+                                    RtmpStream old = mRtmpStream;
+                                    mRtmpStream = null;
+                                    if (old != null) {
+                                        try { if (old.isStreaming()) old.stopStream(); } catch (Exception ignored) {}
+                                    }
+                                    startRtmpForwardingThread();
+                                }
+                            }, "RtmpReconnect").start();
+                        } else {
+                            mRtmpWorkerRunning = false;
+                            runOnUiThread(() -> updateStreamStatus());
+                        }
+                    } else {
+                        runOnUiThread(() -> updateStreamStatus());
+                    }
                 }
                 @Override public void onAuthError() {
                     Log.e(TAG, "RTMP Auth Error");
@@ -4227,18 +4295,44 @@ public class MainActivity extends AppCompatActivity {
                 int level = is4K ? MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel51
                         : MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel4;
                 fmt.setInteger(MediaFormat.KEY_LEVEL, level);
-                // CBR for predictable TCP frame sizes (reduces buffering jitter)
+                // Try CBR first for predictable TCP frame sizes; weak SoCs may reject it.
+                // The try/catch around configure+start will fall back to VBR if needed.
                 fmt.setInteger(MediaFormat.KEY_BITRATE_MODE,
                         MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
-                // Minimum complexity = fastest possible encoding (less variant encode time)
+                // Use minimum complexity for speed and stability across all devices
                 fmt.setInteger(MediaFormat.KEY_COMPLEXITY, 0);
+                // Ask for real-time priority (reduces internal codec buffering significantly)
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                    fmt.setInteger(MediaFormat.KEY_PRIORITY, 0);
+                }
             }
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                // Tell encoder to emit output as soon as each frame is encoded
-                fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1);
+
+            boolean encoderStarted = false;
+            try {
+                enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                enc.start();
+                encoderStarted = true;
+                Log.i(TAG, "H.265 encoder started (Safe CBR) " + width + "x" + height);
+            } catch (Exception e2) {
+                Log.w(TAG, "H.265 encoder: Safe CBR failed, retrying with VBR", e2);
+                try { enc.reset(); } catch (Exception ignored) {}
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
+                    fmt.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR);
+                }
+                try {
+                    enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+                    enc.start();
+                    encoderStarted = true;
+                    Log.i(TAG, "H.265 encoder started (VBR Fallback) " + width + "x" + height);
+                } catch (Exception e3) {
+                    Log.e(TAG, "H.265 encoder: all fallbacks failed", e3);
+                }
             }
-            enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-            enc.start();
+            if (!encoderStarted) {
+                try { enc.release(); } catch (Exception ignored) {}
+                mH264Encoder = null;
+                return;
+            }
             mH264Encoder = enc;
             mH264EncoderWidth = width;
             mH264EncoderHeight = height;
@@ -4246,7 +4340,6 @@ public class MainActivity extends AppCompatActivity {
             mTcpUdpTargetFps = targetFps;
             mTcpUdpMinFrameIntervalNs = 1_000_000_000L / mTcpUdpTargetFps;
             mNextTcpUdpEnqueueTimeNs = 0;
-            Log.i(TAG, "H.265 encoder started " + width + "x" + height + " @ " + bitrate / 1_000_000 + " Mbps @ " + targetFps + " fps");
         } catch (Exception e) {
             Log.e(TAG, "Failed to start H.265 encoder", e);
             mH264Encoder = null;
@@ -4288,10 +4381,16 @@ public class MainActivity extends AppCompatActivity {
         int yuvSize = frame.width * frame.height * 3 / 2;
         int actualYuvSize = Math.min(yuvSize, frame.frame.remaining());
 
-        // Submit the new frame immediately; drop if encoder is full (zero timeout).
+        // Submit the new frame; allow a short wait so slow SoCs have a chance to free a slot.
+        // On weak devices, 0-timeout causes every frame to be dropped once the pipeline is full,
+        // which permanently starves the encoder and produces no output at all.
+        // Use zero timeout: if the encoder isn't ready, drop the frame immediately.
+        // A 5ms wait here means the worker thread is blocked and can't drain output,
+        // which creates a feedback loop that increases latency.
         int inputIndex = enc.dequeueInputBuffer(0);
         int enqueuedSize = 0;
         if (inputIndex >= 0) {
+            mEncoderConsecutiveDrops = 0; // reset drop streak on success
             java.nio.ByteBuffer inputBuf = enc.getInputBuffer(inputIndex);
             if (inputBuf != null) {
                 inputBuf.clear();
@@ -4304,19 +4403,31 @@ public class MainActivity extends AppCompatActivity {
             enc.queueInputBuffer(inputIndex, 0, enqueuedSize, ptsUs, 0);
         } else {
             mTcpFramesDropped.incrementAndGet();
+            mEncoderConsecutiveDrops++;
+            // Adaptive FPS reduction: if the encoder is consistently starved on this device,
+            // reduce the target FPS so the pipeline can keep up without dropping every frame.
+            if (mEncoderConsecutiveDrops >= ENCODER_DROP_THRESHOLD && mTcpUdpTargetFps > 15) {
+                mTcpUdpTargetFps = Math.max(15, mTcpUdpTargetFps - 1);
+                mTcpUdpMinFrameIntervalNs = 1_000_000_000L / mTcpUdpTargetFps;
+                mEncoderConsecutiveDrops = 0;
+                Log.w(TAG, "Encoder starved — reducing TCP target FPS to " + mTcpUdpTargetFps
+                        + " to improve compatibility on this device");
+            }
             maybePublishTcpTelemetry(false);
             return;
         }
 
-        // Phase 3 — drain output without blocking the pipeline
-        drainEncoderOutput(enc, info, 0);
+        // Phase 3 — drain output with a short timeout to catch packets ready immediately
+        // after queueing input (reduces latency by up to one frame interval).
+        drainEncoderOutput(enc, info, 1_000);
         mTcpEncodeTimeNsSum.addAndGet(System.nanoTime() - encodeStartNs);
         mTcpEncodeSamples.incrementAndGet();
     }
 
     /** Drain all available encoder output packets and forward them to the TCP stream. */
-    private void drainEncoderOutput(MediaCodec enc, MediaCodec.BufferInfo info, long firstTimeoutUs)
+    private boolean drainEncoderOutput(MediaCodec enc, MediaCodec.BufferInfo info, long firstTimeoutUs)
             throws IOException {
+        boolean sentData = false;
         long timeoutUs = firstTimeoutUs;
         while (true) {
             int outIndex = enc.dequeueOutputBuffer(info, timeoutUs);
@@ -4355,6 +4466,7 @@ public class MainActivity extends AppCompatActivity {
                 OutputStream out = mH264OutputStream;
                 if (out != null) {
                     sendH264Packet(pts, data, 0, info.size);
+                    sentData = true;
                     if (!isConfig) {
                         mTcpFramesEncoded.incrementAndGet();
                     }
@@ -4366,6 +4478,7 @@ public class MainActivity extends AppCompatActivity {
             enc.releaseOutputBuffer(outIndex, false);
             if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
         }
+        return sentData;
     }
 
     /**
@@ -4936,8 +5049,10 @@ public class MainActivity extends AppCompatActivity {
                         try { client.setKeepAlive(true); } catch (Exception ignored) {}
                         try { client.setSendBufferSize(LOW_LATENCY_TCP_SEND_BUFFER_BYTES); } catch (Exception ignored) {}
                         try { client.setTrafficClass(0x10); } catch (Exception ignored) {}
-                        mH264OutputStream = new BufferedOutputStream(
-                                client.getOutputStream(), LOW_LATENCY_TCP_SEND_BUFFER_BYTES / 4);
+                        // Use raw OutputStream — TCP_NODELAY is set, so BufferedOutputStream
+                        // just adds latency by batching writes. Each encoded HEVC packet is already
+                        // a complete NAL unit and should be sent immediately.
+                        mH264OutputStream = client.getOutputStream();
                         mLastTcpFlushTimeNs = 0;
                         Log.i(TAG, "OBS connected from " + client.getInetAddress().getHostAddress());
                     } catch (java.net.SocketTimeoutException ignored) {
@@ -4953,7 +5068,10 @@ public class MainActivity extends AppCompatActivity {
 
                 // Clear any stale queued frames before starting a new connection.
                 clearTcpUdpFrameQueue();
+                // Force an IDR (sync) frame immediately so OBS can decode from the very first frame
                 requestH264SyncFrame();
+                // Also reset the encoder drop counter so adaptive FPS stays accurate per-connection
+                mEncoderConsecutiveDrops = 0;
 
                 // Send cached SPS+PPS so OBS can decode immediately
                 try {
@@ -4962,6 +5080,10 @@ public class MainActivity extends AppCompatActivity {
                         sendH264Packet(H264_NO_PTS, sps, 0, sps.length);
                         mH264OutputStream.flush();
                     }
+                    // Force a second IDR request AFTER sending SPS/PPS — this ensures OBS gets
+                    // SPS+PPS immediately followed by an IDR frame, which triggers source appearance
+                    // without requiring the user to switch sources or change resolution.
+                    requestH264SyncFrame();
                 } catch (IOException e) {
                     Log.w(TAG, "Failed to send SPS/PPS to OBS", e);
                     mH264OutputStream = null;
@@ -4971,11 +5093,32 @@ public class MainActivity extends AppCompatActivity {
 
                 // Frame streaming loop — runs until client disconnects or we stop
                 boolean clientActive = true;
+                MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
                 while (mTcpUdpWorkerRunning && clientActive) {
                     try {
+                        // 1. Constantly drain encoder output to prevent stalling.
+                        if (mH264Encoder != null) {
+                            boolean drained = drainEncoderOutput(mH264Encoder, info, 0);
+                            if (drained) {
+                                OutputStream flushOut = mH264OutputStream;
+                                if (flushOut != null) {
+                                    long nowFlushNs = System.nanoTime();
+                                    if (mLastTcpFlushTimeNs <= 0
+                                            || (nowFlushNs - mLastTcpFlushTimeNs) >= TCP_FLUSH_INTERVAL_NS) {
+                                        flushOut.flush();
+                                        mLastTcpFlushTimeNs = nowFlushNs;
+                                    }
+                                }
+                            }
+                        }
+
+                        // 2. Poll for new input frames.
                         CustomUdpFrame frame = mTcpUdpFrameQueue.poll(
-                                5, java.util.concurrent.TimeUnit.MILLISECONDS);
-                        if (frame == null) continue;
+                                3, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (frame == null) {
+                            continue; // No new frame, loop back and keep draining output
+                        }
+                        
                         try {
                             if (mH264Encoder == null
                                     || frame.width != mH264EncoderWidth
@@ -4987,17 +5130,6 @@ public class MainActivity extends AppCompatActivity {
                                 requestH264SyncFrame();
                             }
                             feedFrameToH264Encoder(frame);
-                            // Micro-batched flush reduces syscall jitter while preserving low latency.
-                            OutputStream flushOut = mH264OutputStream;
-                            if (flushOut != null) {
-                                long nowFlushNs = System.nanoTime();
-                                if (mLastTcpFlushTimeNs <= 0
-                                        || (nowFlushNs - mLastTcpFlushTimeNs) >= TCP_FLUSH_INTERVAL_NS
-                                        || mTcpUdpFrameQueue.isEmpty()) {
-                                    flushOut.flush();
-                                    mLastTcpFlushTimeNs = nowFlushNs;
-                                }
-                            }
                             maybePublishTcpTelemetry(false);
                         } finally {
                             recycleFrameBuffer(frame.frame);
@@ -5005,11 +5137,19 @@ public class MainActivity extends AppCompatActivity {
                     } catch (IOException e) {
                         Log.i(TAG, "OBS disconnected: " + e.getMessage());
                         clientActive = false;
+                        runOnUiThread(() -> Toast.makeText(MainActivity.this,
+                                "OBS deconectat — aștept reconectare...", Toast.LENGTH_SHORT).show());
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         clientActive = false;
                     } catch (Exception e) {
                         Log.w(TAG, "Error in H.265 TCP forwarding thread", e);
+                        // If the hardware encoder crashed (e.g. IllegalStateException after a camera change),
+                        // destroy it now. A brief cooldown avoids an immediate crash loop on faulty hardware.
+                        stopH264Encoder();
+                        try { Thread.sleep(300); } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
                     }
                 }
 

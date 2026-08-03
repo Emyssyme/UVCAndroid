@@ -93,6 +93,11 @@ public class CameraHelper implements ICameraHelper {
     public void selectDevice(final UsbDevice device) {
         if (DEBUG)
             Log.d(TAG, "selectDevice:device=" + (device != null ? device.getDeviceName() : null) + " " + this);
+
+        if (device == null) {
+            return;
+        }
+
         mAsyncHandler.post(() -> {
             if (mService != null && !isDetached(device)) {
                 mUsbDevice = device;
@@ -100,6 +105,7 @@ public class CameraHelper implements ICameraHelper {
                     mService.selectDevice(device);
                 } catch (final Exception e) {
                     if (DEBUG) Log.e(TAG, "selectDevice:", e);
+                    mCallbackWrapper.onError(device, new CameraException(CameraException.CAMERA_OPEN_ERROR_UNKNOWN, e));
                 }
             }
         });
