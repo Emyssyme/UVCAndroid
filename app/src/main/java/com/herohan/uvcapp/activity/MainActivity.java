@@ -163,7 +163,10 @@ public class MainActivity extends AppCompatActivity {
 
     private enum StreamProtocol { TCP_UDP, SRT, RTMP }
     private StreamProtocol mStreamProtocol = StreamProtocol.SRT;
+    private enum VideoCodec { H265, H264, AV1 }
+    private VideoCodec mSelectedCodec = VideoCodec.H265;
     private static final String PREF_STREAM_PROTOCOL = "pref_stream_protocol";
+    private static final String PREF_VIDEO_CODEC = "pref_video_codec";
     private static final String PREF_STREAM_HOST = "pref_stream_host";
     private static final String PREF_STREAM_PORT = "pref_stream_port";
     private static final String PREF_RTMP_URL = "pref_rtmp_url";
@@ -179,7 +182,7 @@ public class MainActivity extends AppCompatActivity {
     private static final int DEFAULT_VIDEO_QUALITY = 60;
 
     // H.265-over-TCP frame header constants (compatible with DroidCam OBS protocol)
-    private static final long H264_NO_PTS = 0xFFFFFFFFFFFFFFFFL; // config/SPS+PPS marker
+    private static final long NO_PTS = 0xFFFFFFFFFFFFFFFFL; // config/SPS+PPS marker
 
     private static class CustomUdpFrame {
         final java.nio.ByteBuffer frame;
@@ -203,18 +206,18 @@ public class MainActivity extends AppCompatActivity {
 
     // H.265 TCP server
     private ServerSocket mH265ServerSocket;
-    private volatile OutputStream mH264OutputStream;
-    private MediaCodec mH264Encoder;
-    private volatile int mH264EncoderWidth = 0;
-    private volatile int mH264EncoderHeight = 0;
-    private volatile byte[] mH264SpsPps;
-    private volatile boolean mH264SyncFrameRequested = false;
+    private volatile OutputStream mVideoOutputStream;
+    private MediaCodec mVideoEncoder;
+    private volatile int mVideoEncoderWidth = 0;
+    private volatile int mVideoEncoderHeight = 0;
+    private volatile byte[] mVideoSpsPps;
+    private volatile boolean mVideoSyncFrameRequested = false;
     // Adaptive FPS throttle for low-end devices — counts consecutive encoder input drops
     private int mEncoderConsecutiveDrops = 0;
     private static final int ENCODER_DROP_THRESHOLD = 15; // reduce FPS after N consecutive drops
-    private final byte[] mH264FrameHeaderBuf = new byte[12];
-    private byte[] mH264EncodeBuffer;          // reused NV12 input — allocated once per resolution
-    private byte[] mH264OutputBuffer = new byte[2 * 1024 * 1024]; // reused encoded-packet buffer
+    private final byte[] mVideoFrameHeaderBuf = new byte[12];
+    private byte[] mVideoEncodeBuffer;          // reused NV12 input — allocated once per resolution
+    private byte[] mVideoOutputBuffer = new byte[2 * 1024 * 1024]; // reused encoded-packet buffer
     private Thread mTcpUdpWorkerThread;
     private volatile boolean mTcpUdpWorkerRunning = false;
     private final java.util.concurrent.ArrayBlockingQueue<CustomUdpFrame> mTcpUdpFrameQueue = new java.util.concurrent.ArrayBlockingQueue<>(2);
@@ -388,6 +391,7 @@ public class MainActivity extends AppCompatActivity {
         requestIgnoreBatteryOptimizations();
 
         mStreamProtocol = getSavedStreamProtocol();
+        mSelectedCodec = getSavedVideoCodec();
         mStreamHost = getSavedStreamHost();
         mStreamPort = getSavedStreamPort();
         mSrtPort = getSavedSrtPort();
@@ -1142,6 +1146,27 @@ public class MainActivity extends AppCompatActivity {
         mStreamProtocol = protocol;
     }
 
+    private VideoCodec getSavedVideoCodec() {
+        final String codec = PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .getString(PREF_VIDEO_CODEC, VideoCodec.H265.name());
+        try {
+            return VideoCodec.valueOf(codec);
+        } catch (IllegalArgumentException e) {
+            return VideoCodec.H265;
+        }
+    }
+
+    private void setSavedVideoCodec(final VideoCodec codec) {
+        if (codec == null) return;
+        PreferenceManager
+                .getDefaultSharedPreferences(this)
+                .edit()
+                .putString(PREF_VIDEO_CODEC, codec.name())
+                .apply();
+        mSelectedCodec = codec;
+    }
+
     private String getSavedStreamHost() {
         return PreferenceManager
                 .getDefaultSharedPreferences(this)
@@ -1486,6 +1511,17 @@ public class MainActivity extends AppCompatActivity {
         bitrateInput.setText(String.valueOf(getSavedVideoBitrate()));
         container.addView(bitrateInput);
 
+        final TextView codecLabel = new TextView(this);
+        codecLabel.setText("Video Codec:");
+        codecLabel.setPadding(0, padding, 0, 0);
+        container.addView(codecLabel);
+
+        final android.widget.Spinner codecSpinner = new android.widget.Spinner(this);
+        android.widget.ArrayAdapter<String> codecAdapter = new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, new String[]{"H.265 (HEVC)", "H.264 (AVC)", "AV1 (Software/Experimental)"});
+        codecSpinner.setAdapter(codecAdapter);
+        codecSpinner.setSelection(mSelectedCodec == VideoCodec.AV1 ? 2 : (mSelectedCodec == VideoCodec.H264 ? 1 : 0));
+        container.addView(codecSpinner);
+
         final android.widget.CheckBox dynamicBitrateCheckBox = new android.widget.CheckBox(this);
         if (isRtmp) {
             dynamicBitrateCheckBox.setText(R.string.stream_dynamic_bitrate);
@@ -1547,9 +1583,15 @@ public class MainActivity extends AppCompatActivity {
                     if (isRtmp) {
                         setDynamicBitrateEnabled(dynamicBitrateCheckBox.isChecked());
                     }
+                    
+                    int selectedCodecIdx = codecSpinner.getSelectedItemPosition();
+                    VideoCodec newCodec = selectedCodecIdx == 2 ? VideoCodec.AV1 : (selectedCodecIdx == 1 ? VideoCodec.H264 : VideoCodec.H265);
+                    if (mSelectedCodec != newCodec) {
+                        setSavedVideoCodec(newCodec);
+                    }
 
                     String summary = isRtmp ? (TextUtils.isEmpty(rtmpKey) ? rtmpUrl : rtmpUrl + "/****") : String.format("%s:%d", host, port);
-                    Toast.makeText(this, String.format("%s fps=%d quality=%d bitrate=%d", summary, targetFps, quality, bitrateKbps), Toast.LENGTH_SHORT).show();
+                    Toast.makeText(this, String.format("%s fps=%d quality=%d bitrate=%d codec=%s", summary, targetFps, quality, bitrateKbps, newCodec.name()), Toast.LENGTH_SHORT).show();
                     
                     invalidateOptionsMenu();
                     updateStreamStatus();
@@ -2339,6 +2381,7 @@ public class MainActivity extends AppCompatActivity {
         int parsedTargetFps = mVideoTargetFps;
         int parsedQuality = mVideoQuality;
         int parsedBitrateKbps = getSavedVideoBitrate();
+        int parsedCodec = mSelectedCodec == VideoCodec.AV1 ? 2 : (mSelectedCodec == VideoCodec.H264 ? 1 : 0);
 
         String[] parts = msg.split(";");
         for (String part : parts) {
@@ -2403,6 +2446,11 @@ public class MainActivity extends AppCompatActivity {
                     }
                 } catch (NumberFormatException ignored) {
                 }
+            } else if (part.startsWith("codec=")) {
+                try {
+                    parsedCodec = Integer.parseInt(part.substring(part.indexOf('=') + 1));
+                } catch (NumberFormatException ignored) {
+                }
             }
         }
 
@@ -2415,6 +2463,7 @@ public class MainActivity extends AppCompatActivity {
         final int targetFps = parsedTargetFps;
         final int quality = parsedQuality;
         final int bitrateKbps = parsedBitrateKbps;
+        final int codecValue = parsedCodec;
 
         runOnUiThread(() -> {
             mInternalExposureLock = exposureLock;
@@ -2510,7 +2559,15 @@ public class MainActivity extends AppCompatActivity {
                 mInternalFocusLock = focusLock;
                 mInternalAfLock = afLock;
             }
-            applyRemoteStreamSettings(resolutionIndex, targetFps, quality, bitrateKbps);
+            boolean codecChanged = false;
+            if (codecValue >= 0 && codecValue <= 2) {
+                VideoCodec newCodec = codecValue == 2 ? VideoCodec.AV1 : (codecValue == 1 ? VideoCodec.H264 : VideoCodec.H265);
+                if (mSelectedCodec != newCodec) {
+                    setSavedVideoCodec(newCodec);
+                    codecChanged = true;
+                }
+            }
+            applyRemoteStreamSettings(resolutionIndex, targetFps, quality, bitrateKbps, codecChanged);
         });
     }
 
@@ -3040,7 +3097,7 @@ public class MainActivity extends AppCompatActivity {
         return best;
     }
 
-    private void applyRemoteStreamSettings(int resolutionIndex, int targetFps, int quality, int bitrateKbps) {
+    private void applyRemoteStreamSettings(int resolutionIndex, int targetFps, int quality, int bitrateKbps, boolean codecChanged) {
         int clampedResolutionIndex = clampObsResolutionIndex(resolutionIndex);
         int clampedTargetFps = Math.max(24, Math.min(60, targetFps));
         int clampedQuality = Math.max(10, Math.min(100, quality));
@@ -3084,7 +3141,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        if ((fpsChanged || qualityChanged || bitrateChanged) && mIsCameraConnected) {
+        if ((fpsChanged || qualityChanged || bitrateChanged || codecChanged) && mIsCameraConnected) {
             if (mStreamProtocol == StreamProtocol.TCP_UDP) {
                 cleanupStreaming();
                 if (mCameraMode == CameraMode.INTERNAL && mCurrentInternalCamera != null && mInternalPreviewSize != null) {
@@ -3536,8 +3593,8 @@ public class MainActivity extends AppCompatActivity {
             try { ss.close(); } catch (Exception ignored) {}
         }
         // Close any active output stream
-        OutputStream out = mH264OutputStream;
-        mH264OutputStream = null;
+        OutputStream out = mVideoOutputStream;
+        mVideoOutputStream = null;
         if (out != null) {
             try { out.close(); } catch (Exception ignored) {}
         }
@@ -3575,7 +3632,7 @@ public class MainActivity extends AppCompatActivity {
         while ((pending = mSrtFrameQueue.poll()) != null) {
             recycleFrameBuffer(pending.frame);
         }
-        stopH264Encoder();
+        stopVideoEncoder();
         runOnUiThread(this::updateStreamStatus);
     }
 
@@ -3929,7 +3986,7 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
         // Ensure clean encoder state — previous transport may have left stale encoder
-        stopH264Encoder();
+        stopVideoEncoder();
         mSrtTargetFps = Math.max(24, Math.min(60, mVideoTargetFps));
         mSrtMinFrameIntervalNs = 1_000_000_000L / mSrtTargetFps;
         mNextSrtEnqueueTimeNs = 0;
@@ -4020,13 +4077,13 @@ public class MainActivity extends AppCompatActivity {
                     }
                     try {
                         // Lazy-init encoder on first frame or when resolution changes
-                        if (mH264Encoder == null
-                                || frame.width != mH264EncoderWidth
-                                || frame.height != mH264EncoderHeight) {
-                            reconfigureH264Encoder(frame.width, frame.height);
+                        if (mVideoEncoder == null
+                                || frame.width != mVideoEncoderWidth
+                                || frame.height != mVideoEncoderHeight) {
+                            reconfigureVideoEncoder(frame.width, frame.height);
                         }
                         // Encode and send via SRT (UDP with H.265 payload)
-                        feedFrameToH264EncoderSrt(frame);
+                        feedFrameToVideoEncoderSrt(frame);
                         mSrtFramesEncoded.incrementAndGet();
                     } finally {
                         recycleFrameBuffer(frame.frame);
@@ -4062,7 +4119,7 @@ public class MainActivity extends AppCompatActivity {
                 }
             }
 
-            stopH264Encoder();
+            stopVideoEncoder();
             java.net.DatagramSocket sock = mSrtSocket;
             mSrtSocket = null;
             if (sock != null) try { sock.close(); } catch (Exception ignored) {}
@@ -4076,8 +4133,8 @@ public class MainActivity extends AppCompatActivity {
      * Encodes a frame and sends it as H.265 over UDP (SRT-lite caller mode).
      * Each NAL unit is wrapped in a simple header: 4-byte length prefix.
      */
-    private void feedFrameToH264EncoderSrt(CustomUdpFrame frame) throws IOException {
-        MediaCodec enc = mH264Encoder;
+    private void feedFrameToVideoEncoderSrt(CustomUdpFrame frame) throws IOException {
+        MediaCodec enc = mVideoEncoder;
         if (enc == null) {
             Log.w(TAG, "SRT: encoder is null, dropping frame");
             return;
@@ -4149,26 +4206,26 @@ public class MainActivity extends AppCompatActivity {
                 byte[] spsPps = new byte[spsLen + ppsLen];
                 if (spsB != null) spsB.get(spsPps, 0, spsLen);
                 if (ppsB != null) ppsB.get(spsPps, spsLen, ppsLen);
-                mH264SpsPps = spsPps;
+                mVideoSpsPps = spsPps;
                 Log.i(TAG, "SRT: encoder format changed — SPS+PPS " + spsPps.length + " bytes");
                 // Send SPS+PPS over SRT
-                sendSrtPacket(H264_NO_PTS, spsPps, 0, spsPps.length, socket, remoteAddr, remotePort);
+                sendSrtPacket(NO_PTS, spsPps, 0, spsPps.length, socket, remoteAddr, remotePort);
                 continue;
             }
             if (outIndex < 0) break;
             java.nio.ByteBuffer outBuf = enc.getOutputBuffer(outIndex);
             if (outBuf != null && info.size > 0) {
                 boolean isConfig = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
-                if (mH264OutputBuffer == null || mH264OutputBuffer.length < info.size) {
-                    mH264OutputBuffer = new byte[info.size * 2];
+                if (mVideoOutputBuffer == null || mVideoOutputBuffer.length < info.size) {
+                    mVideoOutputBuffer = new byte[info.size * 2];
                 }
-                byte[] data = mH264OutputBuffer;
+                byte[] data = mVideoOutputBuffer;
                 outBuf.position(info.offset);
                 outBuf.get(data, 0, info.size);
-                long pts = isConfig ? H264_NO_PTS : info.presentationTimeUs;
+                long pts = isConfig ? NO_PTS : info.presentationTimeUs;
                 sendSrtPacket(pts, data, 0, info.size, socket, remoteAddr, remotePort);
                 if (isConfig) {
-                    mH264SpsPps = java.util.Arrays.copyOf(data, info.size);
+                    mVideoSpsPps = java.util.Arrays.copyOf(data, info.size);
                 } else {
                     mSrtPacketsSent.incrementAndGet();
                 }
@@ -4207,7 +4264,7 @@ public class MainActivity extends AppCompatActivity {
         if (length <= 0) return;
 
         // One-shot diagnostic on first successful send
-        if (mSrtPacketsSent.get() == 0 && pts != H264_NO_PTS) {
+        if (mSrtPacketsSent.get() == 0 && pts != NO_PTS) {
             Log.i(TAG, "SRT: first video packet — "
                     + length + " bytes → " + remoteAddr + ":" + remotePort);
         }
@@ -4260,8 +4317,8 @@ public class MainActivity extends AppCompatActivity {
 
     // ── H.265 encoder lifecycle ──────────────────────────────────────────────
 
-    private void startH264Encoder(int width, int height) {
-        stopH264Encoder();
+    private void startVideoEncoder(int width, int height) {
+        stopVideoEncoder();
         try {
             int pixels = width * height;
             boolean is4K = (long) pixels > 1920L * 1080L;
@@ -4275,28 +4332,60 @@ public class MainActivity extends AppCompatActivity {
             if (manualBitrateKbps > 0) {
                 bitrate = manualBitrateKbps * 1000L;
             } else {
-                // H.265 needs ~50% the bitrate of H.264; scale but cap aggressively for TCP stability
-                long baseBitrate = 3_000_000L + (17_000_000L * quality / 100L);
+                long baseBitrate;
+                long maxBitrate;
+                switch (mSelectedCodec) {
+                    case AV1:
+                        baseBitrate = 2_000_000L + (12_000_000L * quality / 100L);
+                        maxBitrate = is4K ? 15_000_000L : 12_000_000L;
+                        break;
+                    case H265:
+                    default:
+                        baseBitrate = 3_000_000L + (17_000_000L * quality / 100L);
+                        maxBitrate = is4K ? 25_000_000L : 20_000_000L;
+                        break;
+                    case H264:
+                        baseBitrate = 4_000_000L + (25_000_000L * quality / 100L);
+                        maxBitrate = is4K ? 35_000_000L : 30_000_000L;
+                        break;
+                }
                 long scaledBitrate = baseBitrate * pixels / (1920 * 1080);
-                long maxBitrate = is4K ? 25_000_000L : 20_000_000L;
                 bitrate = Math.min(maxBitrate, Math.max(2_000_000L, scaledBitrate));
             }
-            MediaCodec enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_HEVC);
-            MediaFormat fmt = MediaFormat.createVideoFormat(
-                    MediaFormat.MIMETYPE_VIDEO_HEVC, width, height);
+            
+            String mimeType;
+            switch (mSelectedCodec) {
+                case AV1: mimeType = MediaFormat.MIMETYPE_VIDEO_AV1; break;
+                case H264: mimeType = MediaFormat.MIMETYPE_VIDEO_AVC; break;
+                case H265:
+                default: mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC; break;
+            }
+
+            MediaCodec enc = MediaCodec.createEncoderByType(mimeType);
+            MediaFormat fmt = MediaFormat.createVideoFormat(mimeType, width, height);
             fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT,
                     MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar);
             fmt.setInteger(MediaFormat.KEY_BIT_RATE, (int) bitrate);
             fmt.setInteger(MediaFormat.KEY_FRAME_RATE, targetFps);
             // Longer I-frame interval → fewer expensive keyframes → smoother TCP delivery
             fmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, is4K ? 5 : 2);
+            
             if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.LOLLIPOP) {
-                fmt.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain);
-                int level = is4K ? MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel51
-                        : MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel4;
-                fmt.setInteger(MediaFormat.KEY_LEVEL, level);
+                if (mSelectedCodec == VideoCodec.H265) {
+                    fmt.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain);
+                    int level = is4K ? MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel51
+                            : MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel4;
+                    fmt.setInteger(MediaFormat.KEY_LEVEL, level);
+                } else if (mSelectedCodec == VideoCodec.H264) {
+                    fmt.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileHigh);
+                    int level = is4K ? MediaCodecInfo.CodecProfileLevel.AVCLevel51
+                            : MediaCodecInfo.CodecProfileLevel.AVCLevel4;
+                    fmt.setInteger(MediaFormat.KEY_LEVEL, level);
+                } else if (mSelectedCodec == VideoCodec.AV1 && android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                    fmt.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AV1ProfileMain8);
+                }
+                
                 // Try CBR first for predictable TCP frame sizes; weak SoCs may reject it.
-                // The try/catch around configure+start will fall back to VBR if needed.
                 fmt.setInteger(MediaFormat.KEY_BITRATE_MODE,
                         MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
                 // Use minimum complexity for speed and stability across all devices
@@ -4330,45 +4419,45 @@ public class MainActivity extends AppCompatActivity {
             }
             if (!encoderStarted) {
                 try { enc.release(); } catch (Exception ignored) {}
-                mH264Encoder = null;
+                mVideoEncoder = null;
                 return;
             }
-            mH264Encoder = enc;
-            mH264EncoderWidth = width;
-            mH264EncoderHeight = height;
-            mH264SpsPps = null;
+            mVideoEncoder = enc;
+            mVideoEncoderWidth = width;
+            mVideoEncoderHeight = height;
+            mVideoSpsPps = null;
             mTcpUdpTargetFps = targetFps;
             mTcpUdpMinFrameIntervalNs = 1_000_000_000L / mTcpUdpTargetFps;
             mNextTcpUdpEnqueueTimeNs = 0;
         } catch (Exception e) {
             Log.e(TAG, "Failed to start H.265 encoder", e);
-            mH264Encoder = null;
+            mVideoEncoder = null;
         }
     }
 
-    private void stopH264Encoder() {
-        MediaCodec enc = mH264Encoder;
-        mH264Encoder = null;
-        mH264EncoderWidth = 0;
-        mH264EncoderHeight = 0;
-        mH264SpsPps = null; // Clear stale SPS/PPS — new encoder will produce fresh config
+    private void stopVideoEncoder() {
+        MediaCodec enc = mVideoEncoder;
+        mVideoEncoder = null;
+        mVideoEncoderWidth = 0;
+        mVideoEncoderHeight = 0;
+        mVideoSpsPps = null; // Clear stale SPS/PPS — new encoder will produce fresh config
         if (enc != null) {
             try { enc.stop(); } catch (Exception ignored) {}
             try { enc.release(); } catch (Exception ignored) {}
         }
     }
 
-    private void reconfigureH264Encoder(int width, int height) {
-        stopH264Encoder();
-        startH264Encoder(width, height);
+    private void reconfigureVideoEncoder(int width, int height) {
+        stopVideoEncoder();
+        startVideoEncoder(width, height);
     }
 
     /**
      * Feed one NV12 frame to the H.265 encoder and drain all output packets to TCP.
      * Throws IOException if the TCP stream is broken.
      */
-    private void feedFrameToH264Encoder(CustomUdpFrame frame) throws IOException {
-        MediaCodec enc = mH264Encoder;
+    private void feedFrameToVideoEncoder(CustomUdpFrame frame) throws IOException {
+        MediaCodec enc = mVideoEncoder;
         if (enc == null) return;
         long encodeStartNs = System.nanoTime();
 
@@ -4443,11 +4532,11 @@ public class MainActivity extends AppCompatActivity {
                 byte[] spsPps = new byte[spsLen + ppsLen];
                 if (spsB != null) spsB.get(spsPps, 0, spsLen);
                 if (ppsB != null) ppsB.get(spsPps, spsLen, ppsLen);
-                mH264SpsPps = spsPps;
+                mVideoSpsPps = spsPps;
                 // Send SPS+PPS as config packet
-                OutputStream out = mH264OutputStream;
+                OutputStream out = mVideoOutputStream;
                 if (out != null) {
-                    sendH264Packet(H264_NO_PTS, spsPps, 0, spsPps.length);
+                    sendVideoPacket(NO_PTS, spsPps, 0, spsPps.length);
                     out.flush();
                 }
                 continue;
@@ -4456,23 +4545,23 @@ public class MainActivity extends AppCompatActivity {
             java.nio.ByteBuffer outBuf = enc.getOutputBuffer(outIndex);
             if (outBuf != null && info.size > 0) {
                 boolean isConfig = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
-                if (mH264OutputBuffer == null || mH264OutputBuffer.length < info.size) {
-                    mH264OutputBuffer = new byte[info.size * 2];
+                if (mVideoOutputBuffer == null || mVideoOutputBuffer.length < info.size) {
+                    mVideoOutputBuffer = new byte[info.size * 2];
                 }
-                byte[] data = mH264OutputBuffer;
+                byte[] data = mVideoOutputBuffer;
                 outBuf.position(info.offset);
                 outBuf.get(data, 0, info.size);
-                long pts = isConfig ? H264_NO_PTS : (info.presentationTimeUs);
-                OutputStream out = mH264OutputStream;
+                long pts = isConfig ? NO_PTS : (info.presentationTimeUs);
+                OutputStream out = mVideoOutputStream;
                 if (out != null) {
-                    sendH264Packet(pts, data, 0, info.size);
+                    sendVideoPacket(pts, data, 0, info.size);
                     sentData = true;
                     if (!isConfig) {
                         mTcpFramesEncoded.incrementAndGet();
                     }
                 }
                 if (isConfig) {
-                    mH264SpsPps = java.util.Arrays.copyOf(data, info.size);
+                    mVideoSpsPps = java.util.Arrays.copyOf(data, info.size);
                 }
             }
             enc.releaseOutputBuffer(outIndex, false);
@@ -4485,11 +4574,11 @@ public class MainActivity extends AppCompatActivity {
      * Write a DroidCam-style H.264 packet: 8-byte PTS (BE) + 4-byte length (BE) + payload.
      * Throws IOException if the TCP stream is broken.
      */
-    private void sendH264Packet(long pts, byte[] data, int offset, int length) throws IOException {
-        OutputStream out = mH264OutputStream;
+    private void sendVideoPacket(long pts, byte[] data, int offset, int length) throws IOException {
+        OutputStream out = mVideoOutputStream;
         if (out == null || data == null || length <= 0) return;
 
-        byte[] hdr = mH264FrameHeaderBuf;
+        byte[] hdr = mVideoFrameHeaderBuf;
         // PTS — 8 bytes big-endian
         hdr[0] = (byte) (pts >>> 56);
         hdr[1] = (byte) (pts >>> 48);
@@ -4508,23 +4597,23 @@ public class MainActivity extends AppCompatActivity {
         out.write(hdr, 0, 12);
         out.write(data, offset, length);
 
-        if (pts != H264_NO_PTS) {
+        if (pts != NO_PTS) {
             mTcpPacketsSent.incrementAndGet();
         }
     }
 
-    private void requestH264SyncFrameAsync() {
-        mH264SyncFrameRequested = true;
+    private void requestVideoSyncFrameAsync() {
+        mVideoSyncFrameRequested = true;
     }
 
-    private void requestH264SyncFrame() {
-        if (mH264Encoder == null) {
+    private void requestVideoSyncFrame() {
+        if (mVideoEncoder == null) {
             return;
         }
         try {
             android.os.Bundle params = new android.os.Bundle();
             params.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
-            mH264Encoder.setParameters(params);
+            mVideoEncoder.setParameters(params);
         } catch (Exception e) {
             Log.w(TAG, "Failed to request H.265 sync frame", e);
         }
@@ -4843,8 +4932,9 @@ public class MainActivity extends AppCompatActivity {
         if (mInternalCameraHelper != null) {
             exposureCompensation = mInternalCameraHelper.getCurrentExposureCompensation();
         }
+        int codecValue = mSelectedCodec == VideoCodec.AV1 ? 2 : (mSelectedCodec == VideoCodec.H264 ? 1 : 0);
         return String.format(java.util.Locale.US,
-                "CONTROL_STATE;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d;bitrate=%d",
+                "CONTROL_STATE;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d;bitrate=%d;codec=%d",
                 mInternalExposureLock ? 1 : 0,
                 mInternalFocusLock ? 1 : 0,
                 exposureCompensation,
@@ -4856,7 +4946,8 @@ public class MainActivity extends AppCompatActivity {
                 mapCurrentPreviewToObsResolutionIndex(),
                 mVideoTargetFps,
                 mVideoQuality,
-                getSavedVideoBitrate());
+                getSavedVideoBitrate(),
+                codecValue);
     }
 
     private void maybeSendTcpControlStateToObs() {
@@ -5052,7 +5143,9 @@ public class MainActivity extends AppCompatActivity {
                         // Use raw OutputStream — TCP_NODELAY is set, so BufferedOutputStream
                         // just adds latency by batching writes. Each encoded HEVC packet is already
                         // a complete NAL unit and should be sent immediately.
-                        mH264OutputStream = client.getOutputStream();
+                        mVideoOutputStream = client.getOutputStream();
+                        byte codecId = (byte) (mSelectedCodec == VideoCodec.AV1 ? 2 : (mSelectedCodec == VideoCodec.H264 ? 1 : 0));
+                        mVideoOutputStream.write(new byte[]{0x56, 0x02, codecId, 0x00});
                         mLastTcpFlushTimeNs = 0;
                         Log.i(TAG, "OBS connected from " + client.getInetAddress().getHostAddress());
                     } catch (java.net.SocketTimeoutException ignored) {
@@ -5069,24 +5162,24 @@ public class MainActivity extends AppCompatActivity {
                 // Clear any stale queued frames before starting a new connection.
                 clearTcpUdpFrameQueue();
                 // Force an IDR (sync) frame immediately so OBS can decode from the very first frame
-                requestH264SyncFrame();
+                requestVideoSyncFrame();
                 // Also reset the encoder drop counter so adaptive FPS stays accurate per-connection
                 mEncoderConsecutiveDrops = 0;
 
                 // Send cached SPS+PPS so OBS can decode immediately
                 try {
-                    byte[] sps = mH264SpsPps;
+                    byte[] sps = mVideoSpsPps;
                     if (sps != null) {
-                        sendH264Packet(H264_NO_PTS, sps, 0, sps.length);
-                        mH264OutputStream.flush();
+                        sendVideoPacket(NO_PTS, sps, 0, sps.length);
+                        mVideoOutputStream.flush();
                     }
                     // Force a second IDR request AFTER sending SPS/PPS — this ensures OBS gets
                     // SPS+PPS immediately followed by an IDR frame, which triggers source appearance
                     // without requiring the user to switch sources or change resolution.
-                    requestH264SyncFrame();
+                    requestVideoSyncFrame();
                 } catch (IOException e) {
                     Log.w(TAG, "Failed to send SPS/PPS to OBS", e);
-                    mH264OutputStream = null;
+                    mVideoOutputStream = null;
                     try { client.close(); } catch (Exception ignored) {}
                     continue;
                 }
@@ -5097,10 +5190,10 @@ public class MainActivity extends AppCompatActivity {
                 while (mTcpUdpWorkerRunning && clientActive) {
                     try {
                         // 1. Constantly drain encoder output to prevent stalling.
-                        if (mH264Encoder != null) {
-                            boolean drained = drainEncoderOutput(mH264Encoder, info, 0);
+                        if (mVideoEncoder != null) {
+                            boolean drained = drainEncoderOutput(mVideoEncoder, info, 0);
                             if (drained) {
-                                OutputStream flushOut = mH264OutputStream;
+                                OutputStream flushOut = mVideoOutputStream;
                                 if (flushOut != null) {
                                     long nowFlushNs = System.nanoTime();
                                     if (mLastTcpFlushTimeNs <= 0
@@ -5120,16 +5213,16 @@ public class MainActivity extends AppCompatActivity {
                         }
                         
                         try {
-                            if (mH264Encoder == null
-                                    || frame.width != mH264EncoderWidth
-                                    || frame.height != mH264EncoderHeight) {
-                                reconfigureH264Encoder(frame.width, frame.height);
+                            if (mVideoEncoder == null
+                                    || frame.width != mVideoEncoderWidth
+                                    || frame.height != mVideoEncoderHeight) {
+                                reconfigureVideoEncoder(frame.width, frame.height);
                             }
-                            if (mH264SyncFrameRequested) {
-                                mH264SyncFrameRequested = false;
-                                requestH264SyncFrame();
+                            if (mVideoSyncFrameRequested) {
+                                mVideoSyncFrameRequested = false;
+                                requestVideoSyncFrame();
                             }
-                            feedFrameToH264Encoder(frame);
+                            feedFrameToVideoEncoder(frame);
                             maybePublishTcpTelemetry(false);
                         } finally {
                             recycleFrameBuffer(frame.frame);
@@ -5146,18 +5239,18 @@ public class MainActivity extends AppCompatActivity {
                         Log.w(TAG, "Error in H.265 TCP forwarding thread", e);
                         // If the hardware encoder crashed (e.g. IllegalStateException after a camera change),
                         // destroy it now. A brief cooldown avoids an immediate crash loop on faulty hardware.
-                        stopH264Encoder();
+                        stopVideoEncoder();
                         try { Thread.sleep(300); } catch (InterruptedException ie) {
                             Thread.currentThread().interrupt();
                         }
                     }
                 }
 
-                mH264OutputStream = null;
+                mVideoOutputStream = null;
                 try { client.close(); } catch (Exception ignored) {}
             }
 
-            stopH264Encoder();
+            stopVideoEncoder();
             ServerSocket ss = mH265ServerSocket;
             mH265ServerSocket = null;
             if (ss != null) try { ss.close(); } catch (Exception ignored) {}

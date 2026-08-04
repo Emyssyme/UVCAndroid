@@ -53,20 +53,32 @@ static bool tcp_recv_all(
 #else
     int sock,
 #endif
-    void *buf, size_t len)
+    void *buf, size_t len, volatile bool *running_flag)
 {
     uint8_t *ptr = (uint8_t *)buf;
     size_t received = 0;
-    while (received < len) {
+    while (received < len && (!running_flag || *running_flag)) {
 #ifdef _WIN32
         int n = recv(sock, (char *)(ptr + received), (int)(len - received), 0);
 #else
         ssize_t n = recv(sock, ptr + received, len - received, 0);
 #endif
-        if (n <= 0) return false;
+        if (n <= 0) {
+#ifdef _WIN32
+            int err = WSAGetLastError();
+            if (n < 0 && (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK)) {
+                continue;
+            }
+#else
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                continue;
+            }
+#endif
+            return false;
+        }
         received += (size_t)n;
     }
-    return true;
+    return (!running_flag || *running_flag) && (received == len);
 }
 
 static inline uint64_t read_u64be(const uint8_t *b)
@@ -131,18 +143,24 @@ static void uvc_custom_network_send_tally(uvc_custom_network *context, bool forc
  * Attempts to open an H.265 hardware decoder, falling back to software.
  * Returns the opened AVCodecContext or NULL on failure.
  * The caller is responsible for freeing via avcodec_free_context(). */
-static AVCodecContext *try_open_hw_decoder(const char **codec_name_out)
+static AVCodecContext *try_open_hw_decoder(const char **codec_name_out, int video_codec)
 {
-    static const char *hw_decoders[] = {
-        "hevc_d3d11va",
-        "hevc_dxva2",
-        "hevc_qsv",
-        "hevc_nvdec",
-        "hevc_cuvid",
-        "hevc_amf",
-        "hevc_videotoolbox",
-        NULL
+    static const char *hevc_decoders[] = {
+        "hevc_d3d11va", "hevc_dxva2", "hevc_qsv", "hevc_nvdec", "hevc_cuvid", "hevc_amf", "hevc_videotoolbox", NULL
     };
+    static const char *h264_decoders[] = {
+        "h264_d3d11va", "h264_dxva2", "h264_qsv", "h264_nvdec", "h264_cuvid", "h264_amf", "h264_videotoolbox", NULL
+    };
+    static const char *av1_decoders[] = {
+        "av1_d3d11va", "av1_dxva2", "av1_qsv", "av1_nvdec", "av1_cuvid", "av1_amf", NULL
+    };
+
+    const char **hw_decoders = hevc_decoders;
+    if (video_codec == 1) {
+        hw_decoders = h264_decoders;
+    } else if (video_codec == 2) {
+        hw_decoders = av1_decoders;
+    }
 
     for (int i = 0; hw_decoders[i] != NULL; i++) {
         const AVCodec *hwc = avcodec_find_decoder_by_name(hw_decoders[i]);
@@ -520,7 +538,7 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
                                             bool exposure_lock, bool focus_lock,
                                             int exposure_compensation, int af_mode, bool af_lock,
                                             int flash_mode, int wb_mode, int wb_kelvin,
-                                            int resolution_index, int fps, int quality, int bitrate)
+                                            int resolution_index, int fps, int quality, int bitrate, int video_codec)
 {
     if (!context || !context->host || context->host[0] == '\0') {
         blog(LOG_WARNING, "UVC CONTROL: skipped — host is empty");
@@ -560,7 +578,7 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
 
     char payload[384];
     snprintf(payload, sizeof(payload),
-             "CONTROL;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d;bitrate=%d;srt_port=%d",
+             "CONTROL;exposure_lock=%d;focus_lock=%d;exposure_compensation=%d;af_mode=%d;af_lock=%d;flash_mode=%d;wb_mode=%d;wb_kelvin=%d;resolution_index=%d;fps=%d;quality=%d;bitrate=%d;srt_port=%d;codec=%d",
              exposure_lock ? 1 : 0,
              focus_lock ? 1 : 0,
              exposure_compensation,
@@ -573,7 +591,8 @@ static void uvc_custom_network_send_control(uvc_custom_network *context,
              fps,
              quality,
              bitrate,
-             context->srt_port);
+             context->srt_port,
+             video_codec);
 
     blog(LOG_INFO, "UVC CONTROL -> Android %s:%d: %s", host_copy, CUSTOM_TALLY_PORT, payload);
 
@@ -626,12 +645,14 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
     int fps = 30;
     int quality = 50;
     int bitrate = 0;
+    int video_codec = 0;
 
     pthread_mutex_lock(&context->lock);
     resolution_index = context->resolution_index;
     fps = context->fps;
     quality = context->quality;
     bitrate = context->bitrate;
+    video_codec = context->video_codec;
     pthread_mutex_unlock(&context->lock);
 
     int matched = sscanf(msg,
@@ -652,6 +673,7 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
     parse_message_int(msg, "fps=", &fps);
     parse_message_int(msg, "quality=", &quality);
     parse_message_int(msg, "bitrate=", &bitrate);
+    parse_message_int(msg, "codec=", &video_codec);
 
     /* Ignore noisy EV drift when AE lock is off to avoid sync churn/freeze loops. */
     if (exposure_lock == 0) {
@@ -678,7 +700,8 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
         || context->resolution_index != resolution_index
         || context->fps != fps
         || context->quality != quality
-        || context->bitrate != bitrate) {
+        || context->bitrate != bitrate
+        || context->video_codec != video_codec) {
         context->pending_remote_control_state = true;
         context->pending_exposure_lock = (exposure_lock != 0);
         context->pending_focus_lock = (focus_lock != 0);
@@ -692,6 +715,7 @@ static void uvc_custom_network_apply_remote_control_state(uvc_custom_network *co
         context->pending_fps = fps;
         context->pending_quality = quality;
         context->pending_bitrate = bitrate;
+        context->pending_video_codec = video_codec;
         changed = true;
     }
     pthread_mutex_unlock(&context->lock);
@@ -727,6 +751,7 @@ static void uvc_custom_network_apply_pending_state_to_source(uvc_custom_network 
     obs_data_set_int(settings, "fps", context->fps);
     obs_data_set_int(settings, "quality", context->quality);
     obs_data_set_int(settings, "bitrate", context->bitrate);
+    obs_data_set_int(settings, "video_codec", context->video_codec);
     obs_data_release(settings);
 }
 
@@ -812,6 +837,7 @@ static void uvc_custom_network_video_tick(void *data, float seconds)
     context->fps                          = context->pending_fps;
     context->quality                      = context->pending_quality;
     context->bitrate                      = context->pending_bitrate;
+    context->video_codec                  = context->pending_video_codec;
     context->pending_remote_control_state = false;
     context->pending_ui_refresh = true;  /* trigger dialog rebuild so UI reflects remote changes */
     pthread_mutex_unlock(&context->lock);
@@ -1049,9 +1075,17 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
         return NULL;
     }
 
-    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
+    pthread_mutex_lock(&context->lock);
+    int video_codec = context->video_codec;
+    pthread_mutex_unlock(&context->lock);
+
+    enum AVCodecID codec_id = AV_CODEC_ID_HEVC;
+    if (video_codec == 1) codec_id = AV_CODEC_ID_H264;
+    else if (video_codec == 2) codec_id = AV_CODEC_ID_AV1;
+
+    const AVCodec *codec = avcodec_find_decoder(codec_id);
     if (!codec) {
-        blog(LOG_ERROR, "UVC SRT: H.265 decoder not found");
+        blog(LOG_ERROR, "UVC SRT: software decoder for codec %d not found", video_codec);
         bfree(host);
         context->srt_receiver_running = false;
         return NULL;
@@ -1157,7 +1191,7 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
      * to start sending before we wait for the first packet. */
     {
         bool exp_lock, fcs_lock, af_lock;
-        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual, bitr;
+        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual, bitr, vid_codec;
         pthread_mutex_lock(&context->lock);
         exp_lock = context->control_exposure_lock;
         fcs_lock = context->control_focus_lock;
@@ -1171,11 +1205,12 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
         fps_v    = context->fps;
         qual     = context->quality;
         bitr     = context->bitrate;
+        vid_codec= context->video_codec;
         pthread_mutex_unlock(&context->lock);
         uvc_custom_network_send_control(context,
             exp_lock, fcs_lock, exp_comp,
             af_md, af_lock, fl_md, wb_md, wb_k,
-            res_idx, fps_v, qual, bitr);
+            res_idx, fps_v, qual, bitr, vid_codec);
     }
 
     uvc_custom_network_set_status(context, "SRT listening %s:%d — waiting for video", host, port);
@@ -1187,14 +1222,14 @@ static void *uvc_custom_network_srt_receiver_thread(void *data)
 
     const char *active_codec_name = NULL;
     if (use_hw) {
-        decoder = try_open_hw_decoder(&active_codec_name);
+        decoder = try_open_hw_decoder(&active_codec_name, video_codec);
         if (!decoder) {
             blog(LOG_WARNING, "UVC SRT: HW decoder unavailable — falling back to software");
         }
     }
 
     if (!decoder) {
-        active_codec_name = "hevc (software)";
+        active_codec_name = "software";
         decoder = avcodec_alloc_context3(codec);
         decoder->flags |= AV_CODEC_FLAG_LOW_DELAY;
         decoder->flags2 |= AV_CODEC_FLAG2_FAST;
@@ -1557,15 +1592,7 @@ static void *uvc_custom_network_receiver_thread(void *data)
         return NULL;
     }
 
-    /* ----- initialise avcodec H.265 decoder ----- */
-    const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_HEVC);
-    if (!codec) {
-        blog(LOG_ERROR, "UVC H265 TCP: avcodec H.265 decoder not found");
-        bfree(host);
-        context->receiver_running = false;
-        return NULL;
-    }
-
+    /* ----- avcodec packet/frame ----- */
     AVPacket *pkt   = av_packet_alloc();
     AVFrame  *frame = av_frame_alloc();
     AVCodecContext *decoder = NULL;
@@ -1710,24 +1737,71 @@ static void *uvc_custom_network_receiver_thread(void *data)
          * thread before this thread is spawned — no need to duplicate. */
         uvc_custom_network_set_status(context, "Connected %s:%d — waiting for video", host, port);
 
-        /* fresh H.265 decoder for each connection */
-        if (decoder) { avcodec_free_context(&decoder); decoder = NULL; }
+        /* Read 4-byte handshake */
+        uint8_t handshake[4];
+        if (!tcp_recv_all(sock, handshake, 4, &context->receiver_running)) {
+            blog(LOG_INFO, "UVC TCP: failed to read handshake from %s:%d, retrying...", host, port);
+#ifdef _WIN32
+            closesocket(sock);
+            context->receiver_socket = INVALID_SOCKET;
+#else
+            close(sock);
+            context->receiver_socket = -1;
+#endif
+            for (int i = 0; i < 40 && context->receiver_running; i++) os_sleep_ms(50);
+            continue;
+        }
 
-        bool use_hw = false;
+        if (handshake[0] != 0x56 || handshake[1] != 0x02) {
+            blog(LOG_WARNING, "UVC TCP: invalid handshake 0x%02x 0x%02x from %s:%d", handshake[0], handshake[1], host, port);
+#ifdef _WIN32
+            closesocket(sock);
+            context->receiver_socket = INVALID_SOCKET;
+#else
+            close(sock);
+            context->receiver_socket = -1;
+#endif
+            for (int i = 0; i < 40 && context->receiver_running; i++) os_sleep_ms(50);
+            continue;
+        }
+
         pthread_mutex_lock(&context->lock);
-        use_hw = context->hw_decode;
+        context->video_codec = handshake[2];
+        int video_codec = context->video_codec;
+        bool use_hw = context->hw_decode;
         pthread_mutex_unlock(&context->lock);
+
+        enum AVCodecID codec_id = AV_CODEC_ID_HEVC;
+        if (video_codec == 1) codec_id = AV_CODEC_ID_H264;
+        else if (video_codec == 2) codec_id = AV_CODEC_ID_AV1;
+
+        const AVCodec *codec = avcodec_find_decoder(codec_id);
+        if (!codec) {
+            blog(LOG_ERROR, "UVC TCP: avcodec decoder for codec %d not found", video_codec);
+#ifdef _WIN32
+            closesocket(sock);
+            context->receiver_socket = INVALID_SOCKET;
+#else
+            close(sock);
+            context->receiver_socket = -1;
+#endif
+            for (int i = 0; i < 40 && context->receiver_running; i++) os_sleep_ms(50);
+            continue;
+        }
+
+        /* fresh decoder for each connection */
+        if (decoder) { avcodec_free_context(&decoder); decoder = NULL; }
 
         const char *active_codec_name = NULL;
         if (use_hw) {
-            decoder = try_open_hw_decoder(&active_codec_name);
+            decoder = try_open_hw_decoder(&active_codec_name, video_codec);
             if (!decoder) {
-                blog(LOG_WARNING, "UVC H265 TCP: HW decoder unavailable — falling back to software");
+                blog(LOG_WARNING, "UVC TCP: HW decoder unavailable — falling back to software");
             }
         }
 
         if (!decoder) {
-            active_codec_name = "hevc (software)";
+            active_codec_name = "software";
             decoder = avcodec_alloc_context3(codec);
             decoder->flags       |= AV_CODEC_FLAG_LOW_DELAY;
             decoder->flags2      |= AV_CODEC_FLAG2_FAST;
@@ -1755,7 +1829,7 @@ static void *uvc_custom_network_receiver_thread(void *data)
         /* inner receive/decode loop */
         while (context->receiver_running) {
             uint8_t header[12];
-            if (!tcp_recv_all(sock, header, 12)) {
+            if (!tcp_recv_all(sock, header, 12, &context->receiver_running)) {
                 if (context->receiver_running)
                     blog(LOG_INFO, "UVC H265 TCP: connection lost — will reconnect");
                 break;
@@ -1776,7 +1850,7 @@ static void *uvc_custom_network_receiver_thread(void *data)
             pkt->size = (int)len;
             memset(pkt->data + len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
 
-            if (!tcp_recv_all(sock, pkt->data, len)) {
+            if (!tcp_recv_all(sock, pkt->data, len, &context->receiver_running)) {
                 av_packet_unref(pkt);
                 if (context->receiver_running)
                     blog(LOG_INFO, "UVC H265 TCP: connection lost reading payload");
@@ -2056,7 +2130,7 @@ static void uvc_custom_network_start_receiver(uvc_custom_network *context)
      * before any FFmpeg/socket setup delay in the background thread. */
     {
         bool exp_lock, fcs_lock, af_lock;
-        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual, bitr;
+        int exp_comp, af_md, fl_md, wb_md, wb_k, res_idx, fps_v, qual, bitr, vid_codec;
         pthread_mutex_lock(&context->lock);
         exp_lock = context->control_exposure_lock;
         fcs_lock = context->control_focus_lock;
@@ -2070,11 +2144,12 @@ static void uvc_custom_network_start_receiver(uvc_custom_network *context)
         fps_v    = context->fps;
         qual     = context->quality;
         bitr     = context->bitrate;
+        vid_codec= context->video_codec;
         pthread_mutex_unlock(&context->lock);
         uvc_custom_network_send_control(context,
             exp_lock, fcs_lock, exp_comp,
             af_md, af_lock, fl_md, wb_md, wb_k,
-            res_idx, fps_v, qual, bitr);
+            res_idx, fps_v, qual, bitr, vid_codec);
     }
 
     context->receiver_running = true;
@@ -2101,6 +2176,7 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
     context->fps = (int)obs_data_get_int(settings, "fps");
     context->quality = (int)obs_data_get_int(settings, "quality");
     context->bitrate = (int)obs_data_get_int(settings, "bitrate");
+    context->video_codec = (int)obs_data_get_int(settings, "video_codec");
     context->discovery_enabled = obs_data_get_bool(settings, "discovery_enabled");
     context->control_exposure_lock = obs_data_get_bool(settings, "exposure_lock");
     context->control_focus_lock = obs_data_get_bool(settings, "focus_lock");
@@ -2124,6 +2200,7 @@ static void *uvc_custom_network_create(obs_data_t *settings, obs_source_t *sourc
     context->pending_fps = context->fps;
     context->pending_quality = context->quality;
     context->pending_bitrate = context->bitrate;
+    context->pending_video_codec = context->video_codec;
     context->discovery = NULL;
 #ifdef _WIN32
     context->receiver_socket = INVALID_SOCKET;
@@ -2335,6 +2412,11 @@ static obs_properties_t *uvc_custom_network_properties(void *data)
         obs_property_list_add_int(p, RESOLUTIONS[i], i);
     }
 
+    p = obs_properties_add_list(group, "video_codec", "Video codec", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+    obs_property_list_add_int(p, "H.265 (HEVC)", 0);
+    obs_property_list_add_int(p, "H.264 (AVC)", 1);
+    obs_property_list_add_int(p, "AV1", 2);
+
     obs_properties_add_int(group, "fps", "FPS", 15, 60, 1);
     obs_properties_add_int(group, "quality", "Quality", 1, 100, 1);
     obs_properties_add_int(group, "bitrate", "Bitrate (kbps, 0=auto)", 0, 100000, 100);
@@ -2485,14 +2567,17 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
     int fps = (int)obs_data_get_int(settings, "fps");
     int quality = (int)obs_data_get_int(settings, "quality");
     int bitrate = (int)obs_data_get_int(settings, "bitrate");
+    int video_codec = (int)obs_data_get_int(settings, "video_codec");
     bool stream_settings_changed = resolution_index != context->resolution_index
         || fps != context->fps
         || quality != context->quality
-        || bitrate != context->bitrate;
+        || bitrate != context->bitrate
+        || video_codec != context->video_codec;
     context->resolution_index = resolution_index;
     context->fps = fps;
     context->quality = quality;
     context->bitrate = bitrate;
+    context->video_codec = video_codec;
     bool exposure_lock = obs_data_get_bool(settings, "exposure_lock");
     bool focus_lock = obs_data_get_bool(settings, "focus_lock");
     int exposure_compensation = (int)obs_data_get_int(settings, "exposure_compensation");
@@ -2595,7 +2680,7 @@ static void uvc_custom_network_update(void *data, obs_data_t *settings)
                                         exposure_lock, focus_lock,
                                         exposure_compensation, af_mode, af_lock,
                                         flash_mode, wb_mode, wb_kelvin,
-                                        resolution_index, fps, quality, bitrate);
+                                        resolution_index, fps, quality, bitrate, video_codec);
     } else if (send_control && suppress_control_send) {
         blog(LOG_INFO, "UVC CONTROL skipped because suppress_next_control_send was set");
     } else if (send_control) {

@@ -28,6 +28,7 @@ struct uvc_custom_network {
     int fps;
     int quality;
     int bitrate;
+    int video_codec;
     bool discovery_enabled;
 
     bool control_exposure_lock;
@@ -53,6 +54,7 @@ struct uvc_custom_network {
     int pending_fps;
     int pending_quality;
     int pending_bitrate;
+    int pending_video_codec;
 
     char *discovery_status;
     network_discovery_t *discovery;
